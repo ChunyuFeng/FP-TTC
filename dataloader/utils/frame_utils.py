@@ -140,3 +140,10 @@ def read_gen(file_name, pil=False):
         else:
             return flow[:, :, :-1]
     return []
+
+def read_nusc_image(file_name):
+    return Image.open(file_name)
+
+def read_nusc_scale(file_name):
+    gt_scale = Image.open(file_name)
+    return gt_scale

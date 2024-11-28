@@ -12,7 +12,7 @@ import os.path as osp
 from .utils.rectangle_noise import retangle
 from .utils import frame_utils
 import  cv2
-from .utils.augmentor import FlowAugmentor, SparseFlowAugmentorm
+from .utils.augmentor import FlowAugmentor, SparseFlowAugmentorm, NuscAugmentor
 
 
 def depth_read(filename):
@@ -482,6 +482,83 @@ class Driving(FlowDataset):
 
         return self.triangulation(d1,index),self.triangulation(d2,index),mask
 
+
+class nuScenes(data.Dataset):
+    def __init__(self, aug_params=None, split='training', train_info_file='train_infos_150.pkl',
+                 root='/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes'):
+        self.aug_params = aug_params
+        self.split = split
+        self.root = root
+        self.train_info_file = train_info_file
+        self.data = None  # 用于存储从 pkl 文件中加载的数据
+
+        # 根据 split 加载对应的 pkl 文件
+        pkl_file_path = osp.join(root, self.train_info_file)
+
+        # 检查文件是否存在
+        if osp.exists(pkl_file_path):
+            with open(pkl_file_path, 'rb') as f:
+                self.data = pickle.load(f)
+            print(f"Loaded data from {pkl_file_path}")
+        else:
+            raise FileNotFoundError(f"No such file: {pkl_file_path}")
+
+        # 数据增强设置
+        self.augmentor = None
+        if self.aug_params is not None:
+            self.augmentor = NuscAugmentor(**self.aug_params)
+
+        # 将 pkl 文件中的数据转换为模型所需的格式
+        self.image_list = []
+        self.timestamp_list = []
+        self.depth_list = []
+
+        infos = self.data['infos']
+        for i in range(len(infos) - 1):
+            current_info = infos[i]
+            next_info = infos[i + 1]
+
+            # 25 ms < timestamp_diff < 125 ms
+            if abs(next_info['timestamp'] - current_info['timestamp'])/1e3 < 25 or abs(next_info['timestamp'] - current_info['timestamp'])/1e3 > 125:
+                continue
+            else:
+                self.image_list.append([current_info['imgs_path']['CAM_FRONT'], next_info['imgs_path']['CAM_FRONT']])
+                self.timestamp_list.append([current_info['timestamp'], next_info['timestamp']])
+                self.depth_list.append([current_info['gt_path']['CAM_FRONT'], next_info['gt_path']['CAM_FRONT']])
+
+    def __len__(self):
+        return len(self.image_list)
+
+    def __getitem__(self, index):
+        # 获取图像对、时间戳和深度文件路径
+        img1_path, img2_path = self.image_list[index]
+        timestamp1, timestamp2 = self.timestamp_list[index]
+        depth1_path, depth2_path = self.depth_list[index]
+
+        image_path_prefix = '/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes/'
+        img1_path = image_path_prefix + img1_path
+        img2_path = image_path_prefix + img2_path
+
+        # 读取图像和深度数据
+        img1 = frame_utils.read_nusc_image(img1_path)
+        img2 = frame_utils.read_nusc_image(img2_path)
+        gt_scale= frame_utils.read_nusc_scale(depth1_path)
+
+        # 数据增强
+        if self.augmentor is not None:
+            img1, img2, gt_scale= [self.augmentor(x) for x in [img1, img2, gt_scale]]
+
+        mask = gt_scale > 0
+
+        # 转换为 Tensor
+        img1_tensor = torch.from_numpy(img1).permute(2, 0, 1).float()
+        img2_tensor = torch.from_numpy(img2).permute(2, 0, 1).float()
+        gt_scale = torch.from_numpy(gt_scale).float()
+        mask = torch.from_numpy(mask)
+
+        # 返回图像、时间戳、深度
+        return img1_tensor, img2_tensor, timestamp1, timestamp2, gt_scale, mask
+
 def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
     """ Create the data loader for the corresponding trainign set """
 
@@ -502,6 +579,12 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
         kitti = KITTI(aug_params, split='training')
         train_dataset = 100*kitti
 
+    elif args.stage == 'nuscenes':
+        aug_params = {'crop_size': args.image_size, 'do_flip': False}
+        train_info_file = 'train_infos_1000.pkl'
+        nuscenes = nuScenes(aug_params, train_info_file=train_info_file, split='training')
+        train_dataset = nuscenes
 
-    print('Training with %d image pairs' % len(train_dataset))
+
+    print('Training with %d image pairs' % len(train_dataset.image_list))
     return train_dataset

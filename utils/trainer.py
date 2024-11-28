@@ -19,11 +19,12 @@ import torch.distributed as dist
 
 from PIL import Image
 
-from .loss import get_loss, get_loss_multi
+from .loss import get_loss, get_loss_multi, get_loss_nusc
 from .draw import disp2rgb, flow_uv_to_colors, flow_to_image
 
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
 
+from torch.utils.tensorboard import SummaryWriter
 
 
 class TTCTrainer(object):
@@ -106,6 +107,8 @@ class TTCTrainer(object):
 
         aug_params = {'crop_size': crop_size, 'min_scale': -0.2, 'max_scale': 0.4, 'do_flip': True}
 
+        self.writer = SummaryWriter(log_dir="./log/tensorboard")
+
     def get_optimizer(self):
         params = list(self.model.named_parameters())
         param_group = [
@@ -126,6 +129,7 @@ class TTCTrainer(object):
         print("Learning rate: ", self.optimizer.state_dict()['param_groups'][0]['lr'])
         # loss_now = self.eval_epoch()
         # print('Eval: ', loss_now)
+
         for epoch in range(self.start_epoch, self.epoch):
             print('Epoch:', epoch)
             self.loss_per_epoch = 0
@@ -135,29 +139,62 @@ class TTCTrainer(object):
             # if torch.distributed.get_rank()==0:
             #print(('Train %f %f '%(self.loss_per_epoch/max(1,self.iters), self.loss_sum_per_epoch/max(1,self.iters))))
             self.train_epoch(epoch)
-            loss_now = self.eval_epoch()
-            print('Eval: ', loss_now)
-            if (self.parallel and torch.distributed.get_rank()==0) or (not self.parallel):
-                file = open(loss_txt,'a')
-                file.write('Loss in epoch %d: '%(epoch))
-                # file.write('Train %f %f '%(self.loss_per_epoch/max(1,self.iters), self.loss_sum_per_epoch/max(1,self.iters))) 
-                file.write('Train %f'%(self.loss_per_epoch/max(1,self.iters)))   
-                file.write('Test %f\n'%(loss_now))          
-                file.close()
 
-                if (epoch<self.epoch and epoch%self.checkpoint==0):
+            # loss_now = self.eval_epoch()
+            # print('Eval: ', loss_now)
+            # if (self.parallel and torch.distributed.get_rank()==0) or (not self.parallel):
+            #     file = open(loss_txt,'a')
+            #     file.write('Loss in epoch %d: '%(epoch))
+            #     # file.write('Train %f %f '%(self.loss_per_epoch/max(1,self.iters), self.loss_sum_per_epoch/max(1,self.iters)))
+            #     file.write('Train %f'%(self.loss_per_epoch/max(1,self.iters)))
+            #     file.write('Test %f\n'%(loss_now))
+            #     file.close()
+            #
+            #     if (epoch<self.epoch and epoch%self.checkpoint==0):
+            #         checkpoint = {
+            #                 "net": self.model.state_dict(),
+            #                 'optimizer':self.optimizer.state_dict(),
+            #                 "epoch": epoch+1
+            #             }
+            #         temp_pth = self.model_path[:-8] + str(epoch) + 'y.pth.tar'
+            #         # temp_pth = self.model_path[:-10] + '_y' + str(epoch) + '.pth.tar'
+            #         torch.save(checkpoint, temp_pth)
+            #
+            #     print("Loss in epoch", epoch, ":", self.loss_per_epoch/max(1,self.iters))
+            #     print("Learning rate: ", self.optimizer.state_dict()['param_groups'][0]['lr'])
+
+            if (self.parallel and torch.distributed.get_rank() == 0) or (not self.parallel):
+                # file = open(loss_txt, 'a')
+                # file.write('Loss in epoch %d: ' % (epoch))
+                # # file.write('Train %f %f '%(self.loss_per_epoch/max(1,self.iters), self.loss_sum_per_epoch/max(1,self.iters)))
+                # file.write('Train %f' % (self.loss_per_epoch / max(1, self.iters)))
+                # file.write('Test %f\n' % (loss_now))
+                # file.close()
+
+                if (epoch < self.epoch and epoch % self.checkpoint == 0):
                     checkpoint = {
-                            "net": self.model.state_dict(),
-                            'optimizer':self.optimizer.state_dict(),
-                            "epoch": epoch+1
-                        }
-                    temp_pth = self.model_path[:-8] + str(epoch) + 'y.pth.tar'
+                        "net": self.model.state_dict(),
+                        'optimizer': self.optimizer.state_dict(),
+                        "epoch": epoch + 1
+                    }
+                    # # 用当前的时间戳为模型保存路径命名
+                    # current_time = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
+                    # ckpt_save_path = os.path.join('./log', current_time)
+                    # os.makedirs(ckpt_save_path, exist_ok=True)
+                    temp_pth = os.path.join(out_dir, f'{epoch}y.pth.tar')
+
+                    # temp_pth = ckpt_save_path + str(epoch) + 'y.pth.tar'
                     # temp_pth = self.model_path[:-10] + '_y' + str(epoch) + '.pth.tar'
                     torch.save(checkpoint, temp_pth)
-                
-                print("Loss in epoch", epoch, ":", self.loss_per_epoch/max(1,self.iters))
+
+                print("Loss in epoch", epoch, ":", self.loss_per_epoch / max(1, self.iters))
                 print("Learning rate: ", self.optimizer.state_dict()['param_groups'][0]['lr'])
 
+            # # 每个epoch结束后记录平均损失
+            # self.writer.add_scalar("Train/Epoch_Loss", self.loss_per_epoch / max(1, self.iters), epoch)
+
+        # 训练结束后关闭SummaryWriter
+        self.writer.close()
 
         # end = time.time()
         # total_time = end-start
@@ -175,15 +212,21 @@ class TTCTrainer(object):
         save_index = 2000 if not self.parallel else random.randint(int(4000/self.batch_size),int(8000/self.batch_size))
         t0 = time.time()
         for i, data in enumerate(self.train_loader):
+
+            if i > 0:
+                break
             
             #print('aaaaaaaaaaaaaaaaaa', time.time()-t0)
             #print('xxxxxxxxxxxxxxxxxx', i)
-            img0, img1, flow_gt, imgAux , valid = data
+            img0, img1, timestamp0, timestamp1, gt_scale, valid = data
+            # img0, img1, flow_gt, imgAux , valid = data
             img0, img1 = img0.to(self.device), img1.to(self.device)
-            # flow_gt ,imgAux = flow_gt.to(self.device), imgAux.to(self.device)
-            imgAux = imgAux.to(self.device)
+            gt_scale = gt_scale.to(self.device)
             valid = valid.to(self.device)
-            flow_gt = flow_gt.to(self.device)
+            # flow_gt ,imgAux = flow_gt.to(self.device), imgAux.to(self.device)
+            # imgAux = imgAux.to(self.device)
+            # valid = valid.to(self.device)
+            # flow_gt = flow_gt.to(self.device)
             start_time = time.time()
             #print(img0.shape)
             self.optimizer.zero_grad()
@@ -205,10 +248,16 @@ class TTCTrainer(object):
             # print(scale.shape, flow.shape)
             # scale_gt_selfsup = self_supervised_gt_affine(flow)[0]
             # scale_gt_selfsup[~(valid[0].unsqueeze(0).bool())] = 0
-            if type(scale) == list:
-                loss, loss_last, gt_scale, mask = get_loss_multi(scale, imgAux, epoch)
-            else:
-                loss, loss_last, gt_scale, f1 = get_loss(scale, flow, imgAux, flow_gt, valid, epoch)
+            # if type(scale) == list:
+            #     loss, loss_last, gt_scale, mask = get_loss_multi(scale, imgAux, epoch)
+            # else:
+            #     loss, loss_last, gt_scale, f1 = get_loss(scale, flow, imgAux, flow_gt, valid, epoch)
+
+            loss = get_loss_nusc(scale, gt_scale, valid)
+            loss_last = None
+
+            if i % 10 == 0:
+                self.writer.add_scalar("Train/Batch_Loss", loss.item(), epoch * len(self.train_loader) + i)
 
             # torch.distributed.barrier()
             time3 = time.time()
@@ -219,7 +268,7 @@ class TTCTrainer(object):
             # if torch.isnan(loss):
             #     continue
             #print(scale_gt_selfsup.shape, gt_scale.shape)
-            loss_last.backward()
+            loss.backward()
             #self.average_gradients()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             
@@ -231,11 +280,11 @@ class TTCTrainer(object):
             if type(scale) == list:
                 scale = scale[-1]
             if i%int(save_index)==0:
-                out_of_viz = flow_to_image((flow.permute(0,2,3,1).detach().cpu().numpy())[0])
-                cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'flow'+'.jpg'), out_of_viz)
-
-                out_of_viz = flow_to_image((flow_gt.permute(0,2,3,1).detach().cpu().numpy())[0])
-                cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'flowgt'+'.jpg'), out_of_viz)
+                # out_of_viz = flow_to_image((flow.permute(0,2,3,1).detach().cpu().numpy())[0])
+                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'flow'+'.jpg'), out_of_viz)
+                #
+                # out_of_viz = flow_to_image((flow_gt.permute(0,2,3,1).detach().cpu().numpy())[0])
+                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'flowgt'+'.jpg'), out_of_viz)
 
                 ttc_warp_image2 = ((scale[0]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
                 ttc_warp_image2 = disp2rgb(np.clip(ttc_warp_image2.detach().cpu().numpy(), 0.0, 1.0))
@@ -261,10 +310,14 @@ class TTCTrainer(object):
                 # occ_image = np.asarray(occ_image, dtype=np.uint8)
                 # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'mask'+'.jpg'), occ_image)
 
-                ttc_warp_image = ((gt_scale[0,...]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
+                # ttc_warp_image = ((gt_scale[0,...]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
+                # ttc_warp_image = disp2rgb(np.clip(ttc_warp_image.detach().cpu().numpy(), 0.0, 1.0))
+                # ttc_warp_image = ttc_warp_image*255.0
+                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttcx'+'.jpg'), ttc_warp_image)
+                ttc_warp_image = (gt_scale[:1].transpose(0, 1).transpose(1, 2) - 0.5) / (1.0)
                 ttc_warp_image = disp2rgb(np.clip(ttc_warp_image.detach().cpu().numpy(), 0.0, 1.0))
-                ttc_warp_image = ttc_warp_image*255.0
-                cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttcx'+'.jpg'), ttc_warp_image)
+                ttc_warp_image = ttc_warp_image * 255.0
+                cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'ttcx' + '.jpg'), ttc_warp_image)
 
 
             # if (self.parallel and torch.distributed.get_rank()==0):

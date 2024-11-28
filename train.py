@@ -166,21 +166,21 @@ def main():
 
     epoch = 0
 
-    checkpoint = torch.load(args.resume, map_location=device)
-    if args.load_opt:
-        epoch = checkpoint['epoch']
-        optimizer.load_state_dict(checkpoint['optimizer'])
-    
-    if 'model' in checkpoint:
-        model.load_state_dict(checkpoint['model'])
-    elif 'net' in checkpoint:
-        # model.load_state_dict(data['net'])
-        #print(data['net'].items())
-        model.load_state_dict({k.replace('module.', ''): v for k, v in checkpoint['net'].items()})
-    elif 'state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
+    # checkpoint = torch.load(args.resume, map_location=device)
+    # if args.load_opt:
+    #     epoch = checkpoint['epoch']
+    #     optimizer.load_state_dict(checkpoint['optimizer'])
+    #
+    # if 'model' in checkpoint:
+    #     model.load_state_dict(checkpoint['model'])
+    # elif 'net' in checkpoint:
+    #     # model.load_state_dict(data['net'])
+    #     #print(data['net'].items())
+    #     model.load_state_dict({k.replace('module.', ''): v for k, v in checkpoint['net'].items()})
+    # elif 'state_dict' in checkpoint:
+    #     model.load_state_dict(checkpoint['state_dict'])
+    # else:
+    #     model.load_state_dict(checkpoint)
 
     
     if parallel:
@@ -199,10 +199,14 @@ def main():
         #     torch.distributed.barrier()
     else:
         if not os.path.isdir(out_dir):
-            os.mkdir(out_dir) 
-            loss_txt = out_dir + '/0.txt'
-            file = open(loss_txt,'w')
-            file.close()
+            # os.mkdir(out_dir)
+            # loss_txt = out_dir + '/0.txt'
+            # file = open(loss_txt,'w')
+            # file.close()
+            os.makedirs(out_dir)  # 创建多层目录
+            loss_txt = os.path.join(out_dir, '0.txt')  # 构建文件路径
+            with open(loss_txt, 'w') as file:
+                file.close()
 
     start = time.time()
     print('Start Loading ...')

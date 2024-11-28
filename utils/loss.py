@@ -240,3 +240,33 @@ def self_supervised_gt(flow_f):
 
     return scale_gt
 
+def get_loss_nusc(scale, gt_scale, valid):
+    # 移除单个维度，使所有张量形状为 (320, 640)
+    scale = scale.squeeze(0).squeeze(0)  # 将形状从 [1, 1, 320, 640] 压缩为 [320, 640]
+    gt_scale = gt_scale.squeeze(0)       # 将形状从 [1, 320, 640] 压缩为 [320, 640]
+    valid = valid.squeeze(0)             # 将形状从 [1, 320, 640] 压缩为 [320, 640]
+
+    gt_scale = torch.nan_to_num(gt_scale, nan=10)
+
+    # 处理 gt_scale 的有效范围
+    gt_scale[gt_scale <= 0] = 10
+    gt_scale[gt_scale > 3] = 10
+
+    # 创建有效的深度变化掩膜
+    maskdc = (gt_scale < 3) & (gt_scale > 0.3) & valid & (scale > 0)
+
+    if maskdc.sum() == 0:
+        return torch.tensor(0.0, device=scale.device)  # 返回 0 作为损失
+
+    # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
+    epsilon = 1e-6  # 预防性的小值
+    scale = torch.clamp(scale, min=epsilon)
+    gt_scale = torch.clamp(gt_scale, min=epsilon)
+
+    # 计算 scale loss
+    d_loss = (scale.log() - gt_scale.log()).abs()
+
+    sloss = (maskdc * d_loss).sum() / maskdc.sum()
+
+    # 返回 sloss 作为最终的损失
+    return sloss

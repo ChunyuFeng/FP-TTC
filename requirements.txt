@@ -6,7 +6,7 @@ fonttools==4.43.1
 imageio==2.31.5
 importlib-resources==6.1.0
 kiwisolver==1.4.5
-matplotlib==3.8.0
+matplotlib==3.7.5
 mmcv-full==1.7.1
 numpy==1.24.3
 opencv-python==4.7.0.72

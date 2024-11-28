@@ -293,7 +293,6 @@ class SparseFlowAugmentor:
         dc = np.ascontiguousarray(dc)
         return img1, img2, flow,dc,d1,d2,d1pre,d2pre,bkmask,ints, valid
 
-
 class SparseFlowAugmentorm:
     def __init__(self, crop_size, min_scale=-0.2, max_scale=0.5, do_flip=False):
         # spatial augmentation params
@@ -439,3 +438,98 @@ class SparseFlowAugmentorm:
         valid = np.ascontiguousarray(valid)
         dc = np.ascontiguousarray(dc)
         return img1, img2, flow, dc, valid
+
+
+class NuscAugmentor:
+    def __init__(self, crop_size, do_flip=False):
+        # 增强参数
+        self.crop_size = crop_size  # 裁剪后图像的大小
+        self.do_flip = do_flip  # 是否进行翻转
+        # self.photo_aug = ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.5 / 3.14)
+
+    # def color_transform(self, img):
+    #     """颜色增强（对称）"""
+    #     img = np.array(self.photo_aug(Image.fromarray(img)), dtype=np.uint8)
+    #     return img
+
+    def resize_and_crop(self, img):
+        """将图像缩放并裁剪到指定大小"""
+        w, h = img.size
+        crop_h, crop_w = self.crop_size
+        resize = max(crop_h / h, crop_w / w)
+
+        resize_h, resize_w = int(h * resize), int(w * resize)
+        crop_h_start = (resize_h - crop_h) // 2
+        crop_w_start = (resize_w - crop_w) // 2
+        crop = (crop_w_start, crop_h_start, crop_w_start + crop_w, crop_h_start + crop_h)
+
+        if img.mode == 'RGB':
+            img = img.resize((resize_w, resize_h), Image.BILINEAR)
+        elif img.mode == 'F':
+            img = self.resize_with_explicit_mapping(img, (resize_h, resize_w))
+        else:
+            raise ValueError(f'Unsupported image mode: {img.mode}')
+
+        img = img.crop(crop)
+
+        return img
+
+    def resize_with_explicit_mapping(self, img, resize_dims, fill_value=np.nan):
+        # 将图像转换为 NumPy 数组
+        img_np = np.array(img)
+        # 提取有效数据的位置和值（非 NaN 的位置）
+        valid_coords = np.argwhere(~np.isnan(img_np))  # 获取有效数据的坐标 (y, x)
+        valid_values = img_np[~np.isnan(img_np)]  # 获取有效数据的值
+        # 计算缩放因子
+        resize_coef = max(resize_dims[0] / img_np.shape[0], resize_dims[1] / img_np.shape[1])
+        # 对有效坐标进行缩放
+        scaled_coords = (valid_coords * resize_coef).astype(int)
+        # 创建填充了 fill_value 的新图像
+        resized_img_np = np.full((resize_dims[0], resize_dims[1]), fill_value, dtype=np.float32)
+        # 将有效值填充到新的位置
+        for (y, x), value in zip(scaled_coords, valid_values):
+            if 0 <= y < resize_dims[0] and 0 <= x < resize_dims[1]:  # 检查边界
+                resized_img_np[y, x] = value
+        # 转换为 PIL 图像返回
+        return Image.fromarray(resized_img_np, mode='F')
+
+
+    def center_crop(self, img):
+        """从图像中心裁剪到指定大小"""
+        ht, wd = img.shape[:2]
+        crop_h, crop_w = self.crop_size
+
+        # 计算中心裁剪的起始坐标
+        center_y, center_x = ht // 2, wd // 2
+        start_y = max(0, center_y - crop_h // 2)
+        start_x = max(0, center_x - crop_w // 2)
+
+        # 裁剪图像
+        img_cropped = img[start_y:start_y + crop_h, start_x:start_x + crop_w]
+
+        # 如果裁剪区域小于目标大小，用填充补齐
+        if img_cropped.shape[0] < crop_h or img_cropped.shape[1] < crop_w:
+            pad_h = crop_h - img_cropped.shape[0]
+            pad_w = crop_w - img_cropped.shape[1]
+            img_cropped = cv2.copyMakeBorder(img_cropped, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
+
+        return img_cropped
+
+    def flip_transform(self, img):
+        """图像翻转"""
+        if self.do_flip:
+            if np.random.rand() < 0.5:  # 水平翻转
+                img = img[:, ::-1]
+            if np.random.rand() < 0.1:  # 垂直翻转
+                img = img[::-1, :]
+        return img
+
+    def __call__(self, img):
+
+        img = self.resize_and_crop(img)
+
+        # 将 PIL 图像转换为 NumPy 数组
+        if isinstance(img, Image.Image):
+            img = np.array(img)
+
+        return np.ascontiguousarray(img)
