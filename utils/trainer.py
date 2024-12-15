@@ -212,10 +212,6 @@ class TTCTrainer(object):
         save_index = 2000 if not self.parallel else random.randint(int(4000/self.batch_size),int(8000/self.batch_size))
         t0 = time.time()
         for i, data in enumerate(self.train_loader):
-
-            if i > 0:
-                break
-            
             #print('aaaaaaaaaaaaaaaaaa', time.time()-t0)
             #print('xxxxxxxxxxxxxxxxxx', i)
             img0, img1, timestamp0, timestamp1, gt_scale, valid = data

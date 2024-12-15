@@ -242,7 +242,7 @@ def self_supervised_gt(flow_f):
 
 def get_loss_nusc(scale, gt_scale, valid):
     # 移除单个维度，使所有张量形状为 (320, 640)
-    scale = scale.squeeze(0).squeeze(0)  # 将形状从 [1, 1, 320, 640] 压缩为 [320, 640]
+    scale = scale.squeeze(1)  # 将形状从 [1, 1, 320, 640] 压缩为 [320, 640]
     gt_scale = gt_scale.squeeze(0)       # 将形状从 [1, 320, 640] 压缩为 [320, 640]
     valid = valid.squeeze(0)             # 将形状从 [1, 320, 640] 压缩为 [320, 640]
 

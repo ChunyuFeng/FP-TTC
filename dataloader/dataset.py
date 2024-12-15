@@ -484,7 +484,7 @@ class Driving(FlowDataset):
 
 
 class nuScenes(data.Dataset):
-    def __init__(self, aug_params=None, split='training', train_info_file='train_infos_150.pkl',
+    def __init__(self, aug_params=None, split='training', train_info_file='train_infos_1000.pkl',
                  root='/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes'):
         self.aug_params = aug_params
         self.split = split
@@ -556,8 +556,21 @@ class nuScenes(data.Dataset):
         gt_scale = torch.from_numpy(gt_scale).float()
         mask = torch.from_numpy(mask)
 
+        #################### 统计gt中的有效值 ####################
+        # 点云数只占图像像素数的 1%
+        non_nan_values = gt_scale[~torch.isnan(gt_scale)]
+        non_nan_count = non_nan_values.numel()
+
+
         # 返回图像、时间戳、深度
         return img1_tensor, img2_tensor, timestamp1, timestamp2, gt_scale, mask
+
+    def __rmul__(self, v):
+        self.timestamp_list = v * self.timestamp_list
+        self.image_list = v * self.image_list
+        self.depth_list = v * self.depth_list
+        # self.occ_list = v * self.occ_list
+        return self
 
 def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
     """ Create the data loader for the corresponding trainign set """
@@ -581,9 +594,9 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
 
     elif args.stage == 'nuscenes':
         aug_params = {'crop_size': args.image_size, 'do_flip': False}
-        train_info_file = 'train_infos_1000.pkl'
+        train_info_file = 'train_infos_500_ground.pkl'
         nuscenes = nuScenes(aug_params, train_info_file=train_info_file, split='training')
-        train_dataset = nuscenes
+        train_dataset = 100*nuscenes
 
 
     print('Training with %d image pairs' % len(train_dataset.image_list))

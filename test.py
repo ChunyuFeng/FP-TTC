@@ -11,6 +11,7 @@ from glob import glob
 from fpttc.fp_ttc import FpTTC
 from utils.trainer import TTCTrainer
 from utils.draw import disp2rgb, flow_uv_to_colors, flow_to_image
+import pickle
 
 parser = argparse.ArgumentParser()
 
@@ -163,7 +164,7 @@ def main():
     time_stamp = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
 
     model_loaded.eval()
-    out_dir = "./output/%s_selfcon_ttc"%(time_stamp)
+    out_dir = "./test/%s_selfcon_ttc"%(time_stamp)
     if not os.path.isdir(out_dir):
         os.mkdir(out_dir)
 
@@ -173,16 +174,30 @@ def main():
     # print(filenames)
     print('%d images found' % len(filenames))
 
+    camera_lut_path = './Datasets/nuscenes/camera_lut_sorted_ground.pkl'
+
+    # 读取 camera_lut.pkl
+    with open(camera_lut_path, 'rb') as file:
+        camera_lut = pickle.load(file)
+
     w, h = 640, 320
     total = 0
     with torch.no_grad():
-        for test_id in range(0, 200):
+        for test_id in range(0, 420):
             
-            if test_id%5!=0:
-                continue
-            
-            file_1 = inference_dir+str(test_id).zfill(6)+'_10.png'
-            file_2 = inference_dir+str(test_id).zfill(6)+'_11.png'
+            # if test_id%5!=0:
+            #     continue
+
+            img_idx = test_id
+
+            filepath1 = camera_lut[img_idx]['CAM_FRONT']['filename']
+            filename1 = os.path.basename(filepath1)
+            filepath2 = camera_lut[img_idx+1]['CAM_FRONT']['filename']
+            filename2 = os.path.basename(filepath2)
+
+
+            file_1 = inference_dir+filename1
+            file_2 = inference_dir+filename2
 
             image1 = Image.open(file_1).convert('RGB')
             image2 = Image.open(file_2).convert('RGB')
@@ -224,8 +239,8 @@ def main():
             ttc_warp_image2 = disp2rgb(np.clip(ttc_warp_image2.detach().cpu().numpy(), 0.0, 1.0))
             ttc_warp_image2 = ttc_warp_image2*255.0
             cv2.imwrite(os.path.join(out_dir, 'scale'+str(test_id)+'.png'), ttc_warp_image2)
-            txt_result = scale[0,0].detach().cpu().numpy()
-            np.save(os.path.join(out_dir, str(test_id)+'_eta_out.npy'), txt_result)
+            # txt_result = scale[0,0].detach().cpu().numpy()
+            # np.save(os.path.join(out_dir, str(test_id)+'_eta_out.npy'), txt_result)
 
 
 if __name__ == "__main__":

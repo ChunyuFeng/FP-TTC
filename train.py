@@ -166,21 +166,21 @@ def main():
 
     epoch = 0
 
-    # checkpoint = torch.load(args.resume, map_location=device)
-    # if args.load_opt:
-    #     epoch = checkpoint['epoch']
-    #     optimizer.load_state_dict(checkpoint['optimizer'])
-    #
-    # if 'model' in checkpoint:
-    #     model.load_state_dict(checkpoint['model'])
-    # elif 'net' in checkpoint:
-    #     # model.load_state_dict(data['net'])
-    #     #print(data['net'].items())
-    #     model.load_state_dict({k.replace('module.', ''): v for k, v in checkpoint['net'].items()})
-    # elif 'state_dict' in checkpoint:
-    #     model.load_state_dict(checkpoint['state_dict'])
-    # else:
-    #     model.load_state_dict(checkpoint)
+    checkpoint = torch.load(args.resume, map_location=device)
+    if args.load_opt:
+        epoch = checkpoint['epoch']
+        optimizer.load_state_dict(checkpoint['optimizer'])
+
+    if 'model' in checkpoint:
+        model.load_state_dict(checkpoint['model'])
+    elif 'net' in checkpoint:
+        # model.load_state_dict(data['net'])
+        #print(data['net'].items())
+        model.load_state_dict({k.replace('module.', ''): v for k, v in checkpoint['net'].items()})
+    elif 'state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
 
     
     if parallel:

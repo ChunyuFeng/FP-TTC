@@ -181,8 +181,8 @@ def main():
             if test_id%5!=0:
                 continue
             
-            file_1 = inference_dir+str(test_id).zfill(6)+'_10.png'
-            file_2 = inference_dir+str(test_id).zfill(6)+'_11.png'
+            file_1 = inference_dir+'/1.jpg'
+            file_2 = inference_dir+'/2.jpg'
 
             image1 = Image.open(file_1).convert('RGB')
             image2 = Image.open(file_2).convert('RGB')
