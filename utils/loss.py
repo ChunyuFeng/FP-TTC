@@ -1,3 +1,4 @@
+
 from PIL import Image
 import os
 import time
@@ -111,9 +112,6 @@ def ttc_smooth_loss(img, disp, mask):
     grad_disp_y *= torch.exp(-grad_img_y)
 
     return (grad_disp_x*mask).sum()/mask.sum() + (grad_disp_y*mask).sum()/mask.sum()
-
-
-
 
 
 def get_loss_selfsup(scale, valid, scale_gt):
@@ -270,3 +268,65 @@ def get_loss_nusc(scale, gt_scale, valid):
 
     # 返回 sloss 作为最终的损失
     return sloss
+
+def get_loss_mix(scale, gt_scale_with_mask):
+    # 移除单个维度，使所有张量形状为 (320, 640)
+    scale = scale.squeeze(1)  # 将形状从 [batch_size, 1, 320, 640] 压缩为 [batch_size, 320, 640]
+    gt_scale = gt_scale_with_mask[:,0,:,:]
+    valid = gt_scale_with_mask[:,1,:,:].bool()
+
+    gt_scale = torch.nan_to_num(gt_scale, nan=10)
+
+    # 处理 gt_scale 的有效范围
+    gt_scale[gt_scale <= 0] = 10
+    gt_scale[gt_scale > 3] = 10
+
+    # 创建有效的深度变化掩膜
+    maskdc = (gt_scale < 3) & (gt_scale > 0.3) & valid & (scale > 0)
+
+    if maskdc.sum() == 0:
+        return torch.tensor(0.0, device=scale.device)  # 返回 0 作为损失
+
+    # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
+    epsilon = 1e-6  # 预防性的小值
+    scale = torch.clamp(scale, min=epsilon)
+    gt_scale = torch.clamp(gt_scale, min=epsilon)
+
+    # 计算 scale loss
+    d_loss = (scale.log() - gt_scale.log()).abs()
+
+    # sloss = (maskdc * d_loss).sum() / maskdc.sum()
+    sloss = d_loss[maskdc].mean()
+    # 返回 sloss 作为最终的损失
+    return sloss, valid
+
+def get_loss_range_image(scale, gt_scale_with_mask):
+    # 移除单个维度，使所有张量形状为 (320, 640)
+    scale = scale.squeeze(1)  # 将形状从 [batch_size, 1, H, W] 压缩为 [batch_size, H, W]
+    gt_scale = gt_scale_with_mask[:,0,:,:]
+    valid = gt_scale_with_mask[:,1,:,:].bool()
+
+    gt_scale = torch.nan_to_num(gt_scale, nan=10)
+
+    # 处理 gt_scale 的有效范围
+    gt_scale[gt_scale <= 0] = 10
+    gt_scale[gt_scale > 3] = 10
+
+    # 创建有效的深度变化掩膜
+    maskdc = (gt_scale < 3) & (gt_scale > 0.3) & valid & (scale > 0)
+
+    if maskdc.sum() == 0:
+        return torch.tensor(0.0, device=scale.device)  # 返回 0 作为损失
+
+    # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
+    epsilon = 1e-6  # 预防性的小值
+    scale = torch.clamp(scale, min=epsilon)
+    gt_scale = torch.clamp(gt_scale, min=epsilon)
+
+    # 计算 scale loss
+    d_loss = (scale.log() - gt_scale.log()).abs()
+
+    # sloss = (maskdc * d_loss).sum() / maskdc.sum()
+    sloss = d_loss[maskdc].mean()
+    # 返回 sloss 作为最终的损失
+    return sloss, valid

@@ -1,4 +1,6 @@
 import os
+
+import matplotlib.pyplot as plt
 import torch
 import torchvision.transforms as transforms
 import cv2
@@ -19,8 +21,8 @@ import torch.distributed as dist
 
 from PIL import Image
 
-from .loss import get_loss, get_loss_multi, get_loss_nusc
-from .draw import disp2rgb, flow_uv_to_colors, flow_to_image
+from .loss import get_loss, get_loss_multi, get_loss_nusc, get_loss_mix, get_loss_range_image
+from .draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_iamge
 
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
 
@@ -209,147 +211,434 @@ class TTCTrainer(object):
         ten_loss_sum = 0
 
         out_dir = "./log/%s_selfcon_ttc"%(self.time_stamp)
-        save_index = 2000 if not self.parallel else random.randint(int(4000/self.batch_size),int(8000/self.batch_size))
+        save_index = 400 if not self.parallel else random.randint(int(4000/self.batch_size),int(8000/self.batch_size))
         t0 = time.time()
         for i, data in enumerate(self.train_loader):
             #print('aaaaaaaaaaaaaaaaaa', time.time()-t0)
             #print('xxxxxxxxxxxxxxxxxx', i)
-            img0, img1, timestamp0, timestamp1, gt_scale, valid = data
-            # img0, img1, flow_gt, imgAux , valid = data
-            img0, img1 = img0.to(self.device), img1.to(self.device)
-            gt_scale = gt_scale.to(self.device)
-            valid = valid.to(self.device)
-            # flow_gt ,imgAux = flow_gt.to(self.device), imgAux.to(self.device)
-            # imgAux = imgAux.to(self.device)
-            # valid = valid.to(self.device)
-            # flow_gt = flow_gt.to(self.device)
-            start_time = time.time()
-            #print(img0.shape)
-            self.optimizer.zero_grad()
-            # for param in self.model.parameters():
-            #     param.grad = None
-            
-            time2 = time.time()
+            if len(data) == 6: # nuscenes dataset
+                img0, img1, timestamp0, timestamp1, gt_scale, valid = data
+                # img0, img1, flow_gt, imgAux , valid = data
+                img0, img1 = img0.to(self.device), img1.to(self.device)
+                gt_scale = gt_scale.to(self.device)
+                valid = valid.to(self.device)
+                # flow_gt ,imgAux = flow_gt.to(self.device), imgAux.to(self.device)
+                # imgAux = imgAux.to(self.device)
+                # valid = valid.to(self.device)
+                # flow_gt = flow_gt.to(self.device)
+                start_time = time.time()
+                #print(img0.shape)
+                self.optimizer.zero_grad()
+                # for param in self.model.parameters():
+                #     param.grad = None
 
-            scale, flow, scale_pre = self.model(img0, img1,
-                                    attn_type=self.attn_type,
-                                    attn_splits_list=self.attn_splits_list,
-                                    corr_radius_list=self.corr_radius_list,
-                                    prop_radius_list=self.prop_radius_list,
-                                    num_reg_refine=self.num_reg_refine,
-                                    )
+                time2 = time.time()
 
-            end_time = time.time()
-            #print(end_time-time2)
-            # print(scale.shape, flow.shape)
-            # scale_gt_selfsup = self_supervised_gt_affine(flow)[0]
-            # scale_gt_selfsup[~(valid[0].unsqueeze(0).bool())] = 0
-            # if type(scale) == list:
-            #     loss, loss_last, gt_scale, mask = get_loss_multi(scale, imgAux, epoch)
-            # else:
-            #     loss, loss_last, gt_scale, f1 = get_loss(scale, flow, imgAux, flow_gt, valid, epoch)
+                scale, flow, scale_pre = self.model(img0, img1,
+                                        attn_type=self.attn_type,
+                                        attn_splits_list=self.attn_splits_list,
+                                        corr_radius_list=self.corr_radius_list,
+                                        prop_radius_list=self.prop_radius_list,
+                                        num_reg_refine=self.num_reg_refine,
+                                        )
 
-            loss = get_loss_nusc(scale, gt_scale, valid)
-            loss_last = None
+                end_time = time.time()
+                #print(end_time-time2)
+                # print(scale.shape, flow.shape)
+                # scale_gt_selfsup = self_supervised_gt_affine(flow)[0]
+                # scale_gt_selfsup[~(valid[0].unsqueeze(0).bool())] = 0
+                # if type(scale) == list:
+                #     loss, loss_last, gt_scale, mask = get_loss_multi(scale, imgAux, epoch)
+                # else:
+                #     loss, loss_last, gt_scale, f1 = get_loss(scale, flow, imgAux, flow_gt, valid, epoch)
 
-            if i % 10 == 0:
-                self.writer.add_scalar("Train/Batch_Loss", loss.item(), epoch * len(self.train_loader) + i)
+                loss = get_loss_nusc(scale, gt_scale, valid)
+                loss_last = None
 
-            # torch.distributed.barrier()
-            time3 = time.time()
-            # loss += ttc_smooth_loss(img1, scale, torch.ones_like(valid))
-            # if isinstance(loss, float):
-            #     continue
-
-            # if torch.isnan(loss):
-            #     continue
-            #print(scale_gt_selfsup.shape, gt_scale.shape)
-            loss.backward()
-            #self.average_gradients()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-            
-            self.optimizer.step()
-            self.lr_scheduler3.step()
-            #print(time.time()-time3, time3-time2, time2-time1)
-
-            #print(flow.shape, scale.shape, gt_scale.shape, img0.shape)
-            if type(scale) == list:
-                scale = scale[-1]
-            if i%int(save_index)==0:
-                # out_of_viz = flow_to_image((flow.permute(0,2,3,1).detach().cpu().numpy())[0])
-                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'flow'+'.jpg'), out_of_viz)
-                #
-                # out_of_viz = flow_to_image((flow_gt.permute(0,2,3,1).detach().cpu().numpy())[0])
-                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'flowgt'+'.jpg'), out_of_viz)
-
-                ttc_warp_image2 = ((scale[0]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
-                ttc_warp_image2 = disp2rgb(np.clip(ttc_warp_image2.detach().cpu().numpy(), 0.0, 1.0))
-                ttc_warp_image2 = ttc_warp_image2*255.0
-                cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttcs'+'.jpg'), ttc_warp_image2)
-
-                # img = ((img0[0]).transpose(0,1).transpose(1,2))
-                # img = np.clip(img.detach().cpu().numpy(), 0.0, 255.0)
-                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'img'+'.jpg'), img)
-                
-                img = ((img0[0]).transpose(0,1).transpose(1,2))
-                img = np.clip(img.detach().cpu().numpy(), 0.0, 255.0)
-                cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'img1'+'.jpg'), img)
-
-                # ttc_warp_image = ((scale_gt_selfsup[0:1,...]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
-                # ttc_warp_image = disp2rgb(np.clip(ttc_warp_image.detach().cpu().numpy(), 0.0, 1.0))
-                # ttc_warp_image = ttc_warp_image*255.0
-                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttc_self'+'.jpg'), ttc_warp_image)
-
-                # occ_image = (mask[0]).transpose(0,1).transpose(1,2).detach().cpu().numpy()
-                # occ_image = (occ_image*255)
-                # occ_image = np.repeat(occ_image, 3, axis=2)
-                # occ_image = np.asarray(occ_image, dtype=np.uint8)
-                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'mask'+'.jpg'), occ_image)
-
-                # ttc_warp_image = ((gt_scale[0,...]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
-                # ttc_warp_image = disp2rgb(np.clip(ttc_warp_image.detach().cpu().numpy(), 0.0, 1.0))
-                # ttc_warp_image = ttc_warp_image*255.0
-                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttcx'+'.jpg'), ttc_warp_image)
-                ttc_warp_image = (gt_scale[:1].transpose(0, 1).transpose(1, 2) - 0.5) / (1.0)
-                ttc_warp_image = disp2rgb(np.clip(ttc_warp_image.detach().cpu().numpy(), 0.0, 1.0))
-                ttc_warp_image = ttc_warp_image * 255.0
-                cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'ttcx' + '.jpg'), ttc_warp_image)
-
-
-            # if (self.parallel and torch.distributed.get_rank()==0):
-            #     dist.all_reduce(loss, op = dist.ReduceOp.SUM)
-            #     loss /= float(dist.get_world_size())
-            #     if i % 10 == 0:
-            #         print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
-            #             ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
-            #             '{:6.4f}'.format(loss.item()))
-            # else:
-            if loss_last is not None:
-                self.loss_per_epoch += loss.item()
-                self.loss_sum_per_epoch += loss_last.item()
                 if i % 10 == 0:
+                    self.writer.add_scalar("Train/Batch_Loss", loss.item(), epoch * len(self.train_loader) + i)
+
+                # torch.distributed.barrier()
+                time3 = time.time()
+                # loss += ttc_smooth_loss(img1, scale, torch.ones_like(valid))
+                # if isinstance(loss, float):
+                #     continue
+
+                # if torch.isnan(loss):
+                #     continue
+                #print(scale_gt_selfsup.shape, gt_scale.shape)
+                loss.backward()
+                #self.average_gradients()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+
+                self.optimizer.step()
+                self.lr_scheduler3.step()
+                #print(time.time()-time3, time3-time2, time2-time1)
+
+                #print(flow.shape, scale.shape, gt_scale.shape, img0.shape)
+                if type(scale) == list:
+                    scale = scale[-1]
+                if i%int(save_index)==0:
+                    # out_of_viz = flow_to_image((flow.permute(0,2,3,1).detach().cpu().numpy())[0])
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'flow'+'.jpg'), out_of_viz)
+                    #
+                    # out_of_viz = flow_to_image((flow_gt.permute(0,2,3,1).detach().cpu().numpy())[0])
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'flowgt'+'.jpg'), out_of_viz)
+
+                    prediction_scale = ((scale[0]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
+                    prediction_scale = disp2rgb(np.clip(prediction_scale.detach().cpu().numpy(), 0.0, 1.0))
+                    prediction_scale = prediction_scale*255.0
+                    cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttcs'+'.jpg'), prediction_scale)
+
+                    # img = ((img0[0]).transpose(0,1).transpose(1,2))
+                    # img = np.clip(img.detach().cpu().numpy(), 0.0, 255.0)
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'img'+'.jpg'), img)
+
+                    img = ((img0[0]).transpose(0,1).transpose(1,2))
+                    img = np.clip(img.detach().cpu().numpy(), 0.0, 255.0)
+                    cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'img1'+'.jpg'), img)
+
+                    # ground_truth_scale = ((scale_gt_selfsup[0:1,...]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
+                    # ground_truth_scale = disp2rgb(np.clip(ground_truth_scale.detach().cpu().numpy(), 0.0, 1.0))
+                    # ground_truth_scale = ground_truth_scale*255.0
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttc_self'+'.jpg'), ground_truth_scale)
+
+                    # occ_image = (mask[0]).transpose(0,1).transpose(1,2).detach().cpu().numpy()
+                    # occ_image = (occ_image*255)
+                    # occ_image = np.repeat(occ_image, 3, axis=2)
+                    # occ_image = np.asarray(occ_image, dtype=np.uint8)
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'mask'+'.jpg'), occ_image)
+
+                    # ground_truth_scale = ((gt_scale[0,...]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
+                    # ground_truth_scale = disp2rgb(np.clip(ground_truth_scale.detach().cpu().numpy(), 0.0, 1.0))
+                    # ground_truth_scale = ground_truth_scale*255.0
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttcx'+'.jpg'), ground_truth_scale)
+                    ground_truth_scale = (gt_scale[:1].transpose(0, 1).transpose(1, 2) - 0.5) / (1.0)
+                    ground_truth_scale = disp2rgb(np.clip(ground_truth_scale.detach().cpu().numpy(), 0.0, 1.0))
+                    ground_truth_scale = ground_truth_scale * 255.0
+                    cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'ttcx' + '.jpg'), ground_truth_scale)
+
+
+                # if (self.parallel and torch.distributed.get_rank()==0):
+                #     dist.all_reduce(loss, op = dist.ReduceOp.SUM)
+                #     loss /= float(dist.get_world_size())
+                #     if i % 10 == 0:
+                #         print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
+                #             ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
+                #             '{:6.4f}'.format(loss.item()))
+                # else:
+                if loss_last is not None:
+                    self.loss_per_epoch += loss.item()
+                    self.loss_sum_per_epoch += loss_last.item()
+                    if i % 10 == 0:
+                            print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
+                                ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
+                                '{:6.4f}'.format(loss_last.item()) + '    ' + '{:6.4f}'.format(loss.item()), '    ' + '{:6.4f}'.format(f1.item()))
+                else:
+                    self.loss_per_epoch += loss.item()
+                    if i % 10 == 0:
                         print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
                             ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
-                            '{:6.4f}'.format(loss_last.item()) + '    ' + '{:6.4f}'.format(loss.item()), '    ' + '{:6.4f}'.format(f1.item()))
-            else:
-                self.loss_per_epoch += loss.item()
+                            '{:6.4f}'.format(loss.item()))
+
+
+                # if i % 10 == 0:
+                #     print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
+                #         ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
+                #         '{:6.4f}'.format(loss.item()) + '   Loss eva: ' + '{:6.4f}'.format(loss2.item()))
+
+                # self.loss_per_epoch += loss2.item()
+                self.iters += 1
+
+                t0 = time.time()
+
+                #print('Epoch Time: ', end_time-start_time)
+
+            if len(data) == 5:
+                img0, img1, flow_gt, imgAux, valid = data
+                img0, img1 = img0.to(self.device), img1.to(self.device)
+                # flow_gt ,imgAux = flow_gt.to(self.device), imgAux.to(self.device)
+                imgAux = imgAux.to(self.device)
+                valid = valid.to(self.device)
+                flow_gt = flow_gt.to(self.device)
+                start_time = time.time()
+                # print(img0.shape)
+                self.optimizer.zero_grad()
+                # for param in self.model.parameters():
+                #     param.grad = None
+
+                time2 = time.time()
+
+                scale, flow, scale_pre = self.model(img0, img1,
+                                                    attn_type=self.attn_type,
+                                                    attn_splits_list=self.attn_splits_list,
+                                                    corr_radius_list=self.corr_radius_list,
+                                                    prop_radius_list=self.prop_radius_list,
+                                                    num_reg_refine=self.num_reg_refine,
+                                                    )
+
+                end_time = time.time()
+                # print(end_time-time2)
+                # print(scale.shape, flow.shape)
+                # scale_gt_selfsup = self_supervised_gt_affine(flow)[0]
+                # scale_gt_selfsup[~(valid[0].unsqueeze(0).bool())] = 0
+                if type(scale) == list:
+                    loss, loss_last, gt_scale, mask = get_loss_multi(scale, imgAux, epoch)
+                else:
+                    loss, loss_last, gt_scale, f1 = get_loss(scale, flow, imgAux, flow_gt, valid, epoch)
+
+                # torch.distributed.barrier()
+                time3 = time.time()
+                # loss += ttc_smooth_loss(img1, scale, torch.ones_like(valid))
+                # if isinstance(loss, float):
+                #     continue
+
+                # if torch.isnan(loss):
+                #     continue
+                # print(scale_gt_selfsup.shape, gt_scale.shape)
+                loss_last.backward()
+                # self.average_gradients()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+
+                self.optimizer.step()
+                self.lr_scheduler3.step()
+                # print(time.time()-time3, time3-time2, time2-time1)
+
+                # print(flow.shape, scale.shape, gt_scale.shape, img0.shape)
+                if type(scale) == list:
+                    scale = scale[-1]
+                if i % int(save_index) == 0:
+                    out_of_viz = flow_to_image((flow.permute(0, 2, 3, 1).detach().cpu().numpy())[0])
+                    cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'flow' + '.jpg'), out_of_viz)
+
+                    out_of_viz = flow_to_image((flow_gt.permute(0, 2, 3, 1).detach().cpu().numpy())[0])
+                    cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'flowgt' + '.jpg'), out_of_viz)
+
+                    prediction_scale = ((scale[0]).transpose(0, 1).transpose(1, 2) - 0.5) / (1.0)
+                    prediction_scale = disp2rgb(np.clip(prediction_scale.detach().cpu().numpy(), 0.0, 1.0))
+                    prediction_scale = prediction_scale * 255.0
+                    cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'ttcs' + '.jpg'), prediction_scale)
+
+                    # img = ((img0[0]).transpose(0,1).transpose(1,2))
+                    # img = np.clip(img.detach().cpu().numpy(), 0.0, 255.0)
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'img'+'.jpg'), img)
+
+                    img = ((img0[0]).transpose(0, 1).transpose(1, 2))
+                    img = np.clip(img.detach().cpu().numpy(), 0.0, 255.0)
+                    cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'img1' + '.jpg'), img)
+
+                    # ground_truth_scale = ((scale_gt_selfsup[0:1,...]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
+                    # ground_truth_scale = disp2rgb(np.clip(ground_truth_scale.detach().cpu().numpy(), 0.0, 1.0))
+                    # ground_truth_scale = ground_truth_scale*255.0
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttc_self'+'.jpg'), ground_truth_scale)
+
+                    # occ_image = (mask[0]).transpose(0,1).transpose(1,2).detach().cpu().numpy()
+                    # occ_image = (occ_image*255)
+                    # occ_image = np.repeat(occ_image, 3, axis=2)
+                    # occ_image = np.asarray(occ_image, dtype=np.uint8)
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'mask'+'.jpg'), occ_image)
+
+                    ground_truth_scale = ((gt_scale[0, ...]).transpose(0, 1).transpose(1, 2) - 0.5) / (1.0)
+                    ground_truth_scale = disp2rgb(np.clip(ground_truth_scale.detach().cpu().numpy(), 0.0, 1.0))
+                    ground_truth_scale = ground_truth_scale * 255.0
+                    cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'ttcx' + '.jpg'), ground_truth_scale)
+
+                # if (self.parallel and torch.distributed.get_rank()==0):
+                #     dist.all_reduce(loss, op = dist.ReduceOp.SUM)
+                #     loss /= float(dist.get_world_size())
+                #     if i % 10 == 0:
+                #         print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
+                #             ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
+                #             '{:6.4f}'.format(loss.item()))
+                # else:
+                if loss_last is not None:
+                    self.loss_per_epoch += loss.item()
+                    self.loss_sum_per_epoch += loss_last.item()
+                    if i % 10 == 0:
+                        print(
+                            '[' + '{:5}'.format(i * self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
+                            ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
+                            '{:6.4f}'.format(loss_last.item()) + '    ' + '{:6.4f}'.format(loss.item()),
+                            '    ' + '{:6.4f}'.format(f1.item()))
+                else:
+                    self.loss_per_epoch += loss.item()
+                    if i % 10 == 0:
+                        print(
+                            '[' + '{:5}'.format(i * self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
+                            ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
+                            '{:6.4f}'.format(loss.item()))
+
+                # if i % 10 == 0:
+                #     print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
+                #         ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
+                #         '{:6.4f}'.format(loss.item()) + '   Loss eva: ' + '{:6.4f}'.format(loss2.item()))
+
+                # self.loss_per_epoch += loss2.item()
+                self.iters += 1
+
+                t0 = time.time()
+
+                # print('Epoch Time: ', end_time-start_time)
+
+            if len(data) == 3: # mix dataset
+                img0, img1, gt_scale_with_mask = data
+                # img0, img1, flow_gt, imgAux , valid = data
+                img0, img1 = img0.to(self.device), img1.to(self.device)
+                gt_scale_with_mask = gt_scale_with_mask.to(self.device)
+                # valid = valid.to(self.device)
+                # flow_gt ,imgAux = flow_gt.to(self.device), imgAux.to(self.device)
+                # imgAux = imgAux.to(self.device)
+                # valid = valid.to(self.device)
+                # flow_gt = flow_gt.to(self.device)
+                start_time = time.time()
+                #print(img0.shape)
+                self.optimizer.zero_grad()
+                # for param in self.model.parameters():
+                #     param.grad = None
+
+                time2 = time.time()
+
+                scale, flow, scale_pre = self.model(img0, img1,
+                                        attn_type=self.attn_type,
+                                        attn_splits_list=self.attn_splits_list,
+                                        corr_radius_list=self.corr_radius_list,
+                                        prop_radius_list=self.prop_radius_list,
+                                        num_reg_refine=self.num_reg_refine,
+                                        )
+
+                end_time = time.time()
+                #print(end_time-time2)
+                # print(scale.shape, flow.shape)
+                # scale_gt_selfsup = self_supervised_gt_affine(flow)[0]
+                # scale_gt_selfsup[~(valid[0].unsqueeze(0).bool())] = 0
+                # if type(scale) == list:
+                #     loss, loss_last, gt_scale, mask = get_loss_multi(scale, imgAux, epoch)
+                # else:
+                #     loss, loss_last, gt_scale, f1 = get_loss(scale, flow, imgAux, flow_gt, valid, epoch)
+
+                loss, valid_vis = get_loss_range_image(scale, gt_scale_with_mask)
+                loss_last = None
+
+                gt_scale = gt_scale_with_mask[:,0,:,:]
+                gt_scale = torch.nan_to_num(gt_scale, nan=0.0)
+                gt_scale_valid_mask = gt_scale_with_mask[:,1,:,:]
+
                 if i % 10 == 0:
-                    print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
-                        ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
-                        '{:6.4f}'.format(loss.item()))
+                    self.writer.add_scalar("Train/Batch_Loss", loss.item(), epoch * len(self.train_loader) + i)
 
-                                   
-            # if i % 10 == 0:
-            #     print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
-            #         ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
-            #         '{:6.4f}'.format(loss.item()) + '   Loss eva: ' + '{:6.4f}'.format(loss2.item()))
+                loss.backward()
 
-            # self.loss_per_epoch += loss2.item()
-            self.iters += 1
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
-            t0 = time.time()
-                
-            #print('Epoch Time: ', end_time-start_time)
+                self.optimizer.step()
+                self.lr_scheduler3.step()
+
+                if type(scale) == list:
+                    scale = scale[-1]
+                if i%int(save_index)==0:
+
+                    # 可视化 prediction_scale 和 gt_scale
+                    gt_scale_np = gt_scale[:1].squeeze(0).cpu().numpy()
+                    gt_scale_valid_mask_np = gt_scale_valid_mask[:1].squeeze(0).cpu().bool()
+                    normalized_gt = visual_scale_map_range_iamge(gt_scale_np, gt_scale_valid_mask_np)
+
+                    scale_np = scale[0].detach().squeeze(0).cpu().numpy()
+                    pred_valid_mask = scale_np > 0
+                    normalized_pred = visual_scale_map_range_iamge(scale_np, pred_valid_mask)
+
+                    # 保存可视化结果
+                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.jpg"), normalized_pred, cmap='seismic', vmin=-1, vmax=1)
+                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.jpg"), normalized_gt, cmap='seismic', vmin=-1, vmax=1)
+
+
+                    # img = ((img0[0]).transpose(0,1).transpose(1,2))
+                    # img = np.clip(img.detach().cpu().numpy(), 0.0, 255.0)
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'img1'+'.jpg'),
+                    #             cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                    #
+                    # # 处理 prediction_scale
+                    # prediction_scale = (scale[0].transpose(0, 1).transpose(1, 2) - 0.5) / 1.0
+                    # prediction_scale_np = prediction_scale.detach().squeeze(2).cpu().numpy()
+                    # prediction_scale_clipped = np.clip(prediction_scale_np, 0.0, 1.0)
+                    #
+                    # # 处理 gt_scale
+                    # ground_truth_scale = (gt_scale[:1].transpose(0, 1).transpose(1, 2) - 0.5) / 1.0
+                    # ground_truth_scale_np = ground_truth_scale.detach().squeeze(2).cpu().numpy()
+                    # ground_truth_scale_clipped = np.clip(ground_truth_scale_np, 0.0, 1.0)
+                    #
+                    # # 共同计算最小值和最大值
+                    # combined = np.concatenate([prediction_scale_clipped.flatten(), ground_truth_scale_clipped.flatten()])
+                    # scale_min = combined.min()
+                    # scale_max = combined.max()
+                    #
+                    # if scale_max - scale_min > 0:
+                    #     prediction_scale_normalized = (prediction_scale_clipped - scale_min) / (scale_max - scale_min)
+                    #     ground_truth_scale_normalized = (ground_truth_scale_clipped - scale_min) / (scale_max - scale_min)
+                    # else:
+                    #     prediction_scale_normalized = prediction_scale_clipped
+                    #     ground_truth_scale_normalized = ground_truth_scale_clipped
+                    #
+                    # # 转换为 RGB
+                    # rgb_pred = disp2rgb_normalized(prediction_scale_normalized, colormap_name='inferno')
+                    # rgb_gt = disp2rgb_normalized(ground_truth_scale_normalized, colormap_name='inferno')
+                    #
+                    # # 转换为 0-255 范围并转换为 uint8 类型
+                    # rgb_pred_uint8 = (rgb_pred * 255).astype(np.uint8)
+                    # rgb_gt_uint8 = (rgb_gt * 255).astype(np.uint8)
+                    #
+                    # # 保存图像
+                    # cv2.imwrite(os.path.join(out_dir, f"{epoch}_{i}_ttcs.jpg"),
+                    #             cv2.cvtColor(rgb_pred_uint8, cv2.COLOR_RGB2BGR))
+                    # cv2.imwrite(os.path.join(out_dir, f"{epoch}_{i}_ttcx.jpg"),
+                    #             cv2.cvtColor(rgb_gt_uint8, cv2.COLOR_RGB2BGR))
+
+
+                    # prediction_scale = ((scale[0]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
+                    # prediction_scale = disp2rgb(np.clip(prediction_scale.detach().cpu().numpy(), 0.0, 1.0))
+                    # prediction_scale = prediction_scale*255.0
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttcs'+'.jpg'), prediction_scale)
+                    #
+                    #
+                    # ground_truth_scale = (gt_scale[:1].transpose(0, 1).transpose(1, 2) - 0.5) / (1.0)
+                    # ground_truth_scale = disp2rgb(np.clip(ground_truth_scale.detach().cpu().numpy(), 0.0, 1.0))
+                    # ground_truth_scale = ground_truth_scale * 255.0
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'ttcx' + '.jpg'), ground_truth_scale)
+                    #
+                    # # # visualize gt_scale_valid_mask
+                    # # gt_scale_valid_mask = gt_scale_valid_mask.bool()
+                    # # gt_scale_valid_mask = gt_scale_valid_mask[:1].squeeze(0).cpu().numpy().astype(np.uint8)
+                    # # bool_mask_img = gt_scale_valid_mask * 255
+                    # # cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'mask' + '.jpg'), bool_mask_img)
+                    #
+                    # valid_vis = valid_vis[:1].squeeze(0).cpu().numpy().astype(np.uint8)
+                    # bool_mask_img = valid_vis * 255
+                    # cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'mask' + '.jpg'), bool_mask_img)
+
+
+                # if (self.parallel and torch.distributed.get_rank()==0):
+                #     dist.all_reduce(loss, op = dist.ReduceOp.SUM)
+                #     loss /= float(dist.get_world_size())
+                #     if i % 10 == 0:
+                #         print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
+                #             ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
+                #             '{:6.4f}'.format(loss.item()))
+                # else:
+                if loss_last is not None:
+                    self.loss_per_epoch += loss.item()
+                    self.loss_sum_per_epoch += loss_last.item()
+                    if i % 10 == 0:
+                            print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
+                                ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
+                                '{:6.4f}'.format(loss_last.item()) + '    ' + '{:6.4f}'.format(loss.item()), '    ' + '{:6.4f}'.format(f1.item()))
+                else:
+                    self.loss_per_epoch += loss.item()
+                    if i % 10 == 0:
+                        print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
+                            ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
+                            '{:6.4f}'.format(loss.item()))
+
+                self.iters += 1
+
         
     @torch.no_grad()
     def eval_epoch(self, eval_path='/mnt/pool/lcl/data/kitti/data_scene_flow/training/'):

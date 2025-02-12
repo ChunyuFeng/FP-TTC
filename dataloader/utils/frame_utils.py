@@ -147,3 +147,7 @@ def read_nusc_image(file_name):
 def read_nusc_scale(file_name):
     gt_scale = Image.open(file_name)
     return gt_scale
+
+def read_nusc_scale_range_image(file_name):
+    gt_scale = np.load(file_name)
+    return gt_scale

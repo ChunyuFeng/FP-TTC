@@ -13,7 +13,7 @@ def create_video_from_images(image_folder, output_video, frame_rate=30):
         frame_rate (int): 视频帧率（每秒显示的帧数），默认值为 30。
     """
 
-    # 获取所有 PNG 文件并按文件名中的数字排序
+    # pred - 获取所有 PNG 文件并按文件名中的数字排序
     image_files = sorted(
         glob(os.path.join(image_folder, '*.png')),
         key=lambda x: int(os.path.basename(x).split('scale')[-1].split('.')[0])
@@ -24,7 +24,7 @@ def create_video_from_images(image_folder, output_video, frame_rate=30):
         return
 
 
-    # # 获取所有文件并按照时间戳排序
+    # # gt - 获取所有文件并按照时间戳排序
     # image_files = sorted(
     #     glob(os.path.join(image_folder, '*.jpg')),
     #     key=lambda x: int(os.path.basename(x).split('__')[-1].split('.')[0])
@@ -53,9 +53,10 @@ def create_video_from_images(image_folder, output_video, frame_rate=30):
 
 # 示例用法
 if __name__ == "__main__":
-    image_folder = "./test/24_12_15-14_45_03_selfcon_ttc"
-    # image_folder = "./test/gt_with_img31_"
-    output_video = "./test/pred_31_new.mp4"  # 输出视频文件路径
+    image_folder = "./test/24_12_23-08_54_29_selfcon_ttc"
+    # image_folder = "./test/gt_with_img_31mix_"
+    output_video = "./test/pred_31mix_.mp4"  # 输出视频文件路径
+
     frame_rate = 10  # 帧率
 
     create_video_from_images(image_folder, output_video, frame_rate)

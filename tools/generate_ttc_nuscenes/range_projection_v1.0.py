@@ -153,8 +153,8 @@ def main():
         proj_range, proj_scale, proj_xyz, proj_idx, proj_mask = range_projection(
             points_prev,
             scales,
-            H=480,
-            W=5120,
+            H=160,
+            W=1280,
             fov_up=10.0,
             fov_down=-30.0
         )
@@ -214,7 +214,7 @@ def main():
             print(f"Scale <1 range: [{neg_range.min()}, {neg_range.max()}]")
 
         # 保存归一化后的 scale 映射图像，使用 bwr 色表
-        out_name = f"seismic_clip_range_{i}.png"
+        out_name = f"clip_range_{i}.png"
         out_path = os.path.join(output_dir, out_name)
 
         plt.imsave(out_path, normalized_display, cmap='seismic', vmin=-1, vmax=1)

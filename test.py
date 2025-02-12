@@ -10,7 +10,7 @@ import datetime
 from glob import glob
 from fpttc.fp_ttc import FpTTC
 from utils.trainer import TTCTrainer
-from utils.draw import disp2rgb, flow_uv_to_colors, flow_to_image
+from utils.draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image
 import pickle
 
 parser = argparse.ArgumentParser()
@@ -174,8 +174,8 @@ def main():
     # print(filenames)
     print('%d images found' % len(filenames))
 
-    camera_lut_path = './Datasets/nuscenes/camera_lut_sorted_ground.pkl'
-
+    camera_lut_path = './Datasets/nuscenes/camera_lut_sorted_ground_31mix.pkl'
+    # camera_lut_path = './Datasets/nuscenes/camera_lut_sorted.pkl'
     # 读取 camera_lut.pkl
     with open(camera_lut_path, 'rb') as file:
         camera_lut = pickle.load(file)
@@ -183,7 +183,8 @@ def main():
     w, h = 640, 320
     total = 0
     with torch.no_grad():
-        for test_id in range(0, 420):
+        # for test_id in range(1000, 1500):
+        for test_id in range(0, 500):
             
             # if test_id%5!=0:
             #     continue
@@ -235,12 +236,23 @@ def main():
                 scale = F.interpolate(scale, size=ori_size, mode='bilinear',
                                         align_corners=True)
 
-            ttc_warp_image2 = (scale[0].transpose(0,1).transpose(1,2) - 0.5) / (1.0) # [H, W, 2]
-            ttc_warp_image2 = disp2rgb(np.clip(ttc_warp_image2.detach().cpu().numpy(), 0.0, 1.0))
-            ttc_warp_image2 = ttc_warp_image2*255.0
-            cv2.imwrite(os.path.join(out_dir, 'scale'+str(test_id)+'.png'), ttc_warp_image2)
-            # txt_result = scale[0,0].detach().cpu().numpy()
-            # np.save(os.path.join(out_dir, str(test_id)+'_eta_out.npy'), txt_result)
+            prediction_scale = (scale[0].transpose(0,1).transpose(1,2) - 0.5) / (1.0) # [H, W, 2]
+            prediction_scale_np = prediction_scale.detach().squeeze(2).cpu().numpy()
+            prediction_scale_clipped = np.clip(prediction_scale_np, 0.0, 1.0)
+
+            scale_min = prediction_scale_clipped.min()
+            scale_max = prediction_scale_clipped.max()
+
+            if scale_max - scale_min > 0:
+                prediction_scale_normalized = (prediction_scale_clipped - scale_min) / (scale_max - scale_min)
+            else:
+                prediction_scale_normalized = prediction_scale_clipped
+
+            rgb_pred = disp2rgb_normalized(prediction_scale_normalized)
+
+            rgb_pred_uint8 = (rgb_pred * 255).astype(np.uint8)
+
+            cv2.imwrite(os.path.join(out_dir, 'scale' + str(test_id) + '.png'), rgb_pred_uint8)
 
 
 if __name__ == "__main__":

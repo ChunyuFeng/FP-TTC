@@ -9,10 +9,11 @@ import math
 import random
 from glob import glob
 import os.path as osp
+
 from .utils.rectangle_noise import retangle
 from .utils import frame_utils
 import  cv2
-from .utils.augmentor import FlowAugmentor, SparseFlowAugmentorm, NuscAugmentor
+from .utils.augmentor import FlowAugmentor, SparseFlowAugmentorm, NuscAugmentor, NuscRangeImageAugmentor
 
 
 def depth_read(filename):
@@ -290,7 +291,8 @@ class FlowDataset(data.Dataset):
         else:
             valid = (flow[0].abs() < 1000) & (flow[1].abs() < 1000)
 
-        return img1, img2, flow, dc_change, valid.float()
+        # return img1, img2, flow, dc_change, valid.float()
+        return img1, img2, dc_change
 
     def __rmul__(self, v):
         self.flow_list = v * self.flow_list
@@ -362,7 +364,7 @@ class FlyingThings3D(FlowDataset):
         return self.triangulation(d1),self.triangulation(d2),mask
 
 class KITTI(FlowDataset):
-    def __init__(self, aug_params=None, split='training', root='/mnt/pool/Datasets/OpticalFlow/kitti/data_scene_flow',get_depth=0):
+    def __init__(self, aug_params=None, split='training', root='./Datasets/kitti/data_scene_flow',get_depth=0):
         super(KITTI, self).__init__(aug_params, sparse=True)
         self.get_depth=get_depth
         if split == 'testing':
@@ -380,7 +382,7 @@ class KITTI(FlowDataset):
         disp2 = []
         flow =[]
 
-        root_img = '/mnt/pool/Datasets/OpticalFlow/kitti/data_scene_flow_multi'
+        root_img = './Datasets/kitti/data_scene_flow_multi'
         if split == 'training':
             root = osp.join(root, split)
             root_img = osp.join(root_img, split)
@@ -484,7 +486,7 @@ class Driving(FlowDataset):
 
 
 class nuScenes(data.Dataset):
-    def __init__(self, aug_params=None, split='training', train_info_file='train_infos_1000.pkl',
+    def __init__(self, aug_params=None, split='training', train_info_file='train_infos_500_ground_31mix_.pkl',
                  root='/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes'):
         self.aug_params = aug_params
         self.split = split
@@ -546,7 +548,14 @@ class nuScenes(data.Dataset):
 
         # 数据增强
         if self.augmentor is not None:
-            img1, img2, gt_scale= [self.augmentor(x) for x in [img1, img2, gt_scale]]
+            random_state = random.getstate()
+            img1 = self.augmentor(img1)
+            random.setstate(random_state)
+            img2 = self.augmentor(img2)
+            random.setstate(random_state)
+            gt_scale = self.augmentor(gt_scale)
+
+            # img1, img2, gt_scale= [self.augmentor(x) for x in [img1, img2, gt_scale]]
 
         mask = gt_scale > 0
 
@@ -556,14 +565,145 @@ class nuScenes(data.Dataset):
         gt_scale = torch.from_numpy(gt_scale).float()
         mask = torch.from_numpy(mask)
 
-        #################### 统计gt中的有效值 ####################
-        # 点云数只占图像像素数的 1%
-        non_nan_values = gt_scale[~torch.isnan(gt_scale)]
-        non_nan_count = non_nan_values.numel()
+        # 拼接gt_scale和mask
+        gt_scale_with_mask = torch.cat((gt_scale.unsqueeze(0), mask.unsqueeze(0).float()), dim=0)
+
+        # #################### 统计gt中的有效值 ####################
+        # # 点云数只占图像像素数的 1%
+        # non_nan_values = gt_scale[~torch.isnan(gt_scale)]
+        # non_nan_count = non_nan_values.numel()
 
 
         # 返回图像、时间戳、深度
-        return img1_tensor, img2_tensor, timestamp1, timestamp2, gt_scale, mask
+        # return img1_tensor, img2_tensor, timestamp1, timestamp2, gt_scale, mask
+        return img1_tensor, img2_tensor, gt_scale_with_mask
+
+    def __rmul__(self, v):
+        self.timestamp_list = v * self.timestamp_list
+        self.image_list = v * self.image_list
+        self.depth_list = v * self.depth_list
+        # self.occ_list = v * self.occ_list
+        return self
+
+class nuScenes_range_image(data.Dataset):
+    def __init__(self, aug_params=None, split='training', train_info_file='nusc_range_image_train_infos.pkl',
+                 root='/mnt/fpttc_data/TVT_infos'):
+        self.aug_params = aug_params
+        self.split = split
+        self.root = root
+        self.train_info_file = train_info_file
+        self.data = None  # 用于存储从 pkl 文件中加载的数据
+
+        # 根据 split 加载对应的 pkl 文件
+        pkl_file_path = osp.join(root, self.train_info_file)
+
+        # 检查文件是否存在
+        if osp.exists(pkl_file_path):
+            with open(pkl_file_path, 'rb') as f:
+                self.data = pickle.load(f)
+            print(f"Loaded data from {pkl_file_path}")
+        else:
+            raise FileNotFoundError(f"No such file: {pkl_file_path}")
+
+        # for item in self.data['infos']:
+        #     for path in item['original_imgs_path'].values():
+        #         if path.startswith('/'):
+        #             print("Path is not correct: ", path)
+
+        # 数据增强设置
+        self.augmentor = None
+        if self.aug_params is not None:
+            self.augmentor = NuscRangeImageAugmentor(**self.aug_params)
+
+        # 将 pkl 文件中的数据转换为模型所需的格式
+        self.image_list = []
+        self.timestamp_list = []
+        self.depth_list = []
+
+        infos = self.data['infos']
+        for i in range(len(infos) - 1):
+            current_info = infos[i]
+            next_info = infos[i + 1]
+
+            # 25 ms < timestamp_diff < 125 ms
+            if abs(next_info['timestamp'] - current_info['timestamp'])/1e3 < 25 or abs(next_info['timestamp'] - current_info['timestamp'])/1e3 > 125:
+                continue
+            else:
+                self.image_list.append([current_info['original_imgs_path'], next_info['original_imgs_path']])
+                self.timestamp_list.append([current_info['timestamp'], next_info['timestamp']])
+                self.depth_list.append([current_info['scale_map_path'], next_info['scale_map_path']])
+
+    def __len__(self):
+        return len(self.image_list)
+
+    def __getitem__(self, index):
+        # 获取图像对、时间戳和深度文件路径
+        surr_view_imgs1 = {}
+        surr_view_imgs2 = {}
+        surr_view_imgs_path1, surr_view_imgs_path2 = self.image_list[index]
+
+        # for item in self.image_list:
+        #     for d in item:
+        #         for path in d.values():
+        #             if path.startswith('/'):
+        #                 print("Path is not correct: ", path)
+
+        timestamp1, timestamp2 = self.timestamp_list[index]
+        range_image_scale_path1, range_image_scale_path2 = self.depth_list[index]
+
+        image_path_prefix = '/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes/'
+
+        camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
+                           'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
+
+        # for channel in camera_channels:
+        #     if not surr_view_imgs_path1[channel].startswith('image_path_prefix'):
+        #         surr_view_imgs_path1[channel] = image_path_prefix + surr_view_imgs_path1[channel]
+        #     if not surr_view_imgs_path2[channel].startswith('image_path_prefix'):
+        #         surr_view_imgs_path2[channel] = image_path_prefix + surr_view_imgs_path2[channel]
+
+
+        # 读取图像和 scale 真值（range image）数据
+        for channel in camera_channels:
+            if not surr_view_imgs_path1[channel].startswith(image_path_prefix):
+                surr_view_imgs_path1[channel] = image_path_prefix + surr_view_imgs_path1[channel]
+            if not surr_view_imgs_path2[channel].startswith(image_path_prefix):
+                surr_view_imgs_path2[channel] = image_path_prefix + surr_view_imgs_path2[channel]
+            surr_view_imgs1[channel] = frame_utils.read_nusc_image(surr_view_imgs_path1[channel])
+            surr_view_imgs2[channel] = frame_utils.read_nusc_image(surr_view_imgs_path2[channel])
+
+        gt_scale = frame_utils.read_nusc_scale_range_image(range_image_scale_path1)
+
+        # 数据增强
+        if self.augmentor is not None:
+            surr_view_imgs1 = self.augmentor(surr_view_imgs1)
+            surr_view_imgs2 = self.augmentor(surr_view_imgs2)
+
+        mask = gt_scale > 0
+
+        # 转换为 Tensor，不同视角的图像放到同一个 tensor 中
+        for channel in camera_channels:
+            surr_view_imgs1[channel] = torch.from_numpy(surr_view_imgs1[channel]).permute(2, 0, 1).float()
+            surr_view_imgs2[channel] = torch.from_numpy(surr_view_imgs2[channel]).permute(2, 0, 1).float()
+
+        prev_surr_view_imgs_tensor = torch.stack([surr_view_imgs1[channel] for channel in camera_channels], dim=0)
+        curr_surr_view_imgs_tensor = torch.stack([surr_view_imgs2[channel] for channel in camera_channels], dim=0)
+
+        gt_scale = torch.from_numpy(gt_scale).float()
+        mask = torch.from_numpy(mask)
+
+        # 拼接gt_scale和mask
+        gt_scale_with_mask = torch.cat((gt_scale.unsqueeze(0), mask.unsqueeze(0).float()), dim=0)
+
+        # #################### 统计gt中的有效值 ####################
+        # # 点云数只占图像像素数的 1%
+        # non_nan_values = gt_scale[~torch.isnan(gt_scale)]
+        # non_nan_count = non_nan_values.numel()
+
+
+        # 返回图像、时间戳、深度
+        # return img1_tensor, img2_tensor, timestamp1, timestamp2, gt_scale, mask
+        return prev_surr_view_imgs_tensor, curr_surr_view_imgs_tensor, gt_scale_with_mask
 
     def __rmul__(self, v):
         self.timestamp_list = v * self.timestamp_list
@@ -588,16 +728,28 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
 
     elif args.stage == 'kitti':
         aug_params = {'crop_size': args.image_size, 'min_scale': -0.2, 'max_scale': 0.6, 'do_flip': True}
-
         kitti = KITTI(aug_params, split='training')
         train_dataset = 100*kitti
 
     elif args.stage == 'nuscenes':
-        aug_params = {'crop_size': args.image_size, 'do_flip': False}
+        aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': True, 'rotate_prob': 0.1, 'rotate_angle': 90}
         train_info_file = 'train_infos_500_ground.pkl'
         nuscenes = nuScenes(aug_params, train_info_file=train_info_file, split='training')
         train_dataset = 100*nuscenes
 
+    elif args.stage == 'nuscenes_range_image':
+        aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
+        train_info_file = 'nusc_range_image_train_infos_240_1920.pkl'
+        nuscenes = nuScenes_range_image(aug_params, train_info_file=train_info_file, split='training')
+        train_dataset = 100*nuscenes
 
-    print('Training with %d image pairs' % len(train_dataset.image_list))
+    elif args.stage == 'mix':
+        nusc_aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': True, 'rotate_prob': 0.2, 'rotate_angle': 90}
+        kitti_aug_params = {'crop_size': args.image_size, 'min_scale': -0.2, 'max_scale': 0.6, 'do_flip': True}
+        train_info_file = 'train_infos_500_ground_31mix_.pkl'
+        nuscenes = nuScenes(nusc_aug_params, train_info_file=train_info_file, split='training')
+        kitti = KITTI(kitti_aug_params, split='training')
+        train_dataset = torch.utils.data.ConcatDataset([50*nuscenes, 50*kitti])
+
+    # print('Training with %d image pairs' % len(train_dataset.image_list))
     return train_dataset

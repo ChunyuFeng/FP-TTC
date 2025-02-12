@@ -25,7 +25,7 @@ def copy_cam_front_images(src_dir, dst_dir):
         files = os.listdir(folder_path)
 
         # 筛选出CAM_FRONT通道的文件
-        cam_front_files = [f for f in files if "CAM_FRONT" in f and f.endswith(".jpg")]
+        cam_front_files = [f for f in files if "CAM_FRONT" in f and not "CAM_FRONT_LEFT" in f and not "CAM_FRONT_RIGHT" in f and f.endswith(".jpg")]
 
         for file_name in cam_front_files:
             src_file = os.path.join(folder_path, file_name)
@@ -36,8 +36,7 @@ def copy_cam_front_images(src_dir, dst_dir):
             print(f"Copied: {src_file} -> {dst_file}")
 
 
-# 示例调用
-source_directory = "/home/chunyu/WorkSpace/BugStudio/AEB/visualization/scale_gt_with_ori_img31_"  # 源目录路径
-destination_directory = "./test/gt_with_img31_"  # 目标目录路径
+source_directory = "/home/chunyu/WorkSpace/BugStudio/AEB/visualization/scale_gt_with_ori_img_31mix_"  # 源目录路径
+destination_directory = "./test/gt_with_img_31mix_"  # 目标目录路径
 
 copy_cam_front_images(source_directory, destination_directory)

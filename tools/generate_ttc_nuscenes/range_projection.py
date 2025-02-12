@@ -248,8 +248,8 @@ def main():
     print(f"环视相机数据 LUT 已创建完成，已按照时间戳排序，共有 {len(camera_lut)} 条数据")
 
     ################################################ 将激光点云图像投影到环视相机图像上 ################################################
-    VISUALIZATION = 0
-    vis_output_dir = '/mnt/fpttc_data/output_vis/31_range_img'
+    VISUALIZATION = 1
+    vis_output_dir = '/mnt/fpttc_data/output_vis/31_range_img/240_1920'
 
     GENERATE_GT = 1
     train_infos = []
@@ -306,8 +306,8 @@ def main():
         proj_range, proj_scale, proj_xyz, proj_idx, proj_mask = range_projection(
             points_prev,
             scales,
-            H=480,
-            W=5120,
+            H=240,
+            W=1920,
             fov_up=10.0,
             fov_down=-30.0
         )
@@ -400,8 +400,9 @@ def main():
 
     if GENERATE_GT:
         # 保存 train_infos.pkl
-        with open(os.path.join(train_pkl_save_path, 'nusc_range_image_train_infos.pkl'), 'wb') as f:
-            pickle.dump(train_infos, f)
+        pkl_data = dict(infos=train_infos)
+        with open(os.path.join(train_pkl_save_path, 'nusc_range_image_train_infos_240_1920.pkl'), 'wb') as f:
+            pickle.dump(pkl_data, f)
         print(f"Saved nusc_range_image_train_infos.pkl to {train_pkl_save_path}")
 
 if __name__ == "__main__":
