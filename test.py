@@ -10,8 +10,10 @@ import datetime
 from glob import glob
 from fpttc.fp_ttc import FpTTC
 from utils.trainer import TTCTrainer
-from utils.draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image
+from utils.draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_image
 import pickle
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 parser = argparse.ArgumentParser()
 
@@ -134,6 +136,25 @@ args = parser.parse_args()
 torch.cuda.set_device(0)
 device = torch.device("cuda")
 
+
+def resize_and_crop(img, width, height):
+    """将图像缩放并裁剪到指定大小"""
+    w, h = img.size
+    crop_h, crop_w = height, width
+    resize = max(crop_h / h, crop_w / w)
+
+    resize_h, resize_w = int(h * resize), int(w * resize)
+    crop_h_start = (resize_h - crop_h) // 2
+    crop_w_start = (resize_w - crop_w) // 2
+    crop = (crop_w_start, crop_h_start, crop_w_start + crop_w, crop_h_start + crop_h)
+
+
+    img = img.resize((resize_w, resize_h), Image.BILINEAR)
+
+    img = img.crop(crop)
+
+    return img
+
 def main():
 
 
@@ -168,92 +189,84 @@ def main():
     if not os.path.isdir(out_dir):
         os.mkdir(out_dir)
 
-    # path1, path2 = 'test_img/2341.jpg', 'test_img/2344.jpg'
-    inference_dir = args.inference_dir
-    filenames = sorted(glob(inference_dir + '/*.png') + glob(inference_dir + '/*.jpg'))
-    # print(filenames)
-    print('%d images found' % len(filenames))
+    # # path1, path2 = 'test_img/2341.jpg', 'test_img/2344.jpg'
+    # inference_dir = args.inference_dir
+    # filenames = sorted(glob(inference_dir + '/*.png') + glob(inference_dir + '/*.jpg'))
+    # # print(filenames)
+    # print('%d images found' % len(filenames))
 
-    camera_lut_path = './Datasets/nuscenes/camera_lut_sorted_ground_31mix.pkl'
+    camera_lut_path = '/mnt/fpttc_data/TVT_infos/nusc_range_image_train_infos_160_1920.pkl'
     # camera_lut_path = './Datasets/nuscenes/camera_lut_sorted.pkl'
     # 读取 camera_lut.pkl
     with open(camera_lut_path, 'rb') as file:
         camera_lut = pickle.load(file)
 
-    w, h = 640, 320
-    total = 0
-    with torch.no_grad():
-        # for test_id in range(1000, 1500):
-        for test_id in range(0, 500):
-            
-            # if test_id%5!=0:
-            #     continue
+    image_list= []
+    scale_map_list = []
+    infos = camera_lut['infos']
+    for i in range(len(infos) - 1):
+        current_info = infos[i]
+        next_info = infos[i + 1]
 
-            img_idx = test_id
+        # 25 ms < timestamp_diff < 125 ms
+        if abs(next_info['timestamp'] - current_info['timestamp']) / 1e3 < 25 or abs(
+                next_info['timestamp'] - current_info['timestamp']) / 1e3 > 125:
+            continue
+        else:
+            image_list.append([current_info['original_imgs_path'], next_info['original_imgs_path']])
+            scale_map_list.append([current_info['scale_map_path'], next_info['scale_map_path']])
 
-            filepath1 = camera_lut[img_idx]['CAM_FRONT']['filename']
-            filename1 = os.path.basename(filepath1)
-            filepath2 = camera_lut[img_idx+1]['CAM_FRONT']['filename']
-            filename2 = os.path.basename(filepath2)
+    surr_view_imgs1 = {}
+    surr_view_imgs2 = {}
+    image_path_prefix = '/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes/'
+    camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                       'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
 
+    for i in tqdm(range(len(image_list)), desc='Processing'):
+        surr_view_imgs_path1, surr_view_imgs_path2 = image_list[i]
+        scale_map_path1, scale_map_path2 = scale_map_list[i]
+        for channel in camera_channels:
+            if not surr_view_imgs_path1[channel].startswith(image_path_prefix):
+                surr_view_imgs_path1[channel] = image_path_prefix + surr_view_imgs_path1[channel]
+            if not surr_view_imgs_path2[channel].startswith(image_path_prefix):
+                surr_view_imgs_path2[channel] = image_path_prefix + surr_view_imgs_path2[channel]
+            surr_view_imgs1[channel] = Image.open(surr_view_imgs_path1[channel]).convert('RGB')
+            surr_view_imgs1[channel] = resize_and_crop(surr_view_imgs1[channel], 320, 160)
+            surr_view_imgs1[channel] = np.array(surr_view_imgs1[channel])
+            surr_view_imgs2[channel] = Image.open(surr_view_imgs_path2[channel]).convert('RGB')
+            surr_view_imgs2[channel] = resize_and_crop(surr_view_imgs2[channel], 320, 160)
+            surr_view_imgs2[channel] = np.array(surr_view_imgs2[channel])
 
-            file_1 = inference_dir+filename1
-            file_2 = inference_dir+filename2
+        for channel in camera_channels:
+            surr_view_imgs1[channel] = torch.from_numpy(surr_view_imgs1[channel]).permute(2, 0, 1).float().unsqueeze(0).to(device)
+            surr_view_imgs2[channel] = torch.from_numpy(surr_view_imgs2[channel]).permute(2, 0, 1).float().unsqueeze(0).to(device)
 
-            image1 = Image.open(file_1).convert('RGB')
-            image2 = Image.open(file_2).convert('RGB')
-            image1 = np.array(image1).astype(np.uint8)
-            image2 = np.array(image2).astype(np.uint8)
-            image1 = cv2.resize(image1, (w,h))
-            image2 = cv2.resize(image2, (w,h))
-            image1 = torch.from_numpy(image1).permute(2, 0, 1).float().unsqueeze(0).to(device)
-            image2 = torch.from_numpy(image2).permute(2, 0, 1).float().unsqueeze(0).to(device)
+        prev_surr_view_imgs_tensor = torch.stack([surr_view_imgs1[channel] for channel in camera_channels], dim=1)
+        curr_surr_view_imgs_tensor = torch.stack([surr_view_imgs2[channel] for channel in camera_channels], dim=1)
 
-            padding_factor = 32
-            inference_size = [int(np.ceil(image1.size(-2) / padding_factor)) * padding_factor,
-                            int(np.ceil(image1.size(-1) / padding_factor)) * padding_factor]
+        gt_scale = np.load(scale_map_path1)
+        gt_scale = torch.from_numpy(gt_scale).float()
+        mask = gt_scale > 0
 
-            ori_size = image1.shape[-2:]
-            if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
-                image1 = F.interpolate(image1, size=inference_size, mode='bilinear',
-                                        align_corners=True)
-                image2 = F.interpolate(image2, size=inference_size, mode='bilinear',
-                                        align_corners=True)
+        scale, flow, _ = model_loaded(prev_surr_view_imgs_tensor, curr_surr_view_imgs_tensor,
+                                      attn_type=args.attn_type,
+                                      attn_splits_list=args.attn_splits_list,
+                                      corr_radius_list=args.corr_radius_list,
+                                      prop_radius_list=args.prop_radius_list,
+                                      num_reg_refine=args.num_reg_refine,
+                                      testing=False)
 
-            start = time.time()
-            scale, flow, _ = model_loaded(image1, image2,
-                        attn_type=args.attn_type,
-                        attn_splits_list=args.attn_splits_list,
-                        corr_radius_list=args.corr_radius_list,
-                        prop_radius_list=args.prop_radius_list,
-                        num_reg_refine=args.num_reg_refine,
-                        testing=False)
-            if test_id>3:
-                total = total+time.time()-start
+        # visualization
+        gt_scale_np = gt_scale.detach().squeeze(0).cpu().numpy()
+        gt_valid_mask = gt_scale_np > 0
+        normalized_gt = visual_scale_map_range_image(gt_scale_np, gt_valid_mask)
 
-            # resize back
-            if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
-                scale = F.interpolate(scale, size=ori_size, mode='bilinear',
-                                        align_corners=True)
+        scale_np = scale[0].detach().squeeze(0).cpu().numpy()
+        pred_valid_mask = scale_np > 0
+        normalized_pred = visual_scale_map_range_image(scale_np, pred_valid_mask)
 
-            prediction_scale = (scale[0].transpose(0,1).transpose(1,2) - 0.5) / (1.0) # [H, W, 2]
-            prediction_scale_np = prediction_scale.detach().squeeze(2).cpu().numpy()
-            prediction_scale_clipped = np.clip(prediction_scale_np, 0.0, 1.0)
-
-            scale_min = prediction_scale_clipped.min()
-            scale_max = prediction_scale_clipped.max()
-
-            if scale_max - scale_min > 0:
-                prediction_scale_normalized = (prediction_scale_clipped - scale_min) / (scale_max - scale_min)
-            else:
-                prediction_scale_normalized = prediction_scale_clipped
-
-            rgb_pred = disp2rgb_normalized(prediction_scale_normalized)
-
-            rgb_pred_uint8 = (rgb_pred * 255).astype(np.uint8)
-
-            cv2.imwrite(os.path.join(out_dir, 'scale' + str(test_id) + '.png'), rgb_pred_uint8)
-
+        plt.imsave(os.path.join(out_dir, f"gt{i}.jpg"), normalized_gt, cmap='seismic', vmin=-1, vmax=1)
+        plt.imsave(os.path.join(out_dir, f"pred{i}.jpg"), normalized_pred, cmap='seismic', vmin=-1, vmax=1)
 
 if __name__ == "__main__":
     main()

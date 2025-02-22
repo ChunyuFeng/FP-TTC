@@ -5,7 +5,7 @@ from glob import glob
 
 def create_video_from_images(image_folder, output_video, frame_rate=30):
     """
-    将指定文件夹中的 PNG 图像拼接为 MP4 视频。
+    将指定文件夹中的 pred{i}.jpg 图像按数字顺序拼接为 MP4 视频。
 
     Args:
         image_folder (str): 图像所在的文件夹路径。
@@ -13,22 +13,15 @@ def create_video_from_images(image_folder, output_video, frame_rate=30):
         frame_rate (int): 视频帧率（每秒显示的帧数），默认值为 30。
     """
 
-    # pred - 获取所有 PNG 文件并按文件名中的数字排序
+    # 获取所有 pred{i}.jpg 文件并按文件名中的数字排序
     image_files = sorted(
-        glob(os.path.join(image_folder, '*.png')),
-        key=lambda x: int(os.path.basename(x).split('scale')[-1].split('.')[0])
+        glob(os.path.join(image_folder, 'gt*.jpg')),
+        key=lambda x: int(os.path.basename(x).split('gt')[-1].split('.jpg')[0])
     )
 
     if not image_files:
-        print("No PNG files found in the folder.")
+        print("No 'pred*.jpg' files found in the folder.")
         return
-
-
-    # # gt - 获取所有文件并按照时间戳排序
-    # image_files = sorted(
-    #     glob(os.path.join(image_folder, '*.jpg')),
-    #     key=lambda x: int(os.path.basename(x).split('__')[-1].split('.')[0])
-    # )
 
     # 读取第一张图像以获取宽和高
     first_image = cv2.imread(image_files[0])
@@ -53,10 +46,8 @@ def create_video_from_images(image_folder, output_video, frame_rate=30):
 
 # 示例用法
 if __name__ == "__main__":
-    image_folder = "./test/24_12_23-08_54_29_selfcon_ttc"
-    # image_folder = "./test/gt_with_img_31mix_"
-    output_video = "./test/pred_31mix_.mp4"  # 输出视频文件路径
-
+    image_folder = "./test/25_02_21-13_40_36_selfcon_ttc"  # 图像所在的文件夹路径
+    output_video = "./test/range_image_gt.mp4"  # 输出视频文件路径
     frame_rate = 10  # 帧率
 
     create_video_from_images(image_folder, output_video, frame_rate)

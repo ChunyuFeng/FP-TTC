@@ -586,7 +586,7 @@ class nuScenes(data.Dataset):
         return self
 
 class nuScenes_range_image(data.Dataset):
-    def __init__(self, aug_params=None, split='training', train_info_file='nusc_range_image_train_infos.pkl',
+    def __init__(self, aug_params=None, split='training', train_info_file='nusc_range_image_train_infos_160_1920.pkl',
                  root='/mnt/fpttc_data/TVT_infos'):
         self.aug_params = aug_params
         self.split = split
@@ -653,8 +653,10 @@ class nuScenes_range_image(data.Dataset):
 
         image_path_prefix = '/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes/'
 
-        camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
-                           'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
+        # camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
+        #                    'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
+        camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                           'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
 
         # for channel in camera_channels:
         #     if not surr_view_imgs_path1[channel].startswith('image_path_prefix'):
@@ -739,7 +741,7 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
 
     elif args.stage == 'nuscenes_range_image':
         aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
-        train_info_file = 'nusc_range_image_train_infos_240_1920.pkl'
+        train_info_file = 'nusc_range_image_train_infos_160_1920.pkl'
         nuscenes = nuScenes_range_image(aug_params, train_info_file=train_info_file, split='training')
         train_dataset = 100*nuscenes
 

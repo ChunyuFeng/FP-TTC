@@ -1,4 +1,6 @@
 import glob
+
+from tensorboard.compat.tensorflow_stub.io.gfile import exists
 from tqdm import tqdm
 import os
 import numpy as np
@@ -9,7 +11,7 @@ from tools.generate_ttc_nuscenes.utils.nusc_lidar_cam_match import (find_matchin
 import matplotlib.pyplot as plt
 
 scene_flow_data_path = '/mnt/fpttc_data/scene_flow/multi_frame/31_scene_flow'
-gt_save_path = '/mnt/fpttc_data/scale_map/31_scale_map'
+gt_save_path = '/mnt/fpttc_data/scale_map/31_scale_map_256_3072'
 train_pkl_save_path = '/mnt/fpttc_data/TVT_infos'
 gt_vis_save_path = '/mnt/fpttc_data/output_vis/31_scale_map'
 
@@ -249,7 +251,7 @@ def main():
 
     ################################################ 将激光点云图像投影到环视相机图像上 ################################################
     VISUALIZATION = 1
-    vis_output_dir = '/mnt/fpttc_data/output_vis/31_range_img/240_1920'
+    vis_output_dir = '/mnt/fpttc_data/output_vis/31_range_img/256_3072'
 
     GENERATE_GT = 1
     train_infos = []
@@ -306,8 +308,8 @@ def main():
         proj_range, proj_scale, proj_xyz, proj_idx, proj_mask = range_projection(
             points_prev,
             scales,
-            H=240,
-            W=1920,
+            H=256,
+            W=3072,
             fov_up=10.0,
             fov_down=-30.0
         )
@@ -369,6 +371,10 @@ def main():
             #     print(f"Scale <1 range: [{neg_range.min()}, {neg_range.max()}]")
 
             # 保存归一化后的 scale 映射图像，使用 bwr 色表
+
+            if not exists(vis_output_dir):
+                os.makedirs(vis_output_dir)
+
             out_name = f"seismic_clip_range_{i}.png"
             out_path = os.path.join(vis_output_dir, out_name)
 
@@ -401,7 +407,7 @@ def main():
     if GENERATE_GT:
         # 保存 train_infos.pkl
         pkl_data = dict(infos=train_infos)
-        with open(os.path.join(train_pkl_save_path, 'nusc_range_image_train_infos_240_1920.pkl'), 'wb') as f:
+        with open(os.path.join(train_pkl_save_path, 'nusc_range_image_train_infos_256_3072.pkl'), 'wb') as f:
             pickle.dump(pkl_data, f)
         print(f"Saved nusc_range_image_train_infos.pkl to {train_pkl_save_path}")
 

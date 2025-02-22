@@ -22,7 +22,7 @@ import torch.distributed as dist
 from PIL import Image
 
 from .loss import get_loss, get_loss_multi, get_loss_nusc, get_loss_mix, get_loss_range_image
-from .draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_iamge
+from .draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_image
 
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
 
@@ -540,11 +540,11 @@ class TTCTrainer(object):
                     # 可视化 prediction_scale 和 gt_scale
                     gt_scale_np = gt_scale[:1].squeeze(0).cpu().numpy()
                     gt_scale_valid_mask_np = gt_scale_valid_mask[:1].squeeze(0).cpu().bool()
-                    normalized_gt = visual_scale_map_range_iamge(gt_scale_np, gt_scale_valid_mask_np)
+                    normalized_gt = visual_scale_map_range_image(gt_scale_np, gt_scale_valid_mask_np)
 
                     scale_np = scale[0].detach().squeeze(0).cpu().numpy()
                     pred_valid_mask = scale_np > 0
-                    normalized_pred = visual_scale_map_range_iamge(scale_np, pred_valid_mask)
+                    normalized_pred = visual_scale_map_range_image(scale_np, pred_valid_mask)
 
                     # 保存可视化结果
                     plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.jpg"), normalized_pred, cmap='seismic', vmin=-1, vmax=1)

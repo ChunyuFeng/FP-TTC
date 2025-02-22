@@ -366,7 +366,7 @@ def flow_uv_to_colors(u, v, convert_to_bgr=False):
     return flow_image
 
 
-def visual_scale_map_range_iamge(scale_map, valid_mask, colormap_name='seismic'):
+def visual_scale_map_range_image(scale_map, valid_mask, colormap_name='seismic'):
     scale_display = np.copy(scale_map)
 
     # 将用于可视化的尺度值裁切到 [0.5, 1.5] 范围

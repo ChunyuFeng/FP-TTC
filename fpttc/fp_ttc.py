@@ -11,6 +11,8 @@ from .scale_net.feature_net.feature_net import FeatureNet
 from .scale_net.flow_net import FlowNet
 from .scale_net.scale_net import ScaleNet
 
+from torch.cuda.amp import autocast, GradScaler
+
 class FpTTC(nn.Module):
     def __init__(self,
                  num_scales=2,
@@ -46,6 +48,137 @@ class FpTTC(nn.Module):
                                  upsample_factor=upsample_factor, num_head=num_head,
                                  scale_level=num_scales, reg_refine=reg_refine)
 
+
+
+    # def forward(self, img0, img1,
+    #             attn_type=None,
+    #             attn_splits_list=None,
+    #             corr_radius_list=None,
+    #             prop_radius_list=None,
+    #             num_reg_refine=6,
+    #             pred_bidir_flow=False,
+    #             testing=False,
+    #             ):
+    #
+    #     if self.is_trainning and not testing:
+    #         self.eval()
+    #         torch.set_grad_enabled(False)
+    #
+    #     scale, corr, final = None, None, None
+    #     mlvl_feats0, mlvl_feats1, mlvl_flows, mlvl_flows_back = [], [], [], []
+    #
+    #     start = time.time()
+    #
+    #     # 这一步现在还有用吗？
+    #     img0, img1 = normalize_img(img0, img1)
+    #
+    #     camera_channel_num = 6
+    #     prev_feature_list = []
+    #     curr_feature_list = []
+    #
+    #     for view in range(camera_channel_num):
+    #         prev_feature, curr_feature = self.extract_feature(img0[:, view, :, :, :], img1[:, view, :, :, :])
+    #         prev_feature_list.append(prev_feature)
+    #         curr_feature_list.append(curr_feature)
+    #
+    #     num_feat_levels = len(prev_feature_list[0])
+    #     feature0_listc = []
+    #     feature1_listc = []
+    #     for i in range(num_feat_levels):
+    #         tensor_to_concat = [entry[i] for entry in prev_feature_list]
+    #         concat_tensor = torch.cat(tensor_to_concat, dim=3)
+    #         feature0_listc.append(concat_tensor)
+    #
+    #         tensor_to_concat = [entry[i] for entry in curr_feature_list]
+    #         concat_tensor = torch.cat(tensor_to_concat, dim=3)
+    #         feature1_listc.append(concat_tensor)
+    #
+    #     # del concat_tensor, img0, img1, prev_feature, curr_feature, prev_feature_list, curr_feature_list
+    #     # torch.cuda.empty_cache()
+    #
+    #     mlvl_feats0_view0123, mlvl_feats1_view0123 = [], []
+    #     mlvl_feats0_view3450, mlvl_feats1_view3450 = [], []
+    #     mlvl_feats0, mlvl_feats1 = [], []
+    #     if self.is_trainning and not testing:
+    #         torch.set_grad_enabled(True)
+    #         self.train()
+    #
+    #     corr_view0123 = None
+    #     corr_view3450 = None
+    #     # 视角 0 1 2 3
+    #     scaler = GradScaler()  # 初始化 GradScaler 用于混合精度训练
+    #
+    #     for scale_idx in range(self.num_scales):
+    #         if scale_idx < 1:
+    #             feature0, feature1 = feature0_listc[scale_idx][:, :, :, 0:120], feature1_listc[scale_idx][:, :, :,
+    #                                                                             0:120]
+    #             feature0, feature1 = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
+    #                                               corr_view0123)
+    #             mlvl_feats0_view0123.append(feature0)
+    #             mlvl_feats1_view0123.append(feature1)
+    #             corr_view0123, final_view0123 = self.corrnet(feature0, feature1, scale_idx, corr_radius_list,
+    #                                                          prop_radius_list, num_reg_refine, False, corr_view0123)
+    #             corr_view0123 = F.interpolate(corr_view0123, scale_factor=2, mode='bilinear',
+    #                                           align_corners=True) * 2
+    #         else:
+    #             feature0, feature1 = feature0_listc[scale_idx][:, :, :, 0:240], feature1_listc[scale_idx][:, :, :,
+    #                                                                             0:240]
+    #             feature0_f, feature1_f = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
+    #                                                   corr_view0123)
+    #             mlvl_feats0_view0123.append(feature0_f)
+    #             mlvl_feats1_view0123.append(feature1_f)
+    #             corr_view0123, final_view0123 = self.corrnet(feature0_f, feature1_f, scale_idx, corr_radius_list,
+    #                                                          prop_radius_list, num_reg_refine, False, corr_view0123)
+    #
+    #     # 清理视角0-3的计算结果，释放显存
+    #     del feature0, feature1, feature0_f, feature1_f, final_view0123
+    #     torch.cuda.empty_cache()
+    #
+    #     # 视角 3 4 5 0
+    #     for scale_idx in range(self.num_scales):
+    #         if scale_idx < 1:
+    #             feature0 = feature0_listc[scale_idx][:, :, :, 120:240]
+    #             feature1 = feature1_listc[scale_idx][:, :, :, 120:240]
+    #             feature0, feature1 = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
+    #                                               corr_view3450)
+    #             mlvl_feats0_view3450.append(feature0)
+    #             mlvl_feats1_view3450.append(feature1)
+    #             corr_view3450, final_view3450 = self.corrnet(feature0, feature1, scale_idx, corr_radius_list,
+    #                                                          prop_radius_list, num_reg_refine, False, corr_view3450)
+    #             corr_view3450 = F.interpolate(corr_view3450, scale_factor=2, mode='bilinear',
+    #                                           align_corners=True) * 2
+    #         else:
+    #             feature0 = feature0_listc[scale_idx][:, :, :, 240:480]
+    #             feature1 = feature1_listc[scale_idx][:, :, :, 240:480]
+    #
+    #             del feature0_listc, feature1_listc
+    #             torch.cuda.empty_cache()
+    #
+    #             feature0_f, feature1_f = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
+    #                                                   corr_view3450)
+    #             mlvl_feats0_view3450.append(feature0_f)
+    #             mlvl_feats1_view3450.append(feature1_f)
+    #             corr_view3450, final_view3450 = self.corrnet(feature0_f, feature1_f, scale_idx, corr_radius_list,
+    #                                                          prop_radius_list, num_reg_refine, False, corr_view3450)
+    #
+    #     # 清理视角3-5的计算结果，释放显存
+    #     del feature0, feature1, feature0_f, feature1_f, final_view3450
+    #     torch.cuda.empty_cache()
+    #
+    #     # 特征融合
+    #     corr = torch.cat((corr_view0123, corr_view3450), dim=3)
+    #     mlvl_feats0 = [torch.cat((mlvl_feats0_view0123[i], mlvl_feats0_view3450[i]), dim=3) for i in
+    #                    range(self.num_scales)]
+    #     mlvl_feats1 = [torch.cat((mlvl_feats1_view0123[i], mlvl_feats1_view3450[i]), dim=3) for i in
+    #                    range(self.num_scales)]
+    #
+    #     corr = self.conv_corr(corr)
+    #     ini_scale, corr = corr[:, 0:1, ...], corr[:, 1:, ...]
+    #     scales = self.scalenet(corr, mlvl_feats0, mlvl_feats1, ini_scale)
+    #
+    #     return scales, None, None
+
+    # 0 1 2 3 / 3 4 5 0 分开处理
     # def forward(self, img0, img1,
     #             attn_type=None,
     #             attn_splits_list=None,
@@ -101,42 +234,57 @@ class FpTTC(nn.Module):
     #     # 视角 0 1 2 3
     #     for scale_idx in range(self.num_scales):
     #         if scale_idx < 1:
-    #             feature0, feature1 = feature0_listc[scale_idx][:, :, :, 0:160], feature1_listc[scale_idx][:, :, :, 0:160]
-    #             feature0, feature1 = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list, corr_view0123)
+    #             feature0, feature1 = feature0_listc[scale_idx][:, :, :, 0:256], feature1_listc[scale_idx][:, :, :,
+    #                                                                             0:256]
+    #             feature0, feature1 = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
+    #                                               corr_view0123)
     #             mlvl_feats0_view0123.append(feature0)
     #             mlvl_feats1_view0123.append(feature1)
     #             corr_view0123, final_view0123 = self.corrnet(feature0, feature1, scale_idx, corr_radius_list,
-    #                                 prop_radius_list, num_reg_refine, False, corr_view0123)
+    #                                                          prop_radius_list, num_reg_refine, False, corr_view0123)
     #             corr_view0123 = F.interpolate(corr_view0123, scale_factor=2, mode='bilinear', align_corners=True) * 2
     #         else:
-    #             feature0, feature1 = feature0_listc[scale_idx][:, :, :, 0:320], feature1_listc[scale_idx][:, :, :, 0:320]
-    #             feature0_f, feature1_f = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list, corr_view0123)
+    #             feature0, feature1 = feature0_listc[scale_idx][:, :, :, 0:512], feature1_listc[scale_idx][:, :, :,
+    #                                                                             0:512]
+    #             feature0_f, feature1_f = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
+    #                                                   corr_view0123)
     #             mlvl_feats0_view0123.append(feature0_f)
     #             mlvl_feats1_view0123.append(feature1_f)
     #             corr_view0123, final_view0123 = self.corrnet(feature0_f, feature1_f, scale_idx, corr_radius_list,
-    #                                 prop_radius_list, num_reg_refine, False, corr_view0123)
+    #                                                          prop_radius_list, num_reg_refine, False, corr_view0123)
     #
+    #     # 清理视角0-3的计算结果，释放显存
+    #     del feature0, feature1, feature0_f, feature1_f, final_view0123
+    #     torch.cuda.empty_cache()
     #     # 视角 3 4 5 0
     #     for scale_idx in range(self.num_scales):
     #         if scale_idx < 1:
-    #             feature0 = torch.cat((feature0_listc[scale_idx][:, :, :, 120:240], feature0_listc[scale_idx][:, :, :, 0:40]), dim=3)
-    #             feature1 = torch.cat((feature1_listc[scale_idx][:, :, :, 120:240], feature1_listc[scale_idx][:, :, :, 0:40]), dim=3)
-    #             feature0, feature1 = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list, corr_view3450)
+    #             feature0 = torch.cat(
+    #                 (feature0_listc[scale_idx][:, :, :, 192:384], feature0_listc[scale_idx][:, :, :, 0:64]), dim=3)
+    #             feature1 = torch.cat(
+    #                 (feature1_listc[scale_idx][:, :, :, 192:384], feature1_listc[scale_idx][:, :, :, 0:64]), dim=3)
+    #             feature0, feature1 = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
+    #                                               corr_view3450)
     #             mlvl_feats0_view3450.append(feature0)
     #             mlvl_feats1_view3450.append(feature1)
     #             corr_view3450, final_view3450 = self.corrnet(feature0, feature1, scale_idx, corr_radius_list,
-    #                                 prop_radius_list, num_reg_refine, False, corr)
+    #                                                          prop_radius_list, num_reg_refine, False, corr_view3450)
     #             corr_view3450 = F.interpolate(corr_view3450, scale_factor=2, mode='bilinear', align_corners=True) * 2
     #         else:
     #             feature0 = torch.cat(
-    #                 (feature0_listc[scale_idx][:, :, :, 240:480], feature0_listc[scale_idx][:, :, :, 0:80]), dim=3)
+    #                 (feature0_listc[scale_idx][:, :, :, 384:768], feature0_listc[scale_idx][:, :, :, 0:128]), dim=3)
     #             feature1 = torch.cat(
-    #                 (feature1_listc[scale_idx][:, :, :, 240:480], feature1_listc[scale_idx][:, :, :, 0:80]), dim=3)
-    #             feature0_f, feature1_f = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list, corr_view3450)
+    #                 (feature1_listc[scale_idx][:, :, :, 384:768], feature1_listc[scale_idx][:, :, :, 0:128]), dim=3)
+    #             feature0_f, feature1_f = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
+    #                                                   corr_view3450)
     #             mlvl_feats0_view3450.append(feature0_f)
     #             mlvl_feats1_view3450.append(feature1_f)
     #             corr_view3450, final_view3450 = self.corrnet(feature0_f, feature1_f, scale_idx, corr_radius_list,
-    #                                 prop_radius_list, num_reg_refine, False, corr_view3450)
+    #                                                          prop_radius_list, num_reg_refine, False, corr_view3450)
+    #
+    #     # 清理视角3-5的计算结果，释放显存
+    #     del feature0, feature1, feature0_f, feature1_f, final_view3450
+    #     torch.cuda.empty_cache()
     #
     #     # 暂时用相加代替特征融合，维度其实没对齐，后续修改
     #     corr = torch.cat((corr_view0123, corr_view3450), dim=3)
@@ -149,6 +297,7 @@ class FpTTC(nn.Module):
     #
     #     return scales, final, None
 
+    # 0 ~ 5 6个视角 同时处理
     def forward(self, img0, img1,
                 attn_type=None,
                 attn_splits_list=None,
@@ -168,7 +317,6 @@ class FpTTC(nn.Module):
 
         start = time.time()
 
-        # 这一步现在还有用吗？
         img0, img1 = normalize_img(img0, img1)
 
         camera_channel_num = 6
@@ -300,6 +448,8 @@ class CorrEncoder(nn.Module):
         self.convc2 = nn.Conv2d(256, dim_out, 3, padding=1)
 
     def forward(self, corr):
+        # cor = F.relu(self.convc1(corr))
+        # cor = F.relu(self.convc2(cor))
         cor = F.relu(self.convc1(corr))
         cor = F.relu(self.convc2(cor))
         return cor
