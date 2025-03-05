@@ -586,13 +586,14 @@ class nuScenes(data.Dataset):
         return self
 
 class nuScenes_range_image(data.Dataset):
-    def __init__(self, aug_params=None, split='training', train_info_file='nusc_range_image_train_infos_160_1920.pkl',
-                 root='/mnt/fpttc_data/TVT_infos'):
+    def __init__(self, aug_params=None, split='training', train_info_file='nusc_range_image_train_infos_320_3840.pkl',
+                 root='/mnt/fpttc_data/TVT_infos', train_location='local'):
         self.aug_params = aug_params
         self.split = split
         self.root = root
         self.train_info_file = train_info_file
         self.data = None  # 用于存储从 pkl 文件中加载的数据
+        self.train_location = train_location
 
         # 根据 split 加载对应的 pkl 文件
         pkl_file_path = osp.join(root, self.train_info_file)
@@ -621,6 +622,19 @@ class nuScenes_range_image(data.Dataset):
         self.depth_list = []
 
         infos = self.data['infos']
+
+        # 服务器上的路径前缀和本地路径前缀不一样，需要进行替换
+        local_scale_map_path_prefix = '/mnt/fpttc_data/scale_map/'
+        eden_scale_map_path_prefix = '/mnt/pool/fcy/FP-TTC/Datasets/scale_map/'
+        if self.train_location == 'local':
+            print('Training on Odyssey...')
+        elif self.train_location == 'remote-eden':
+            for info in infos:
+                if info['scale_map_path'].startswith(local_scale_map_path_prefix):
+                    info['scale_map_path'] = info['scale_map_path'].replace(local_scale_map_path_prefix,eden_scale_map_path_prefix)
+        else:
+            raise ValueError('Invalid train_location: ', self.train_location)
+
         for i in range(len(infos) - 1):
             current_info = infos[i]
             next_info = infos[i + 1]
@@ -716,6 +730,7 @@ class nuScenes_range_image(data.Dataset):
 
 def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
     """ Create the data loader for the corresponding trainign set """
+    train_dataset = None
 
     if args.stage == 'driving':
         aug_params = {'crop_size': args.image_size, 'min_scale': -0.4, 'max_scale': 0.8, 'do_flip': True}
@@ -742,7 +757,18 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
     elif args.stage == 'nuscenes_range_image':
         aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
         train_info_file = 'nusc_range_image_train_infos_160_1920.pkl'
-        nuscenes = nuScenes_range_image(aug_params, train_info_file=train_info_file, split='training')
+        train_location = args.train_location
+        if train_location == 'local':
+            root='/mnt/fpttc_data/TVT_infos'
+        elif train_location == 'remote-eden':
+            root='/mnt/pool/fcy/FP-TTC/Datasets/scale_map/'
+        else:
+            raise ValueError('Invalid train_location: ', train_location)
+        nuscenes = nuScenes_range_image(aug_params,
+                                        train_info_file=train_info_file,
+                                        split='training',
+                                        train_location=train_location,
+                                        root=root)
         train_dataset = 100*nuscenes
 
     elif args.stage == 'mix':

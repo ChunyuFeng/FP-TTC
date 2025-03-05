@@ -132,6 +132,10 @@ parser.add_argument('--count_time', action='store_true',
 
 parser.add_argument('--debug', action='store_true')
 
+parser.add_argument('--train_location', type=str, default='local', choices=['local', 'remote-eden'],
+                    help='Specify the training location. If "local", data will be stored in the local directory; if "remote", data will be stored in the remote specific path.')
+
+
 args = parser.parse_args()
 torch.cuda.set_device(0)
 device = torch.device("cuda")
@@ -243,6 +247,19 @@ def main():
 
         prev_surr_view_imgs_tensor = torch.stack([surr_view_imgs1[channel] for channel in camera_channels], dim=1)
         curr_surr_view_imgs_tensor = torch.stack([surr_view_imgs2[channel] for channel in camera_channels], dim=1)
+
+        # 服务器上的路径前缀和本地路径前缀不一样，需要进行替换
+        local_scale_map_path_prefix = '/mnt/fpttc_data/scale_map/'
+        eden_scale_map_path_prefix = '/mnt/pool/fcy/FP-TTC/Datasets/scale_map/'
+        if args.train_location == 'local':
+            print('Training on Odyssey...')
+        elif args.train_location == 'remote-eden':
+            for info in infos:
+                if info['scale_map_path'].startswith(local_scale_map_path_prefix):
+                    info['scale_map_path'] = info['scale_map_path'].replace(local_scale_map_path_prefix,
+                                                                            eden_scale_map_path_prefix)
+        else:
+            raise ValueError('Invalid train_location: ', args.train_location)
 
         gt_scale = np.load(scale_map_path1)
         gt_scale = torch.from_numpy(gt_scale).float()

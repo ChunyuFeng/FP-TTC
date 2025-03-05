@@ -10,8 +10,16 @@ from tools.generate_ttc_nuscenes.utils.nusc_lidar_cam_match import (find_matchin
                                                                        get_scale_map, find_matching_sf_sweep_in_lut)
 import matplotlib.pyplot as plt
 
+IMAGE_HEIGHT = 320
+IMAGE_WIDTH = 640
+RANGE_IMAGE_WIDTH = IMAGE_WIDTH*6
+
+VISUALIZATION = 1
+GENERATE_GT = 1
+
+vis_output_dir = os.path.join('/mnt/fpttc_data/output_vis/31_range_img/', f"{IMAGE_HEIGHT}_{RANGE_IMAGE_WIDTH}")
 scene_flow_data_path = '/mnt/fpttc_data/scene_flow/multi_frame/31_scene_flow'
-gt_save_path = '/mnt/fpttc_data/scale_map/31_scale_map_256_3072'
+gt_save_path = os.path.join('/mnt/fpttc_data/scale_map/', f"31_scale_map_{IMAGE_HEIGHT}_{RANGE_IMAGE_WIDTH}")
 train_pkl_save_path = '/mnt/fpttc_data/TVT_infos'
 gt_vis_save_path = '/mnt/fpttc_data/output_vis/31_scale_map'
 
@@ -250,10 +258,11 @@ def main():
     print(f"环视相机数据 LUT 已创建完成，已按照时间戳排序，共有 {len(camera_lut)} 条数据")
 
     ################################################ 将激光点云图像投影到环视相机图像上 ################################################
-    VISUALIZATION = 1
-    vis_output_dir = '/mnt/fpttc_data/output_vis/31_range_img/256_3072'
-
-    GENERATE_GT = 1
+    # VISUALIZATION = 1
+    # vis_output_dir = os.path.join('/mnt/fpttc_data/output_vis/31_range_img/', f"{IMAGE_HEIGHT}_{IMAGE_WIDTH}")
+    # # vis_output_dir = '/mnt/fpttc_data/output_vis/31_range_img/256_3072'
+    #
+    # GENERATE_GT = 1
     train_infos = []
 
     # 循环依次取出 camera_lut 中连续两组数据（每组数据包含 6 channel 图像数据）
@@ -308,8 +317,8 @@ def main():
         proj_range, proj_scale, proj_xyz, proj_idx, proj_mask = range_projection(
             points_prev,
             scales,
-            H=256,
-            W=3072,
+            H=IMAGE_HEIGHT,
+            W=RANGE_IMAGE_WIDTH,
             fov_up=10.0,
             fov_down=-30.0
         )
@@ -406,8 +415,9 @@ def main():
 
     if GENERATE_GT:
         # 保存 train_infos.pkl
+        pkl_file_name = f"nusc_range_image_train_infos_{IMAGE_HEIGHT}_{RANGE_IMAGE_WIDTH}.pkl"
         pkl_data = dict(infos=train_infos)
-        with open(os.path.join(train_pkl_save_path, 'nusc_range_image_train_infos_256_3072.pkl'), 'wb') as f:
+        with open(os.path.join(train_pkl_save_path, pkl_file_name), 'wb') as f:
             pickle.dump(pkl_data, f)
         print(f"Saved nusc_range_image_train_infos.pkl to {train_pkl_save_path}")
 

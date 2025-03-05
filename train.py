@@ -133,6 +133,9 @@ parser.add_argument('--count_time', action='store_true',
 
 parser.add_argument('--debug', action='store_true')
 
+parser.add_argument('--train_location', type=str, default='local', choices=['local', 'remote-eden'],
+                    help='Specify the training location. If "local", data will be stored in the local directory; if "remote", data will be stored in the remote specific path.')
+
 args = parser.parse_args()
 
 if args.parallel:
