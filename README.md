@@ -116,3 +116,11 @@ The evaluation results will be saved as .npy.
 KITTI:
 
 ![viz](./images/viz.png)
+
+## TODO
+- [ ] Range Image 点云和图像进行区域对齐；目前只是将全部点云做成了Range Image，将图像裁剪到相应区域，并没有进行对齐。
+  - [ ] 可能可以采取的方法：将点云投影到图像上（已实现）；然后将投影到图像上的点云制作成 Range Image 格式。
+  - [ ] ...其他方法
+- [ ] Range Image 如何变稠密？目前已有的大模型可以估计图像的深度，但是没法直接给 Range Image 赋值，是否可以通过 PV Image Depth 2 Point Cloud 2 Range Image Value
+- [ ] 制作真值时，相邻帧之间的时间间距拉开一点
+- [ ] 通过限制深度的离群值、或者限制scale的比值，来限制一下真值的最大、最小值；否则可视化图像中会出现颜色深浅不一，制作成视频后会闪烁

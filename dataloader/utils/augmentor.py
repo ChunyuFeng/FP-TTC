@@ -10,7 +10,7 @@ cv2.ocl.setUseOpenCL(False)
 import torch
 from torchvision.transforms import ColorJitter
 import torch.nn.functional as F
-
+import matplotlib.pyplot as plt
 
 class FlowAugmentor:
     def __init__(self, crop_size, min_scale=-0.2, max_scale=0.5, do_flip=True):
@@ -595,10 +595,16 @@ class NuscRangeImageAugmentor:
         """将图像缩放并裁剪到指定大小"""
         w, h = img.size
         crop_h, crop_w = self.crop_size
-        resize = max(crop_h / h, crop_w / w)
+        # 同时利用h和w计算缩放比例
+        # resize = max(crop_h / h, crop_w / w)
+        # 只利用w计算缩放比例，保证不裁剪w方向，因为相邻图像在w方向有重叠信息
+        resize = crop_w / w
 
         resize_h, resize_w = int(h * resize), int(w * resize)
-        crop_h_start = (resize_h - crop_h) // 2
+        # 图像h方向，保留中间部分
+        # crop_h_start = (resize_h - crop_h) // 2
+        # 图像h方向，保留底部（因为图像底部监督信息更稠密）
+        crop_h_start = 0
         crop_w_start = (resize_w - crop_w) // 2
         crop = (crop_w_start, crop_h_start, crop_w_start + crop_w, crop_h_start + crop_h)
 
@@ -710,10 +716,43 @@ class NuscRangeImageAugmentor:
             raise ValueError(f'Unsupported image mode: {img.mode}')
         return img
 
+    # def __call__(self, surr_view_imgs):
+
+    #     for channel, img in surr_view_imgs.items():
+    #         surr_view_imgs[channel] = self.resize_and_crop(img)
+    #         if isinstance(surr_view_imgs[channel], Image.Image):
+    #             surr_view_imgs[channel] = np.array(surr_view_imgs[channel])
+
+    #     return surr_view_imgs
+
+    
+
+
     def __call__(self, surr_view_imgs):
 
         for channel, img in surr_view_imgs.items():
-            surr_view_imgs[channel] = self.resize_and_crop(img)
+            # # 可视化处理前的图像
+            # plt.figure()
+            # if isinstance(img, Image.Image):
+            #     plt.imshow(img)
+            # else:
+            #     plt.imshow(np.array(img))
+            # plt.title(f'Before resize_and_crop - {channel}')
+            # plt.show()
+
+            # 调用 resize_and_crop 处理
+            processed_img = self.resize_and_crop(img)
+
+            # # 可视化处理后的图像
+            # plt.figure()
+            # if isinstance(processed_img, Image.Image):
+            #     plt.imshow(processed_img)
+            # else:
+            #     plt.imshow(np.array(processed_img))
+            # plt.title(f'After resize_and_crop - {channel}')
+            # plt.show()
+
+            surr_view_imgs[channel] = processed_img
             if isinstance(surr_view_imgs[channel], Image.Image):
                 surr_view_imgs[channel] = np.array(surr_view_imgs[channel])
 

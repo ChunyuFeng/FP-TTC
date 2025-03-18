@@ -174,7 +174,7 @@ print(f"环视相机数据 LUT 已创建完成，已按照时间戳排序，共�
 # 将 scene flow 点云数据投影到 6 个相机图像上；
 # 投影结果 (u, v, scale = depth_pc1 / depth_pc3) 保存为 tiff 图像文件，其中 u 和 v 是像素坐标，depth_pc1 和 depth_pc3 是点云的深度信息。
 GENERATE_GT = False
-VISUALIZATION = False
+VISUALIZATION = True
 VISUALIZATION_ON_IMAGE = False
 train_infos = []
 matching_count = 0
@@ -388,83 +388,83 @@ for i in tqdm(range(len(camera_lut) - 1), desc="Creating ground truth images and
 
 
     ################################### 生成 range image ###################################
-    # 生成 range image
-    points_lidar_coord_list = np.concatenate(points_lidar_coord_list, axis=0)
-    scales_list = np.concatenate(scales_list, axis=0)
-    proj_range, proj_scale, proj_xyz, proj_idx, proj_mask = range_projection(
-        points_lidar_coord_list,
-        scales_list,
-        H=480,
-        W=5120,
-        fov_up=15.0,
-        fov_down=-25.0
-    )
-
-    # 打印一些信息
-    print("投影深度图形状:", proj_range.shape)
-    print("投影3D坐标图形状:", proj_xyz.shape)
-    print("投影索引图形状:", proj_idx.shape)
-    print("投影掩码形状:", proj_mask.shape)
+    # # 生成 range image
+    # points_lidar_coord_list = np.concatenate(points_lidar_coord_list, axis=0)
+    # scales_list = np.concatenate(scales_list, axis=0)
+    # proj_range, proj_scale, proj_xyz, proj_idx, proj_mask = range_projection(
+    #     points_lidar_coord_list,
+    #     scales_list,
+    #     H=480,
+    #     W=5120,
+    #     fov_up=15.0,
+    #     fov_down=-25.0
+    # )
+    #
+    # # 打印一些信息
+    # print("投影深度图形状:", proj_range.shape)
+    # print("投影3D坐标图形状:", proj_xyz.shape)
+    # print("投影索引图形状:", proj_idx.shape)
+    # print("投影掩码形状:", proj_mask.shape)
 
     ################################### 可视化 scale ###################################
-    plt.figure(figsize=(55, 6))
-    plt.title("Scale Projection (Normalized)")
+    # plt.figure(figsize=(55, 6))
+    # plt.title("Scale Projection (Normalized)")
+    #
+    # # 1) 复制一份，以免修改原数据
+    # scale_display = np.copy(proj_scale)
+    #
+    # # 2) 创建一个有效掩码 valid_mask，标记非 -1 的有效像素
+    # valid_mask = (scale_display != -1)
+    #
+    # # 3) 取出有效像素值并计算最小值和最大值，用于归一化
+    # valid_values = scale_display[valid_mask]
+    # if len(valid_values) > 0:
+    #     min_val = valid_values.min()
+    #     max_val = valid_values.max()
+    #     # 防止出现 max_val == min_val 的情况
+    #     if max_val > min_val:
+    #         # 4) 对有效像素做归一化 [0,1]
+    #         scale_display[valid_mask] = (scale_display[valid_mask] - min_val) / (max_val - min_val)
+    #     else:
+    #         # 所有有效像素都是同一个值，直接赋 0.5 做可视化
+    #         scale_display[valid_mask] = 0.5
+    #
+    # # 5) 对无效像素赋 0
+    # scale_display[~valid_mask] = 0
+    #
+    # # 6) 显示归一化后的图像
+    # plt.imshow(scale_display, cmap='plasma', vmin=0, vmax=1)
+    #
+    # # 如果想加 colorbar
+    # # plt.colorbar(label='Normalized Scale')
+    #
+    # plt.xlabel('Width')
+    # plt.ylabel('Height')
+    # plt.tight_layout()
+    # plt.show()
+    #
+    # info = {
+    #     'timestamp': previous_sf_record['timestamp'],
+    #     'imgs_path': original_img_path,
+    #     'gt_path': gt_scale_path
+    # }
+    #
+    # train_infos.append(info)
 
-    # 1) 复制一份，以免修改原数据
-    scale_display = np.copy(proj_scale)
-
-    # 2) 创建一个有效掩码 valid_mask，标记非 -1 的有效像素
-    valid_mask = (scale_display != -1)
-
-    # 3) 取出有效像素值并计算最小值和最大值，用于归一化
-    valid_values = scale_display[valid_mask]
-    if len(valid_values) > 0:
-        min_val = valid_values.min()
-        max_val = valid_values.max()
-        # 防止出现 max_val == min_val 的情况
-        if max_val > min_val:
-            # 4) 对有效像素做归一化 [0,1]
-            scale_display[valid_mask] = (scale_display[valid_mask] - min_val) / (max_val - min_val)
-        else:
-            # 所有有效像素都是同一个值，直接赋 0.5 做可视化
-            scale_display[valid_mask] = 0.5
-
-    # 5) 对无效像素赋 0
-    scale_display[~valid_mask] = 0
-
-    # 6) 显示归一化后的图像
-    plt.imshow(scale_display, cmap='plasma', vmin=0, vmax=1)
-
-    # 如果想加 colorbar
-    # plt.colorbar(label='Normalized Scale')
-
-    plt.xlabel('Width')
-    plt.ylabel('Height')
-    plt.tight_layout()
-    plt.show()
-
-    info = {
-        'timestamp': previous_sf_record['timestamp'],
-        'imgs_path': original_img_path,
-        'gt_path': gt_scale_path
-    }
-
-    train_infos.append(info)
-
-    ################################### 可视化 depth ###################################
-    # 可视化深度图
-    plt.figure(figsize=(55, 6))  # 调整图像大小
-    plt.title("Depth Projection")
-    depth_display = np.copy(proj_range)
-    depth_display[depth_display == -1] = 0  # 将无数据点设为0以便可视化
-    plt.imshow(depth_display, cmap='plasma')
-
-    # plt.colorbar(label='Depth (m)')
-    plt.xlabel('Width')
-    plt.ylabel('Height')
-
-    plt.tight_layout()
-    plt.show()
+    # ################################### 可视化 depth ###################################
+    # # 可视化深度图
+    # plt.figure(figsize=(55, 6))  # 调整图像大小
+    # plt.title("Depth Projection")
+    # depth_display = np.copy(proj_range)
+    # depth_display[depth_display == -1] = 0  # 将无数据点设为0以便可视化
+    # plt.imshow(depth_display, cmap='plasma')
+    #
+    # # plt.colorbar(label='Depth (m)')
+    # plt.xlabel('Width')
+    # plt.ylabel('Height')
+    #
+    # plt.tight_layout()
+    # plt.show()
 
     # ################################### 可视化 scale ###################################
     # plt.figure(figsize=(55, 6))

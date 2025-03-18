@@ -665,7 +665,12 @@ class nuScenes_range_image(data.Dataset):
         timestamp1, timestamp2 = self.timestamp_list[index]
         range_image_scale_path1, range_image_scale_path2 = self.depth_list[index]
 
-        image_path_prefix = '/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes/'
+        if self.train_location == 'local':
+            image_path_prefix = '/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes/'
+        elif self.train_location == 'remote-eden':
+            image_path_prefix = '/mnt/pool/fcy/FP-TTC/Datasets/nuscenes/'
+        else:
+            raise ValueError('Invalid train_location: ', self.train_location)
 
         # camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
         #                    'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
@@ -761,7 +766,7 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
         if train_location == 'local':
             root='/mnt/fpttc_data/TVT_infos'
         elif train_location == 'remote-eden':
-            root='/mnt/pool/fcy/FP-TTC/Datasets/scale_map/'
+            root='/mnt/pool/fcy/FP-TTC/Datasets/tvt_infos/'
         else:
             raise ValueError('Invalid train_location: ', train_location)
         nuscenes = nuScenes_range_image(aug_params,

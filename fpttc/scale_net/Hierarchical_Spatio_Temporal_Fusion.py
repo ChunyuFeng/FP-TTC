@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 
-# 假设我们有 MultiScaleDeformableAttention 模块（例如来自 mmcv 或自定义实现）
+
 # 其构造参数包括嵌入维度、尺度数、注意力头数、每头采样点数等
 # forward 接受: query特征、参考点、多尺度键和值特征等，输出融合后的特征。
-from mmcv.ops import MultiScaleDeformableAttention  # 如果使用mmcv实现
+from mmcv.ops import MultiScaleDeformableAttention
 
 class Hierarchical_Spatio_Temporal_Fusion(nn.Module):
     def __init__(self,
@@ -39,7 +39,7 @@ class Hierarchical_Spatio_Temporal_Fusion(nn.Module):
 
         ### 1. 空间维度多相机融合 ###
         # 将每帧6个相机的多尺度特征准备为MSDA的输入
-        # # 我们先把6个相机的特征在宽度上拼接，得到每个尺度上拼接后的特征图 (B, C, H, 6W)
+        # # 先把6个相机的特征在宽度上拼接，得到每个尺度上拼接后的特征图 (B, C, H, 6W)
         # curr_multi_scale_feats = []
         # prev_multi_scale_feats = []
         # for s in range(num_scales):
@@ -49,7 +49,7 @@ class Hierarchical_Spatio_Temporal_Fusion(nn.Module):
         #     curr_multi_scale_feats.append(curr_level_feat)
         #     prev_multi_scale_feats.append(prev_level_feat)
         # 准备 Multi-Scale Deformable Attention 所需的 reference points 和 shape 信息
-        # 假设我们创建每个尺度的空间尺寸列表和每个尺度起始索引，用于MSDA内部计算
+        # 创建每个尺度的空间尺寸列表和每个尺度起始索引，用于MSDA内部计算
         spatial_shapes = []       # 存储每个尺度 (H, width)；例如[(H, 6W), (H, 6W)] 如果两个尺度尺寸相同
         level_start_index = [0]   # 每个尺度flatten起始索引
         total_len = 0
@@ -61,7 +61,6 @@ class Hierarchical_Spatio_Temporal_Fusion(nn.Module):
         level_start_index = level_start_index[:-1]  # 最后一项多余
 
         # 生成参考点坐标 (normalized coordinates)，shape:(B, total_len, num_levels, 2)，用于指示查询的初始采样位置
-        # 简化起见，这里假设已经有函数生成参考点网格
         ref_points = self._get_reference_points(spatial_shapes, B, device=curr_multi_scale_feats[0].device)  # 自定义函数，生成每个query位置对应的归一化坐标
 
         # 将多尺度特征展开为 (B, total_len, C) 供注意力模块使用
@@ -95,7 +94,7 @@ class Hierarchical_Spatio_Temporal_Fusion(nn.Module):
         ### 2. 时间维度跨帧融合 ###
         # 利用前后帧的融合特征，再次通过MSDA模块进行跨帧的特征交互
         # 将前一帧作为值，当前帧作为查询，捕获跨时间的相关性（然后反过来更新前一帧，使融合对称）
-        # 这里我们假设前后帧在空间上对齐（如同一Range Image坐标系），因此可以复用相同的参考点
+        # 假设前后帧在空间上对齐，复用相同的参考点
         # 当前帧查询前一帧（前一帧为KV）
         fused_curr_flatten = torch.cat([feat.view(B, C, -1) for feat in fused_curr_levels], dim=2).transpose(1, 2)  # (B, total_len, C)
         fused_prev_flatten = torch.cat([feat.view(B, C, -1) for feat in fused_prev_levels], dim=2).transpose(1, 2)
@@ -134,7 +133,7 @@ class Hierarchical_Spatio_Temporal_Fusion(nn.Module):
 
     def _get_reference_points(self, spatial_shapes, batch_size, device):
         """
-        根据每个尺度的空间尺寸生成参考点张量 (B, total_len, 2)，
+        根据每个尺度的空间尺寸生成参考点tensor (B, total_len, 2)，
         假设参考点是每个特征图像素归一化到[0,1]的坐标 (y, x)。
         """
         # 计算每个尺度上的网格坐标并归一化

@@ -95,6 +95,9 @@ class ScaleEncoder(nn.Module):
             query = self.scale_conv(ini_query)
         query += self.pos_enc(query)    # b, c, h, w
 
+        # PV image 和 Range Image的对应关系
+        # query -> Range Image; value -> PV Image
+        # get reference points 是用于找query和value之间的位置对应关系，用于精准计算attention
         query_location = self.get_reference_points(height, width, bs, device=query.device, dtype=query.dtype)
 
         # value

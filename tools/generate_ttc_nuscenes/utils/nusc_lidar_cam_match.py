@@ -305,12 +305,26 @@ def get_scale_map(nusc,
                                                       dilation_kernel_med=design_depth_map.kernels.diamond_kernel_7(),
                                                       dilation_kernel_near=design_depth_map.kernels.diamond_kernel_7())
 
+        import matplotlib.pyplot as plt
+
+        depth_map_display = previous_dense_depth_out.T
+        # Assuming previous_dense_depth_out is defined and has shape (1600, 900)
+        plt.figure(figsize=(10, 8))
+        plt.title("Dense Depth Map")
+        plt.imshow(depth_map_display, cmap='plasma', vmin=0,
+                   vmax=50)  # Adjust vmin and vmax based on depth range
+        plt.xlabel("Width")
+        plt.ylabel("Height")
+        plt.colorbar(label="Depth (m)")
+        plt.tight_layout()
+        plt.show()
+
         current_dense_depth_out, _ = design_depth_map.create_map(previous_projected_points[channel]['original_img'],
                                                                current_depth_wo_overlap,
                                                                max_depth=50.0,
                                                                dilation_kernel_far=design_depth_map.kernels.diamond_kernel_7(),
-                                                               dilation_kernel_med=design_depth_map.kernels.diamond_kernel_7(),
-                                                               dilation_kernel_near=design_depth_map.kernels.diamond_kernel_7())
+                                                               dilation_kernel_med=design_depth_map.kernels.diamond_kernel_5(),
+                                                               dilation_kernel_near=design_depth_map.kernels.cross_kernel_3())
 
         valid_mask = (previous_depth_wo_overlap != 0) & (current_depth_wo_overlap != 0)
         # valid_mask = ~np.isinf(depth_wo_overlap) & ~np.isinf(scale_wo_overlap)

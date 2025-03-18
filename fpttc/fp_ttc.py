@@ -11,7 +11,8 @@ from .scale_net.feature_net.feature_net import FeatureNet
 from .scale_net.flow_net import FlowNet
 from .scale_net.scale_net import ScaleNet
 
-from .range_image_encoder import RangeImageEncoder
+from .range_image_encoder_new import RangeImageEncoder
+# from .range_image_encoder import RangeImageEncoder
 from .scale_net.Hierarchical_Spatio_Temporal_Fusion import Hierarchical_Spatio_Temporal_Fusion, MultiLayerHierarchicalFusion
 
 
@@ -42,26 +43,31 @@ class FpTTC(nn.Module):
         self.cnet = CNNEncoder(output_dim=feature_channels, num_output_scales=num_scales)
 
         self.featnet = FeatureNet(num_scales=num_scales, feature_channels=feature_channels, 
-                                  num_head=num_head, ffn_dim_expansion=ffn_dim_expansion, 
+                                  num_head=num_head, ffn_dim_expansion=ffn_dim_expansion,
                                   num_transformer_layers=num_transformer_layers)
         self.corrnet = FlowNet(num_scales=num_scales, feature_channels=feature_channels,
                                upsample_factor=upsample_factor, reg_refine=reg_refine)
         self.conv_corr = CorrEncoder(dim_in=2, dim_out=feature_channels+1)
         self.scalenet = ScaleNet(num_scales=num_scales, feature_channels=feature_channels,
-                                 upsample_factor=upsample_factor, num_head=num_head,
+                                 upsample_factor=upsample_factor, num_head=8,
                                  scale_level=num_scales, reg_refine=reg_refine)
 
         # Transformer
-        self.rangeimageencoder = RangeImageEncoder(num_layers=num_transformer_layers,
-                                    d_model=feature_channels,
-                                    nhead=num_head,
-                                    num_feature_levels=num_scales,
-                                    num_level=num_scales)
+        # self.rangeimageencoder = RangeImageEncoder(num_layers=num_transformer_layers,
+        #                             d_model=feature_channels,
+        #                             nhead=num_head,
+        #                             num_feature_levels=num_scales,
+        #                             num_level=num_scales)
 
-        self.MultiLayerHierarchicalFusion = MultiLayerHierarchicalFusion(num_layers=num_transformer_layers,
-                                                                         embed_dim=feature_channels,
-                                                                         num_scales=num_scales,
-                                                                         n_heads=num_head)
+        self.rangeimageencoder = RangeImageEncoder(num_layers=num_transformer_layers,
+                                                   num_levels=num_scales,
+                                                   num_points=8,
+                                                   embed_dims=feature_channels
+                                                   )
+        # self.MultiLayerHierarchicalFusion = MultiLayerHierarchicalFusion(num_layers=num_transformer_layers,
+        #                                                                  embed_dim=feature_channels,
+        #                                                                  num_scales=num_scales,
+        #                                                                  n_heads=8)
 
     '''
     # 3 views & 3 views
@@ -230,24 +236,53 @@ class FpTTC(nn.Module):
             prev_feature_list.append(prev_feature)
             curr_feature_list.append(curr_feature)
 
-        num_feat_levels = len(prev_feature_list[0])
         feature0_listc = []
         feature1_listc = []
-        # 将不同视角的图像按照channel维度拼接
-        for i in range(num_feat_levels):
-            tensor_to_concat = [entry[i] for entry in prev_feature_list]
-            concat_tensor = torch.cat(tensor_to_concat, dim=3)
-            feature0_listc.append(concat_tensor)
 
-            tensor_to_concat = [entry[i] for entry in curr_feature_list]
-            concat_tensor = torch.cat(tensor_to_concat, dim=3)
-            feature1_listc.append(concat_tensor)
+        # 随机初始化一个可学习的tensor，用于初始化query，B,C,H,6W
+        B_query_0, C_query_0, H_query_0, W_query_0 = prev_feature_list[0][0].shape
+        B_query_1, C_query_1, H_query_1, W_query_1 = prev_feature_list[0][1].shape
+        prev_query_0 = torch.randn(B_query_0, C_query_0, H_query_0, 6*W_query_0).cuda()
+        curr_query_0 = torch.randn(B_query_0, C_query_0, H_query_0, 6*W_query_0).cuda()
+        prev_query_1 = torch.randn(B_query_1, C_query_1, H_query_1, 6*W_query_1).cuda()
+        curr_query_1 = torch.randn(B_query_1, C_query_1, H_query_1, 6*W_query_1).cuda()
 
+        prev_feat_stacked = []
+        curr_feat_stacked = []
+        # 给每个level的特征增加一个维度，用于存储不同视角的特征 B, num_cams, C, H, W
+        for scale in range(self.num_scales):
+            scale_feats = [prev_feature_list[cam][scale] for cam in range(camera_channel_num)]
+            scale_feats_stacked = torch.stack(scale_feats, dim=1)
+            prev_feat_stacked.append(scale_feats_stacked)
+
+            scale_feats = [curr_feature_list[cam][scale] for cam in range(camera_channel_num)]
+            scale_feats_stacked = torch.stack(scale_feats, dim=1)
+            curr_feat_stacked.append(scale_feats_stacked)
+
+        prev_feature_0 = self.rangeimageencoder(prev_query_0, prev_feat_stacked, feature_lvl=0, reference_points_cam=None, range_image_mask=None)
+        curr_feature_0 = self.rangeimageencoder(curr_query_0, prev_feat_stacked, feature_lvl=0, reference_points_cam=None, range_image_mask=None)
+        prev_feature_1 = self.rangeimageencoder(prev_query_1, curr_feat_stacked, feature_lvl=1, reference_points_cam=None, range_image_mask=None)
+        curr_feature_1 = self.rangeimageencoder(curr_query_1, curr_feat_stacked, feature_lvl=1, reference_points_cam=None, range_image_mask=None)
+
+        feature0_listc.append(prev_feature_0)
+        feature0_listc.append(prev_feature_1)
+        feature1_listc.append(curr_feature_0)
+        feature1_listc.append(curr_feature_1)
+        # # 将不同视角的图像按照channel维度拼接
+        # for i in range(num_feat_levels):
+        #     tensor_to_concat = [entry[i] for entry in prev_feature_list]
+        #     concat_tensor = torch.cat(tensor_to_concat, dim=3)
+        #     feature0_listc.append(concat_tensor)
+        #
+        #     tensor_to_concat = [entry[i] for entry in curr_feature_list]
+        #     concat_tensor = torch.cat(tensor_to_concat, dim=3)
+        #     feature1_listc.append(concat_tensor)
+        #
         # for i in range(len(feature0_listc)):
         #     feature0_listc[i] = self.rangeimageencoder(feature0_listc, feature1_listc, query_lvl=i, ini_query=None)
         #     feature1_listc[i] = self.rangeimageencoder(feature0_listc, feature1_listc, query_lvl=i, ini_query=None)
 
-        feature0_listc, feature1_listc = self.MultiLayerHierarchicalFusion(feature0_listc, feature1_listc)
+        # feature0_listc, feature1_listc = self.MultiLayerHierarchicalFusion(feature0_listc, feature1_listc)
 
         mlvl_feats0, mlvl_feats1 = [], []
         if self.is_trainning and not testing:

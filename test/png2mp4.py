@@ -120,10 +120,10 @@ def create_video_from_images(gt_folder, pred_folder, output_video, frame_rate=30
 if __name__ == "__main__":
     # gt_folder = "./test/25_02_21-13_40_36_selfcon_ttc"  # gt 图像所在的文件夹路径
     # pred_folder = "./test/25_02_21-13_40_36_selfcon_ttc"  # pred 图像所在的文件夹路径
-    gt_folder = "/mnt/fpttc_data/output_vis/test_results/25_02_26-21_59_46_selfcon_ttc"
-    pred_folder = "/mnt/fpttc_data/output_vis/test_results/25_02_26-21_59_46_selfcon_ttc"
+    gt_folder = "/mnt/fpttc_data/output_vis/test_results/25_03_06-22_41_40_selfcon_ttc"
+    pred_folder = "/mnt/fpttc_data/output_vis/test_results/25_03_06-22_41_40_selfcon_ttc"
 
-    output_video = "./test/gt_pred_256_512.mp4"  # 输出视频文件路径
+    output_video = "./test/gt_pred_256_512_spatio_temp_fusion.mp4"  # 输出视频文件路径
     frame_rate = 10  # 帧率
 
     create_video_from_images(gt_folder, pred_folder, output_video, frame_rate)
