@@ -1,6 +1,3 @@
-import glob
-
-from tensorboard.compat.tensorflow_stub.io.gfile import exists
 from tqdm import tqdm
 import os
 import numpy as np
@@ -10,18 +7,18 @@ from tools.generate_ttc_nuscenes.utils.nusc_lidar_cam_match import (find_matchin
                                                                        get_scale_map, find_matching_sf_sweep_in_lut)
 import matplotlib.pyplot as plt
 
-IMAGE_HEIGHT = 320
-IMAGE_WIDTH = 640
+IMAGE_HEIGHT = 160
+IMAGE_WIDTH = 320
 RANGE_IMAGE_WIDTH = IMAGE_WIDTH*6
 
-VISUALIZATION = 1
+VISUALIZATION = 0
 GENERATE_GT = 1
 
-vis_output_dir = os.path.join('/mnt/fpttc_data/output_vis/31_range_img/', f"{IMAGE_HEIGHT}_{RANGE_IMAGE_WIDTH}")
-scene_flow_data_path = '/mnt/fpttc_data/scene_flow/multi_frame/31_scene_flow'
-gt_save_path = os.path.join('/mnt/fpttc_data/scale_map/', f"31_scale_map_{IMAGE_HEIGHT}_{RANGE_IMAGE_WIDTH}")
+vis_output_dir = os.path.join('/mnt/fpttc_data/output_vis/full_frame_range_img/', f"{IMAGE_HEIGHT}_{RANGE_IMAGE_WIDTH}")
+scene_flow_data_path = '/mnt/fpttc_data/scene_flow/multi_frame/full_frame_scene_flow'
+gt_save_path = os.path.join('/mnt/fpttc_data/scale_map/', f"full_frame_scale_map_{IMAGE_HEIGHT}_{RANGE_IMAGE_WIDTH}")
 train_pkl_save_path = '/mnt/fpttc_data/TVT_infos'
-gt_vis_save_path = '/mnt/fpttc_data/output_vis/31_scale_map'
+gt_vis_save_path = '/mnt/fpttc_data/output_vis/full_frame_scale_map'
 
 # NuScenes 数据集路径
 nusc = NuScenes(version='v1.0-trainval', dataroot='./Datasets/nuscenes',
@@ -381,7 +378,7 @@ def main():
 
             # 保存归一化后的 scale 映射图像，使用 bwr 色表
 
-            if not exists(vis_output_dir):
+            if not os.path.exists(vis_output_dir):
                 os.makedirs(vis_output_dir)
 
             out_name = f"seismic_clip_range_{i}.png"
@@ -399,15 +396,26 @@ def main():
             scale_map_filename = "scale_map.npy"
             scale_map_path = os.path.join(gt_save_path, sub_folder_name, scale_map_filename)
             np.save(scale_map_path, scale_map)
+            
+            # 保存depth map - proj_range
+            depth_map = proj_range
+            depth_map_filename = "depth_map.npy"
+            depth_map_path = os.path.join(gt_save_path, sub_folder_name, depth_map_filename)
+            np.save(depth_map_path, depth_map)
 
             original_img_path = {}
+            original_img_token = {}
             for camera_channel, data in previous_surround_view_data.items():
                 original_img_path[camera_channel] = previous_surround_view_data[camera_channel]['filename']
+                original_img_token[camera_channel] = previous_surround_view_data[camera_channel]['token']
 
+            lidar_token = previous_sf_record['token']
             # GT: timestamp, original_imgs_path, scale_map_path
             info = {
                 'timestamp': previous_sf_record['timestamp'],
                 'original_imgs_path': original_img_path,
+                'original_imgs_token': original_img_token,
+                'lidar_token': lidar_token,
                 'scale_map_path': scale_map_path
             }
 
@@ -423,148 +431,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-# # ------------------- 主逻辑：遍历子文件夹，读取 pc1.npy 和 pc3.npy，投影并保存 -------------------
-# def main():
-#     # 根目录，包含多个类似 n015-2018-xx__LIDAR_TOP__1531883538048176 的子文件夹
-#     base_dir = "/mnt/fpttc_data/scene_flow/multi_frame/31_scene_flow"
-#     # 输出图像目录
-#     output_dir = "/mnt/fpttc_data/output_vis/31_range_img"
-#     os.makedirs(output_dir, exist_ok=True)
-#
-#     # 找到所有子文件夹
-#     # 子文件夹名形如: n015-2018-07-18-11-07-57+0800__LIDAR_TOP__1531883538048176
-#     subfolders = glob.glob(os.path.join(base_dir, "n015-*__LIDAR_TOP__*"))
-#     if not subfolders:
-#         print("No matching subfolders found.")
-#         return
-#
-#     # 根据时间戳排序
-#     # folder_name 类似: ".../n015-2018-07-18-11-07-57+0800__LIDAR_TOP__1531883538048176"
-#     # 取最后一个 '__' 后面的UNIX时间戳做排序
-#     def extract_timestamp(folder_path):
-#         folder_basename = os.path.basename(folder_path)
-#         # "n015-2018-07-18-11-07-57+0800__LIDAR_TOP__1531883538048176"
-#         # split('__')[-1] = '1531883538048176'
-#         ts_str = folder_basename.split('__')[-1]
-#         return int(ts_str)  # 转 int 便于按数值排序
-#
-#     subfolders_sorted = sorted(subfolders, key=extract_timestamp)
-#
-#     # # 计算相邻时间戳差值，并处理成 50ms 的倍数
-#     # timestamp_differences = []
-#     # for i in range(1, len(subfolders_sorted)):
-#     #     ts_current = extract_timestamp(subfolders_sorted[i])
-#     #     ts_previous = extract_timestamp(subfolders_sorted[i - 1])
-#     #
-#     #     # 计算时间戳差值（单位为毫秒）
-#     #     time_diff_ms = (ts_current - ts_previous) * 1e-3
-#     #
-#     #     # 计算50ms的倍数并取整
-#     #     time_diff_50ms = round(time_diff_ms / 50)
-#     #     timestamp_differences.append(time_diff_50ms)
-#
-#     # 依序处理
-#     for i, folder_path in enumerate(subfolders_sorted):
-#         # pc1.npy 和 pc3.npy 路径
-#         pc1_path = os.path.join(folder_path, "pc1.npy")
-#         pc3_path = os.path.join(folder_path, "pc3.npy")
-#         if not os.path.isfile(pc1_path) or not os.path.isfile(pc3_path):
-#             print(f"Skipping {folder_path}, pc1.npy or pc3.npy not found.")
-#             continue
-#
-#         print(f"[{i}] Processing folder: {folder_path}")
-#
-#         # 读取点云
-#         points_prev = np.load(pc1_path)  # shape (m, 3)
-#         points_curr = np.load(pc3_path)  # shape (m, 3)
-#
-#         # 计算激光雷达坐标系下的尺度
-#         # depth 为 x-y 平面上距原点的距离
-#         depth_xy_prev = np.linalg.norm(points_prev[:, :2], axis=1)
-#         depth_xy_curr = np.linalg.norm(points_curr[:, :2], axis=1)
-#
-#         # 避免除以零
-#         depth_xy_prev[depth_xy_prev == 0] = 1e-6
-#         scales = depth_xy_curr / depth_xy_prev
-#
-#         # Range Projection
-#         proj_range, proj_scale, proj_xyz, proj_idx, proj_mask = range_projection(
-#             points_prev,
-#             scales,
-#             H=480,
-#             W=5120,
-#             fov_up=10.0,
-#             fov_down=-30.0
-#         )
-#
-#         # 分段归一化；使用 bwr 色表
-#         scale_display = np.copy(proj_scale)
-#         valid_mask = (scale_display != -1)
-#
-#         # 将用于可视化的尺度值裁切到 [0.5, 1.5] 范围
-#         scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.9, 1.1)
-#
-#         # 将尺度的分界线从 1 移至 0（scale - 1）
-#         deviations = np.zeros_like(scale_display, dtype=np.float32)
-#         deviations[valid_mask] = scale_display[valid_mask] - 1.0
-#
-#         # 分别处理大于0和小于0的部分
-#         pos_mask = deviations > 0
-#         neg_mask = deviations < 0
-#
-#         # 初始化归一化后的显示数组
-#         normalized_display = np.zeros_like(deviations, dtype=np.float32)
-#
-#         # 处理大于1的尺度
-#         if np.any(pos_mask):
-#             pos_devs = deviations[pos_mask]
-#             pos_max = pos_devs.max()
-#             pos_min = pos_devs.min()
-#             if pos_max >= pos_min >= 0:
-#                 normalized_display[pos_mask] = (pos_devs - pos_min) / (pos_max - pos_min)  # 归一化到 [0,1]
-#             else:
-#                 normalized_display[pos_mask] = 0.0  # 如果没有变化，设为0
-#
-#         # 处理小于1的尺度
-#         if np.any(neg_mask):
-#             neg_devs = deviations[neg_mask]
-#             neg_max = neg_devs.max()
-#             neg_min = neg_devs.min()
-#             if neg_min <= neg_max <= 0:
-#                 normalized_display[neg_mask] = (neg_devs - neg_min) / (neg_max - neg_min) - 1.0  # 归一化到 [-1,0]
-#                 # normalized_display[neg_mask] = neg_devs / abs(neg_min)  # 归一化到 [-1,0]
-#             else:
-#                 normalized_display[neg_mask] = 0.0  # 如果没有变化，设为0
-#
-#         # 设置等于1的尺度为0
-#         # 由于 deviations = scale -1，等于1的scale对应 deviations = 0，已经在 normalized_display 中为0
-#
-#         # 对无效像素赋值为0
-#         normalized_display[~valid_mask] = 0.0
-#
-#         # 打印当前尺度的范围
-#         pos_range = deviations[pos_mask] if np.any(pos_mask) else np.array([])
-#         neg_range = deviations[neg_mask] if np.any(neg_mask) else np.array([])
-#
-#         if pos_range.size > 0:
-#             print(f"Scale >1 range: [{pos_range.min()}, {pos_range.max()}]")
-#         if neg_range.size > 0:
-#             print(f"Scale <1 range: [{neg_range.min()}, {neg_range.max()}]")
-#
-#         # 保存归一化后的 scale 映射图像，使用 bwr 色表
-#         out_name = f"seismic_clip_range_{i}.png"
-#         out_path = os.path.join(output_dir, out_name)
-#
-#         plt.imsave(out_path, normalized_display, cmap='seismic', vmin=-1, vmax=1)
-#         print(f"Saved range image: {out_path}")
-#
-#     print("All done.")
-#
-# if __name__ == "__main__":
-#     main()
