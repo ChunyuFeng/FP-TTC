@@ -10,6 +10,8 @@ from .scale_net.utils.multi_scale_deformable_attn_function import MultiScaleDefo
 
 from mmcv.runner import force_fp32
 
+from tools.collision_prediction.collision_utils import inverse_range_projection
+
 try:
     from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttnFunction_fp32, multi_scale_deformable_attn_pytorch
 except ImportError:
@@ -148,12 +150,12 @@ class MSDeformableAttention3D(nn.Module):
         # 对每个查询的所有采样点的权重做 softmax
         attention_weights = F.softmax(attention_weights, dim=-1)
         # 计算采样位置 sampling_locations
-        if reference_points.shape[-1] == 2:
+        if reference_points.shape[-1] == 2: # bs, Len_q, num_points, 2
             # reference_points 给出每个查询在各特征图上的归一化 2D 坐标 (u,v)
             # 将偏移归一化：除以特征图尺度
             offset_normalizer = torch.stack([spatial_shapes[:, 1], spatial_shapes[:, 0]], -1).to(query.device)  # (num_levels, 2) -> (W, H)
             # 扩展 reference_points 形状以便与 sampling_offsets 相加: (B, Len_q, 1, num_levels, 1, 2)
-            ref_pts = reference_points[:, :, None, :, None, :]
+            ref_pts = reference_points[:, :, None, None, :, :]
             samp_off = sampling_offsets / offset_normalizer[None, None, None, :, None, :]
             sampling_locations = ref_pts + samp_off  # (B, Len_q, num_heads, num_levels, num_points, 2)
         elif reference_points.shape[-1] == 4:
@@ -217,7 +219,7 @@ class SpatialCrossAttention(nn.Module):
         """
         query: (B, num_query, C) - Range Image 提取的查询特征。
         key/value: (num_cams, L, B, C) - 6视角图像特征展平序列（L是所有尺度像素数之和）。
-        reference_points_cam: (num_cams, B, num_query, D, 2) - 每个查询投影到各摄像头的参考点坐标（归一化），D为每个查询的参考点数（Range场景下通常为1）。
+        reference_points_cam: (num_cams, B, num_query, D, 2) - 每个查询投影到各摄像头的参考点坐标（归一化），D为每个查询的参考点数。
         range_image_mask: (num_cams, B, num_query, D) - 掩码，指示每个查询在各摄像头下哪些参考点可见（True为可见）。
         """
         B, num_query, _ = query.shape
@@ -286,7 +288,8 @@ class SpatialCrossAttention(nn.Module):
 
 class RangeImageEncoder(nn.Module):
     """将 Range Image 特征与多摄像头图像特征融合的编码器。"""
-    def __init__(self, embed_dims=128, num_cams=6, num_layers=6, num_levels=1, num_points=8, pc_range=None):
+    def __init__(self, embed_dims=128, num_cams=6, num_layers=6, num_levels=1, 
+                 num_points=8, pc_range=None):
         super(RangeImageEncoder, self).__init__()
         self.embed_dims = embed_dims
         self.num_cams = num_cams
@@ -298,118 +301,20 @@ class RangeImageEncoder(nn.Module):
                                    pc_range=pc_range, num_levels=num_levels, num_points=num_points)
             for _ in range(num_layers)
         ])
-        self.img_metas = {
-            "CAM_BACK_LEFT": {
-                "cam_cs_record": {
-                    "camera_intrinsic": [
-                        [1256.7414812095406, 0.0, 792.1125740759628],
-                        [0.0, 1256.7414812095406, 492.7757465151356],
-                        [0.0, 0.0, 1.0]
-                    ],
-                    "rotation": [0.6924185592174665, -0.7031619420114925, -0.11648342771943819, 0.11203317912370753],
-                    "translation": [1.03569100218, 0.484795032713, 1.59097014818]
-                },
-                "lidar_cs_record": {
-                    "camera_intrinsic": [],
-                    "rotation": [0.7077955119163518, -0.006492242056004365, 0.010646214713995808, -0.7063073142877817],
-                    "translation": [0.943713, 0.0, 1.84023]
-                }
-            },
-            "CAM_BACK": {
-                "cam_cs_record": {
-                    "camera_intrinsic": [
-                        [809.2209905677063, 0.0, 829.2196003259838],
-                        [0.0, 809.2209905677063, 481.77842384512485],
-                        [0.0, 0.0, 1.0]
-                    ],
-                    "rotation": [0.5037872666382278, -0.49740249788611096, -0.4941850223835201, 0.5045496097725578],
-                    "translation": [0.0283260309358, 0.00345136761476, 1.57910346144]
-                },
-                "lidar_cs_record": {
-                    "camera_intrinsic": [],
-                    "rotation": [0.7077955119163518, -0.006492242056004365, 0.010646214713995808, -0.7063073142877817],
-                    "translation": [0.943713, 0.0, 1.84023]
-                }
-            },
-            "CAM_BACK_RIGHT": {
-                "cam_cs_record": {
-                    "camera_intrinsic": [
-                        [1259.5137405846733, 0.0, 807.2529053838625],
-                        [0.0, 1259.5137405846733, 501.19579884916527],
-                        [0.0, 0.0, 1.0]
-                    ],
-                    "rotation": [0.12280980120078765, -0.132400842670559, -0.7004305821388234, 0.690496031265798],
-                    "translation": [1.0148780988, -0.480568219723, 1.56239545128]
-                },
-                "lidar_cs_record": {
-                    "camera_intrinsic": [],
-                    "rotation": [0.7077955119163518, -0.006492242056004365, 0.010646214713995808, -0.7063073142877817],
-                    "translation": [0.943713, 0.0, 1.84023]
-                }
-            },
-            "CAM_FRONT_RIGHT": {
-                "cam_cs_record": {
-                    "camera_intrinsic": [
-                        [1260.8474446004698, 0.0, 807.968244525554],
-                        [0.0, 1260.8474446004698, 495.3344268742088],
-                        [0.0, 0.0, 1.0]
-                    ],
-                    "rotation": [0.2060347966337182, -0.2026940577919598, 0.6824507824531167, -0.6713610884174485],
-                    "translation": [1.5508477543, -0.493404796419, 1.49574800619]
-                },
-                "lidar_cs_record": {
-                    "camera_intrinsic": [],
-                    "rotation": [0.7077955119163518, -0.006492242056004365, 0.010646214713995808, -0.7063073142877817],
-                    "translation": [0.943713, 0.0, 1.84023]
-                }
-            },
-            "CAM_FRONT": {
-                "cam_cs_record": {
-                    "camera_intrinsic": [
-                        [1266.417203046554, 0.0, 816.2670197447984],
-                        [0.0, 1266.417203046554, 491.50706579294757],
-                        [0.0, 0.0, 1.0]
-                    ],
-                    "rotation": [0.4998015430569128, -0.5030316162024876, 0.4997798114386805, -0.49737083824542755],
-                    "translation": [1.70079118954, 0.0159456324149, 1.51095763913]
-                },
-                "lidar_cs_record": {
-                    "camera_intrinsic": [],
-                    "rotation": [0.7077955119163518, -0.006492242056004365, 0.010646214713995808, -0.7063073142877817],
-                    "translation": [0.943713, 0.0, 1.84023]
-                }
-            },
-            "CAM_FRONT_LEFT": {
-                "cam_cs_record": {
-                    "camera_intrinsic": [
-                        [1272.5979470598488, 0.0, 826.6154927353808],
-                        [0.0, 1272.5979470598488, 479.75165386361925],
-                        [0.0, 0.0, 1.0]
-                    ],
-                    "rotation": [0.6757265034669446, -0.6736266522251881, 0.21214015046209478, -0.21122827103904068],
-                    "translation": [1.52387798135, 0.494631336551, 1.50932822144]
-                },
-                "lidar_cs_record": {
-                    "camera_intrinsic": [],
-                    "rotation": [0.7077955119163518, -0.006492242056004365, 0.010646214713995808, -0.7063073142877817],
-                    "translation": [0.943713, 0.0, 1.84023]
-                }
-            }
-        }
-
+       
     
-    def forward(self, range_features, img_feats, feature_lvl, reference_points_cam, range_image_mask):
+    def forward(self, range_features, img_feats, sensor_metas, range_image_h, range_image_w,
+                feature_lvl, reference_points_cam, range_image_mask):
         """
         range_features: Range Image 提取的特征 (B, N_query, C) 或 (B, C, H_r, W_r)。
         img_feats: 包含多尺度多摄像头图像特征的列表，每个元素形状为 (B, num_cams, C, H, W)，已投影到 embed_dims 通道。
         reference_points_cam: (num_cams, B, N_query, D, 2) - 每个 Range Image 查询在各相机图像中的归一化参考点。
         range_image_mask: (num_cams, B, N_query, D) - 指示参考点是否在相机视野内的掩码。
         """
-        # 将 range_features 展平成 (B, N_query, C) 形式
-        if range_features.dim() == 4:
-            B, C_r, H_r, W_r = range_features.shape
-            range_features = range_features.permute(0, 2, 3, 1).reshape(B, H_r * W_r, C_r)  # 展平 Range 图像特征
+        bs = img_feats[0].shape[0]
+        range_features = range_features.unsqueeze(0).repeat(bs, 1, 1) # B, N_query, C
         B, N_query, C = range_features.shape
+
         # 展平每个尺度的图像特征并拼接
         spatial_shapes = []
         flattened_feats = []
@@ -420,43 +325,67 @@ class RangeImageEncoder(nn.Module):
             assert B_i == B and num_cams_i == self.num_cams
             spatial_shapes.append((H_feat, W_feat))
             # 展平该尺度特征
-            feat_flat = lvl_feat.view(B, num_cams_i, C_feat, H_feat * W_feat)  # (B, num_cams, C_feat, L_lvl)
+            feat_flat = lvl_feat.view(B, num_cams_i, C_feat, H_feat * W_feat)
             feat_flat = feat_flat.permute(1, 3, 0, 2)  # (num_cams, L_lvl, B, C_feat)
             flattened_feats.append(feat_flat)
             total_length += H_feat * W_feat
+
         # 将各尺度展平特征在长度维度上拼接
         # key/value 形状: (num_cams, total_length, B, C)
         key = torch.cat(flattened_feats, dim=1)
         value = key  # key 和 value 使用同一特征
+
         # 构建 spatial_shapes 和 level_start_index 张量
-        spatial_shapes_tensor = torch.tensor(spatial_shapes, dtype=torch.long, device=range_features.device)  # (num_levels, 2)
+        spatial_shapes_tensor = torch.tensor(
+            spatial_shapes, dtype=torch.long, device=range_features.device
+        )  # (num_levels, 2)
         level_start_index = [0]
         for (h, w) in spatial_shapes:
             level_start_index.append(level_start_index[-1] + h * w)
-        level_start_index = torch.tensor(level_start_index[:-1], dtype=torch.long, device=range_features.device)
+        level_start_index = torch.tensor(
+            level_start_index[:-1], dtype=torch.long, device=range_features.device
+        )
+
+        H_r, W_r = range_image_h, range_image_w  # Range Image 的高度和宽度
+        # 生成参考点
+        reference_points = self.get_reference_points(
+            H=H_r,
+            W=W_r,
+            max_range=self.pc_range,
+            num_points_in_ray=8,
+            fov_up=3.0,               # 制作 range image 时的参数
+            fov_down=-25.0,           # 制作 range image 时的参数
+            bs=bs,                    # 批次大小
+            device='cuda',
+            dtype=torch.float
+        )
+        _, _, _, h_feat, w_feat = img_feats[feature_lvl].shape
+        reference_points_cam, cam_mask = self.point_sampling(
+            reference_points=reference_points,
+            sensor_metas=sensor_metas,
+            orig_img_size=(1600, 900),
+            crop_size=(160, 320),
+            feat_size=(h_feat, w_feat)
+        )
+
         # 依次通过每一层 SpatialCrossAttention 进行特征融合
         x = range_features  # (B, N_query, C)
-
-        reference_points = self.get_reference_points(H_r, W_r, B, device='cuda', dtype=torch.float)
-        _, _, _, h_feat, w_feat = img_feats[feature_lvl].shape
-        reference_points_cam, range_image_mask = self.point_sampling(reference_points,
-                                                             self.img_metas,
-                                                             orig_img_size=(1600, 900),
-                                                             crop_size=(160, 320),
-                                                             feat_size=(h_feat, w_feat))
-
         for layer in self.attn_layers:
-            x = layer(query=x, key=key, value=value, query_pos=None,
-                      reference_points_cam=reference_points_cam, spatial_shapes=spatial_shapes_tensor,
-                      level_start_index=level_start_index, range_image_mask=range_image_mask)
+            x = layer(
+                query=x, key=key, value=value, query_pos=None,
+                reference_points_cam=reference_points_cam,
+                spatial_shapes=spatial_shapes_tensor,
+                level_start_index=level_start_index,
+                range_image_mask=cam_mask
+            )
 
         x = x.view(B, H_r, W_r, C).permute(0, 3, 1, 2)
         return x
 
     # 生成参考点，用于生成 range image 到 6环视图的 query，需要进行几何变换
     @staticmethod
-    def get_reference_points(H, W, max_range=70.0, num_points_in_ray=2,
-                             fov_up=3.0, fov_down=-25.0, dim='3d', bs=1,
+    def get_reference_points(H, W, max_range=70.0, num_points_in_ray=8,
+                             fov_up=3.0, fov_down=-25.0, bs=1,
                              device='cuda', dtype=torch.float):
         """
         生成用于 SCA/TSA 的参考点，这里参考点基于 range image 投影。
@@ -465,131 +394,217 @@ class RangeImageEncoder(nn.Module):
             max_range: 激光雷达测量的最大范围（单位与点云一致）。
             num_points_in_ray: 每个像素在射线上均匀采样的点数。
             fov_up, fov_down: 垂直视场角（度）。
-            dim: '3d' 时返回 3D 参考点（经逆投影得到 LiDAR 坐标），
-                '2d' 时返回 range image 平面归一化坐标。
             bs: 批次大小。
             device, dtype: 设备和数据类型。
         Returns:
-            如果 dim=='3d'，返回形状为 (bs, num_keys, num_levels, 3) 的 3D 参考点张量；
-            如果 dim=='2d'，返回形状为 (bs, num_keys, 1, 2) 的归一化 range image 坐标。
+            返回形状为 (bs, num_points_in_ray, H*W, 3) 的 3D 参考点张量；
+
         """
 
-        # 将 fov 转换为弧度
-        fov_up_rad = fov_up / 180.0 * np.pi
-        fov_down_rad = fov_down / 180.0 * np.pi
-        fov = abs(fov_down_rad) + abs(fov_up_rad)
+        # 沿深度方向均匀采样候选点 (单位：实际距离)
+        rs = torch.linspace(0.5, max_range - 0.5, num_points_in_ray, dtype=dtype,
+                            device=device).view(-1, 1, 1).expand(num_points_in_ray, H, W)
 
-        if dim == '3d':
-            # 沿深度方向均匀采样候选点 (单位：实际距离)
-            rs = torch.linspace(0.5, max_range - 0.5, num_points_in_ray, dtype=dtype,
-                                device=device).view(-1, 1, 1).expand(num_points_in_ray, H, W)
-            # 对 range image 的每个像素生成归一化的横向和纵向坐标
-            us = torch.linspace(0.5, W - 0.5, W, dtype=dtype, device=device).view(1, 1, W).expand(num_points_in_ray,
-                                                                                                  H, W) / W
-            vs = torch.linspace(0.5, H - 0.5, H, dtype=dtype, device=device).view(1, H, 1).expand(num_points_in_ray,
-                                                                                                  H, W) / H
+        # 对 range image 的每个像素生成横向和纵向坐标
+        us = torch.linspace(0.5, W - 0.5, W, dtype=dtype, 
+                            device=device).view(1, 1, W).expand(num_points_in_ray, H, W)
+        vs = torch.linspace(0.5, H - 0.5, H, dtype=dtype, 
+                            device=device).view(1, H, 1).expand(num_points_in_ray, H, W)
 
-            # 计算对应的 yaw 和 pitch
-            # 横向归一化坐标 -> yaw：范围 [-pi, pi]
-            yaw = us * 2 * np.pi - np.pi  # shape: (num_points_in_ray, H, W)
-            # 纵向归一化坐标 -> pitch：将 v=0对应 fov_up，v=1对应 -|fov_down|
-            pitch = (1 - vs) * fov - abs(fov_down_rad)
+        zoom_factor = 1920 / W
+        us = us * zoom_factor
+        vs = vs * zoom_factor
 
-            # 由 (r, yaw, pitch) 计算 3D 坐标（激光雷达坐标系）
-            xs = rs * torch.cos(pitch) * torch.cos(yaw)
-            ys = rs * torch.cos(pitch) * torch.sin(yaw)
-            zs = rs * torch.sin(pitch)
+        # 将 (us, vs, rs) 根据制作 range image 时的参数，投影到3D坐标系
+        ref_3d = inverse_range_projection(u=us.cpu().numpy(), v=vs.cpu().numpy(), depth=rs.cpu().numpy())
 
-            # 将 (num_points_in_ray, H, W, 3) 调整成与原来 get_reference_points 类似的格式
-            ref_3d = torch.stack((xs, ys, zs), -1)  # shape: (num_points_in_ray, H, W, 3)
-            ref_3d = ref_3d.permute(0, 3, 1, 2).flatten(2).permute(0, 2, 1)  # (num_points_in_ray, H*W, 3)
-            ref_3d = ref_3d[None].repeat(bs, 1, 1, 1)  # (bs, num_points_in_ray, H*W, 3)
-            return ref_3d
+        # 将 ref_3d 转换为 tensor
+        ref_3d = torch.tensor(ref_3d, dtype=dtype, device=device)
+        
+        # 将 ref_3d 的形状调整为 (bs, 3, num_points_in_ray, H, W)
+        ref_3d = ref_3d.unsqueeze(0).repeat(bs, 1, 1, 1, 1)  # (bs, 3, num_points_in_ray, H, W)
 
-        elif dim == '2d':
-            # 对 range image 平面，直接返回归一化的像素坐标
-            ref_y, ref_x = torch.meshgrid(
-                torch.linspace(0.5, H - 0.5, H, dtype=dtype, device=device),
-                torch.linspace(0.5, W - 0.5, W, dtype=dtype, device=device)
-            )
-            ref_y = ref_y.reshape(-1)[None] / H
-            ref_x = ref_x.reshape(-1)[None] / W
-            ref_2d = torch.stack((ref_x, ref_y), -1)  # (1, H*W, 2)
-            ref_2d = ref_2d.repeat(bs, 1, 1).unsqueeze(2)  # (bs, H*W, 1, 2)
-            return ref_2d
+        # 将 ref_3d 的维度调整为 (bs, num_points_in_ray, H*W, 3)
+        ref_3d = ref_3d.permute(0, 2, 3, 4, 1).flatten(2,3)
+
+        return ref_3d
 
     # This function must use fp32!!!
-    @force_fp32(apply_to=('reference_points', 'img_metas'))
-    def point_sampling(self, reference_points, img_metas, orig_img_size, crop_size, feat_size):
+    @force_fp32(apply_to=('reference_points', 'sensor_metas'))
+    def point_sampling(self, reference_points, sensor_metas, orig_img_size, crop_size, feat_size):
         # 关闭 TF32 加速以确保数值精度
         allow_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
 
-        # 提取每个样本的 lidar2img 变换矩阵，形状为 (B, num_cam, 4, 4)
-        lidar2img = []
-        # 遍历img_metas的每个key:value
-        for channel, calib_info in img_metas.items():
-            cam_cs_record = calib_info['cam_cs_record']
-            lidar_cs_record = calib_info['lidar_cs_record']
-            lidar2img_matrix = get_lidar2img_matrix(cam_cs_record,
-                                                    lidar_cs_record,
-                                                    orig_img_size=orig_img_size,
-                                                    crop_size=crop_size,
-                                                    feat_size=feat_size
-                                                    )
-            lidar2img.append(lidar2img_matrix)
+        device = reference_points.device
 
-        # for img_meta in img_metas:
-        #     lidar2img.append(img_meta['lidar2img'])
-        lidar2img = np.asarray(lidar2img)
-        lidar2img = reference_points.new_tensor(lidar2img)  # (B, num_cam, 4, 4)
-        reference_points = reference_points.clone()
-        # 此处的 reference_points 已经为 3D LiDAR 坐标，不需要用 pc_range 反归一化
+        # -------------------------------------
+        # 1. LiDAR 坐标系 -> Ego vehicle 坐标系
+        # -------------------------------------
+        lidar_metas = sensor_metas['lidar']
 
-        # 转换为齐次坐标
-        reference_points = torch.cat(
-            (reference_points, torch.ones_like(reference_points[..., :1])), -1)
+        # LiDAR 的标定信息：从 LiDAR 传感器到 Ego 的变换
+        lidar_calib = lidar_metas['calibrated_sensor']
+        # 将 translation 和 rotation 从 CPU 转为 GPU 上的 torch.tensor
+        lidar_calib_translation = torch.tensor(
+            [t.item() for t in lidar_calib['translation']],
+            dtype=torch.float32, device=device
+        )  # shape (3,)
+        # 利用 pyquaternion 计算旋转矩阵，再转换为 torch.tensor
+        lidar_calib_rotation = Quaternion([t.item() for t in lidar_calib['rotation']]).rotation_matrix
+        rotation_lidar2ego = torch.tensor(lidar_calib_rotation, dtype=torch.float32, device=device)  # (3,3)
 
-        # 调整维度以便与多相机矩阵做矩阵乘法
-        reference_points = reference_points.permute(1, 0, 2, 3)
-        D, B, num_query = reference_points.size()[:3]
-        num_cam = lidar2img.size(0)
+        # --------------------------------------
+        # 2. Ego vehicle 坐标系 -> Global 坐标系
+        # --------------------------------------
+        lidar_pose = lidar_metas['ego_pose']
+        lidar_pose_translation = torch.tensor(
+            [t.item() for t in lidar_pose['translation']],
+            dtype=torch.float32, device=device
+        )  # shape (3,)
+        lidar_pose_rotation = Quaternion([t.item() for t in lidar_pose['rotation']]).rotation_matrix
+        rotation_ego2global = torch.tensor(lidar_pose_rotation, dtype=torch.float32, device=device)  # (3,3)
 
-        reference_points = reference_points.view(
-            D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
+        bs, num_points_in_ray, num_query, _ = reference_points.shape
+        # 将参考点 reshape 为 (bs, N, 3)，其中 N = num_points_in_ray * num_query
+        pc = reference_points.reshape(bs, -1, 3)  # (bs, N, 3)
 
-        lidar2img = lidar2img.view(
-            1, B, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
+        # LiDAR 传感器坐标系到 Ego 坐标系
+        pc = torch.matmul(pc, rotation_lidar2ego.T) + lidar_calib_translation
+        # Ego 坐标系到 Global 坐标系
+        pc = torch.matmul(pc, rotation_ego2global.T) + lidar_pose_translation
 
-        # 将参考点从 LiDAR 坐标系投影到相机坐标系
-        reference_points_cam = torch.matmul(lidar2img.to(torch.float32),
-                                            reference_points.to(torch.float32)).squeeze(-1)
-        eps = 1e-5
+        # -----------------------------
+        # 4. Global 坐标系 -> Camera 坐标系
+        # -----------------------------
+        camera_metas = sensor_metas['camera']
+        # 构建 (num_cam, bs, num_query, num_points_in_ray, 2) 的 tensor: reference_points_cam
+        reference_points_cam = torch.zeros(
+            (len(camera_metas['calibrated_sensor']), bs, num_query, num_points_in_ray, 2),
+            dtype=torch.float32, device=device
+        )
+        cam_mask = torch.zeros(
+            (len(camera_metas['calibrated_sensor']), bs, num_query, num_points_in_ray),
+            dtype=torch.bool, device=device
+        )
 
-        # 仅保留相机前方的点（z > eps），并执行透视除法
-        cam_mask = (reference_points_cam[..., 2:3] > eps)
-        reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
-            reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3]) * eps)
+        pc_global = pc.clone()  # 保存 global 坐标系下的点云
 
-        # 归一化到相机图像尺寸，假定 img_metas 中给定了 img_shape (height, width)
-        reference_points_cam[..., 0] /= feat_size[1] # width
-        reference_points_cam[..., 1] /= feat_size[0] # height
+        channel_idx = 0
+        for channel,cam_calib in camera_metas['calibrated_sensor'].items():
+            cam_pose = camera_metas['ego_pose'][channel]
+            cam_pose_translation = torch.tensor(
+                [t.item() for t in cam_pose['translation']],
+                dtype=torch.float32, device=device
+            )
+            cam_pose_rotation = Quaternion([t.item() for t in cam_pose['rotation']]).rotation_matrix
+            # 注意：转换 global -> ego_cam 时，需要使用逆变换，因此通常使用平移取反，旋转矩阵取转置
+            rotation_global2ego_cam = torch.tensor(cam_pose_rotation, dtype=torch.float32, device=device).T
+            translation_global2ego_cam = -cam_pose_translation
 
-        cam_mask = (cam_mask & (reference_points_cam[..., 1:2] > 0.0)
-                    & (reference_points_cam[..., 1:2] < 1.0)
-                    & (reference_points_cam[..., 0:1] < 1.0)
-                    & (reference_points_cam[..., 0:1] > 0.0))
-        if digit_version(TORCH_VERSION) >= digit_version('1.8'):
-            cam_mask = torch.nan_to_num(cam_mask)
-        else:
-            cam_mask = cam_mask.new_tensor(np.nan_to_num(cam_mask.cpu().numpy()))
+            # 应用 global -> ego_cam 的变换
+            # 先平移，再旋转
+            pc = pc_global.clone()  # 恢复 global 坐标系下的点云
+            pc = torch.matmul(pc + translation_global2ego_cam, rotation_global2ego_cam.T)
+            
+            cam_calib_translation = torch.tensor(
+                [t.item() for t in cam_calib['translation']],
+                dtype=torch.float32, device=device
+            )
+            cam_calib_rotation = Quaternion([t.item() for t in cam_calib['rotation']]).rotation_matrix
+            # 注意：转换 ego_cam -> cam 时，需要使用逆变换，因此通常使用平移取反，旋转矩阵取转置
+            rotation_ego2cam = torch.tensor(cam_calib_rotation, dtype=torch.float32, device=device).T
+            translation_ego2cam = -cam_calib_translation
 
-        reference_points_cam = reference_points_cam.permute(2, 1, 3, 0, 4)
-        cam_mask = cam_mask.permute(2, 1, 3, 0, 4).squeeze(-1)
+            pc = torch.matmul(pc + translation_ego2cam, rotation_ego2cam.T)
+
+            # -------------------------------------
+            # 4. 将点云从相机坐标系投影到图像平面
+            # -------------------------------------
+            # view_points_gpu 接受 shape 为 (3, n) 的点，因此需要对 batch 内每个样本分别处理
+            camera_intrinsic = torch.tensor([[elem.item() for elem in row] 
+                          for row in cam_calib['camera_intrinsic']], dtype=torch.float64)
+            proj_points_list = []
+            valid_mask_list = []
+            for i in range(bs):
+                # 转置为 (3, N)
+                points_cam = pc[i].T
+                # 使用透视投影：normalize=True 会除以第三行，得到 (3, N) 的齐次投影结果
+                proj = view_points_gpu(points_cam, camera_intrinsic, normalize=True)
+                # 取前两行，即 (u, v) 坐标；再转置回 (N, 2)
+                proj_uv = proj[:2, :].T
+
+                # 上述投影操作是在原图尺寸下进行的
+                # 因此需要将投影坐标缩放到模型输入尺寸 - 进一步到特征图尺寸
+                resize_origin2input = crop_size[1] / orig_img_size[1]
+                proj_uv[:, 0] *= resize_origin2input
+                resize_input2feat = feat_size[1] / crop_size[1]
+                proj_uv[:, 0] *= resize_input2feat
+
+                # 计算有效点的掩码
+                valid_mask = (proj_uv[:, 0] >= 0) & (proj_uv[:, 0] < feat_size[1]) & \
+                            (proj_uv[:, 1] >= 0) & (proj_uv[:, 1] < feat_size[0])
+                proj_points_list.append(proj_uv)
+                valid_mask_list.append(valid_mask)
+            # 堆叠得到 (bs, N, 2)
+            proj_points = torch.stack(proj_points_list, dim=0)
+            valid_mask = torch.stack(valid_mask_list, dim=0)  # (bs, N)
+            
+            # 根据原始点结构恢复 (bs, num_query, num_points_in_ray, 2)
+            proj_points = proj_points.reshape(bs, num_query, num_points_in_ray, 2)
+            # 将有效掩码 reshape 为 (bs, num_query, num_points_in_ray)
+            valid_mask = valid_mask.reshape(bs, num_query, num_points_in_ray)
+
+            # 使用不同 channel 的 proj_points 为 reference_points_cam 赋值
+            reference_points_cam[channel_idx] = proj_points
+            cam_mask[channel_idx] = valid_mask
+            channel_idx += 1    
 
         # 恢复 TF32 配置
         torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         torch.backends.cudnn.allow_tf32 = allow_tf32
 
         return reference_points_cam, cam_mask
+
+
+def view_points_gpu(points: torch.Tensor, view: torch.Tensor, normalize: bool) -> torch.Tensor:
+    """
+    使用 GPU 上的 torch tensor 将 3D 点投影到 2D 平面上。
+
+    Args:
+        points: 形状为 (3, n) 的 tensor，每个点为 (x, y, z)
+        view: 投影矩阵，形状可以是 (3, 3) 或 (3, 4)
+        normalize: 是否归一化第三个坐标（透视投影时设为 True）
+
+    Returns:
+        投影后的点，形状为 (3, n)。当 normalize=True 时，第三个坐标被归一化。
+    """
+    # 确保 view 的维度不超过 4x4，points 为 (3, n)
+    assert view.shape[0] <= 4 and view.shape[1] <= 4, "view 矩阵维度应不超过4x4"
+    assert points.shape[0] == 3, "points 应为形状 (3, n) 的 tensor"
+
+    # 获取 points 所在设备与数据类型
+    device = points.device
+    dtype = points.dtype
+
+    # 构造 4x4 的单位矩阵，并将 view 矩阵填充到对应的子矩阵中
+    viewpad = torch.eye(4, device=device, dtype=dtype)
+    viewpad[:view.shape[0], :view.shape[1]] = view
+
+    nbr_points = points.shape[1]
+
+    # 将 points 扩展为齐次坐标形式，形状 (4, n)
+    ones = torch.ones((1, nbr_points), device=device, dtype=dtype)
+    points_hom = torch.cat([points, ones], dim=0)
+
+    # 投影：矩阵乘法
+    points_proj = torch.matmul(viewpad, points_hom)  # 形状 (4, n)
+    points_proj = points_proj[:3, :]  # 取前3行
+
+    if normalize:
+        # 防止除以 0，加上一个微小值
+        eps = 1e-6
+        points_proj = points_proj / (points_proj[2:3, :] + eps).expand_as(points_proj)
+
+    return points_proj

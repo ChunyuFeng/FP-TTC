@@ -4,6 +4,7 @@ import numpy as np
 import math
 import time
 from sklearn.cluster import DBSCAN
+import torch
 
 
 from PIL import Image
@@ -253,3 +254,44 @@ def project_lidar_to_surround_view_img(nusc,
         }
 
     return projected_points
+
+def view_points_gpu(points: torch.Tensor, view: torch.Tensor, normalize: bool) -> torch.Tensor:
+    """
+    使用 GPU 上的 torch tensor 将 3D 点投影到 2D 平面上。
+
+    Args:
+        points: 形状为 (3, n) 的 tensor，每个点为 (x, y, z)
+        view: 投影矩阵，形状可以是 (3, 3) 或 (3, 4)
+        normalize: 是否归一化第三个坐标（透视投影时设为 True）
+
+    Returns:
+        投影后的点，形状为 (3, n)。当 normalize=True 时，第三个坐标被归一化。
+    """
+    # 确保 view 的维度不超过 4x4，points 为 (3, n)
+    assert view.shape[0] <= 4 and view.shape[1] <= 4, "view 矩阵维度应不超过4x4"
+    assert points.shape[0] == 3, "points 应为形状 (3, n) 的 tensor"
+
+    # 获取 points 所在设备与数据类型
+    device = points.device
+    dtype = points.dtype
+
+    # 构造 4x4 的单位矩阵，并将 view 矩阵填充到对应的子矩阵中
+    viewpad = torch.eye(4, device=device, dtype=dtype)
+    viewpad[:view.shape[0], :view.shape[1]] = view
+
+    nbr_points = points.shape[1]
+
+    # 将 points 扩展为齐次坐标形式，形状 (4, n)
+    ones = torch.ones((1, nbr_points), device=device, dtype=dtype)
+    points_hom = torch.cat([points, ones], dim=0)
+
+    # 投影：矩阵乘法
+    points_proj = torch.matmul(viewpad, points_hom)  # 形状 (4, n)
+    points_proj = points_proj[:3, :]  # 取前3行
+
+    if normalize:
+        # 防止除以 0，加上一个微小值
+        eps = 1e-6
+        points_proj = points_proj / (points_proj[2:3, :] + eps).expand_as(points_proj)
+
+    return points_proj

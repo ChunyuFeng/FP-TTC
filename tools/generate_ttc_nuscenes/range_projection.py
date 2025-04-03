@@ -405,17 +405,40 @@ def main():
 
             original_img_path = {}
             original_img_token = {}
+            cam_calib = {}
+            cam_pose = {}
             for camera_channel, data in previous_surround_view_data.items():
-                original_img_path[camera_channel] = previous_surround_view_data[camera_channel]['filename']
-                original_img_token[camera_channel] = previous_surround_view_data[camera_channel]['token']
+                camera_sample_data = nusc.get('sample_data', data['token'])
+                original_img_path[camera_channel] = data['filename']
+                original_img_token[camera_channel] = data['token']
+                cam_calib[camera_channel] = nusc.get('calibrated_sensor', camera_sample_data['calibrated_sensor_token'])
+                cam_pose[camera_channel] = nusc.get('ego_pose', camera_sample_data['ego_pose_token'])
+
 
             lidar_token = previous_sf_record['token']
+
+            lidar_sample_data = nusc.get('sample_data', lidar_token)
+            lidar_cs_record = nusc.get('calibrated_sensor', lidar_sample_data['calibrated_sensor_token'])
+            lidar_pose = nusc.get('ego_pose', lidar_sample_data['ego_pose_token'])
+
+            sensor_metas = {
+                'lidar': {
+                    'token': lidar_token,
+                    'calibrated_sensor': lidar_cs_record,
+                    'ego_pose': lidar_pose
+                },
+                'camera': {
+                    'token': original_img_token,
+                    'calibrated_sensor': cam_calib,
+                    'ego_pose': cam_pose
+                }
+            }
+
             # GT: timestamp, original_imgs_path, scale_map_path
             info = {
                 'timestamp': previous_sf_record['timestamp'],
                 'original_imgs_path': original_img_path,
-                'original_imgs_token': original_img_token,
-                'lidar_token': lidar_token,
+                'sensor_metas': sensor_metas,
                 'scale_map_path': scale_map_path
             }
 

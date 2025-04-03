@@ -620,6 +620,7 @@ class nuScenes_range_image(data.Dataset):
         self.image_list = []
         self.timestamp_list = []
         self.depth_list = []
+        self.sensor_meta_list = []
 
         infos = self.data['infos']
 
@@ -646,6 +647,7 @@ class nuScenes_range_image(data.Dataset):
                 self.image_list.append([current_info['original_imgs_path'], next_info['original_imgs_path']])
                 self.timestamp_list.append([current_info['timestamp'], next_info['timestamp']])
                 self.depth_list.append([current_info['scale_map_path'], next_info['scale_map_path']])
+                self.sensor_meta_list.append([current_info['sensor_metas'], next_info['sensor_metas']])
 
     def __len__(self):
         return len(self.image_list)
@@ -656,13 +658,9 @@ class nuScenes_range_image(data.Dataset):
         surr_view_imgs2 = {}
         surr_view_imgs_path1, surr_view_imgs_path2 = self.image_list[index]
 
-        # for item in self.image_list:
-        #     for d in item:
-        #         for path in d.values():
-        #             if path.startswith('/'):
-        #                 print("Path is not correct: ", path)
-
         timestamp1, timestamp2 = self.timestamp_list[index]
+
+        # 使用更接近当前时刻的 scale map 作为真值
         range_image_scale_path1, range_image_scale_path2 = self.depth_list[index]
 
         if self.train_location == 'local':
@@ -677,13 +675,6 @@ class nuScenes_range_image(data.Dataset):
         camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                            'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
 
-        # for channel in camera_channels:
-        #     if not surr_view_imgs_path1[channel].startswith('image_path_prefix'):
-        #         surr_view_imgs_path1[channel] = image_path_prefix + surr_view_imgs_path1[channel]
-        #     if not surr_view_imgs_path2[channel].startswith('image_path_prefix'):
-        #         surr_view_imgs_path2[channel] = image_path_prefix + surr_view_imgs_path2[channel]
-
-
         # 读取图像和 scale 真值（range image）数据
         for channel in camera_channels:
             if not surr_view_imgs_path1[channel].startswith(image_path_prefix):
@@ -693,7 +684,7 @@ class nuScenes_range_image(data.Dataset):
             surr_view_imgs1[channel] = frame_utils.read_nusc_image(surr_view_imgs_path1[channel])
             surr_view_imgs2[channel] = frame_utils.read_nusc_image(surr_view_imgs_path2[channel])
 
-        gt_scale = frame_utils.read_nusc_scale_range_image(range_image_scale_path1)
+        gt_scale = frame_utils.read_nusc_scale_range_image(range_image_scale_path2)
 
         # 数据增强
         if self.augmentor is not None:
@@ -716,21 +707,21 @@ class nuScenes_range_image(data.Dataset):
         # 拼接gt_scale和mask
         gt_scale_with_mask = torch.cat((gt_scale.unsqueeze(0), mask.unsqueeze(0).float()), dim=0)
 
-        # #################### 统计gt中的有效值 ####################
-        # # 点云数只占图像像素数的 1%
-        # non_nan_values = gt_scale[~torch.isnan(gt_scale)]
-        # non_nan_count = non_nan_values.numel()
+        sensor_meta = self.sensor_meta_list[index]
 
+        # # 将 images token 和 lidar token 也传入模型
+        # # 方便后续调用投影函数，实现 Range Image 和 Surround View Image 之间特征位置的对应
+        # prev_surr_view_imgs_token, curr_surr_view_imgs_token = self.image_token_list[index]
+        # prev_lidar_token, curr_lidar_token = self.lidar_token_list[index]          
 
-        # 返回图像、时间戳、深度
-        # return img1_tensor, img2_tensor, timestamp1, timestamp2, gt_scale, mask
-        return prev_surr_view_imgs_tensor, curr_surr_view_imgs_tensor, gt_scale_with_mask
+        return (prev_surr_view_imgs_tensor, curr_surr_view_imgs_tensor, gt_scale_with_mask, # model 的输入以及真值
+                sensor_meta) # 传入模型的 sensor_meta 信息，包括 lidar 和 camera 的内参、外参等
 
     def __rmul__(self, v):
         self.timestamp_list = v * self.timestamp_list
         self.image_list = v * self.image_list
         self.depth_list = v * self.depth_list
-        # self.occ_list = v * self.occ_list
+        self.sensor_meta_list = v * self.sensor_meta_list
         return self
 
 def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
@@ -762,6 +753,7 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
     elif args.stage == 'nuscenes_range_image':
         aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
         train_info_file = 'nusc_range_image_train_infos_160_1920.pkl'
+
         train_location = args.train_location
         if train_location == 'local':
             root='/mnt/fpttc_data/TVT_infos'
@@ -769,6 +761,7 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
             root='/mnt/pool/fcy/FP-TTC/Datasets/tvt_infos/'
         else:
             raise ValueError('Invalid train_location: ', train_location)
+        
         nuscenes = nuScenes_range_image(aug_params,
                                         train_info_file=train_info_file,
                                         split='training',

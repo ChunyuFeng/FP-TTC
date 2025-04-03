@@ -24,9 +24,10 @@ class FpTTC(nn.Module):
                  num_head=1,
                  ffn_dim_expansion=4,
                  num_transformer_layers=6,
+                 range_image_feat_shape=[(20, 240), (40, 480)],
                  reg_refine=False,  # optional local regression refinement
                  train=False,
-                 local_radius=3
+                #  local_radius=3,
                  ):
         super(FpTTC, self).__init__()
 
@@ -35,7 +36,9 @@ class FpTTC(nn.Module):
         self.upsample_factor = upsample_factor
         self.reg_refine = reg_refine
         self.is_trainning = train
-        self.local_radius = local_radius
+        # self.local_radius = local_radius
+
+        self.range_image_feat_shape = range_image_feat_shape
 
         # CNN
         #norm_layer=nn.BatchNorm2d
@@ -59,11 +62,21 @@ class FpTTC(nn.Module):
         #                             num_feature_levels=num_scales,
         #                             num_level=num_scales)
 
-        self.rangeimageencoder = RangeImageEncoder(num_layers=num_transformer_layers,
-                                                   num_levels=num_scales,
-                                                   num_points=8,
-                                                   embed_dims=feature_channels
-                                                   )
+        self.RI_Encoder = RangeImageEncoder(embed_dims=feature_channels,
+                                            num_cams=6,
+                                            num_layers=num_transformer_layers,
+                                            num_levels=num_scales,
+                                            num_points=8, # SpatialCrossAttention 模块使用的参数
+                                            pc_range=70.0
+                                            )
+        # 分别为 prev range image/curr range image 的 low level/high level 创建可学习的embedding
+        self.range_image_embeds = nn.ModuleDict({
+            'prev_llvl': nn.Embedding(range_image_feat_shape[0][0] * range_image_feat_shape[0][1], feature_channels),
+            'curr_llvl': nn.Embedding(range_image_feat_shape[0][0] * range_image_feat_shape[0][1], feature_channels),
+            'prev_hlvl': nn.Embedding(range_image_feat_shape[1][0] * range_image_feat_shape[1][1], feature_channels),
+            'curr_hlvl': nn.Embedding(range_image_feat_shape[1][0] * range_image_feat_shape[1][1], feature_channels),
+        })
+
         # self.MultiLayerHierarchicalFusion = MultiLayerHierarchicalFusion(num_layers=num_transformer_layers,
         #                                                                  embed_dim=feature_channels,
         #                                                                  num_scales=num_scales,
@@ -204,9 +217,8 @@ class FpTTC(nn.Module):
         return scales, None, None
         '''
 
-
     # 0 ~ 5 6个视角 同时处理
-    def forward(self, img0, img1,
+    def forward(self, img0, img1, sensor_metas,
                 attn_type=None,
                 attn_splits_list=None,
                 corr_radius_list=None,
@@ -221,9 +233,6 @@ class FpTTC(nn.Module):
             torch.set_grad_enabled(False)
 
         scale, corr = None, None
-        mlvl_feats0, mlvl_feats1, mlvl_flows, mlvl_flows_back = [], [], [], []
-
-        start = time.time()
 
         img0, img1 = normalize_img(img0, img1)
 
@@ -239,17 +248,9 @@ class FpTTC(nn.Module):
         feature0_listc = []
         feature1_listc = []
 
-        # 随机初始化一个可学习的tensor，用于初始化query，B,C,H,6W
-        B_query_0, C_query_0, H_query_0, W_query_0 = prev_feature_list[0][0].shape
-        B_query_1, C_query_1, H_query_1, W_query_1 = prev_feature_list[0][1].shape
-        prev_query_0 = torch.randn(B_query_0, C_query_0, H_query_0, 6*W_query_0).cuda()
-        curr_query_0 = torch.randn(B_query_0, C_query_0, H_query_0, 6*W_query_0).cuda()
-        prev_query_1 = torch.randn(B_query_1, C_query_1, H_query_1, 6*W_query_1).cuda()
-        curr_query_1 = torch.randn(B_query_1, C_query_1, H_query_1, 6*W_query_1).cuda()
-
         prev_feat_stacked = []
         curr_feat_stacked = []
-        # 给每个level的特征增加一个维度，用于存储不同视角的特征 B, num_cams, C, H, W
+        # 合并多个视角的特征图： B, num_cams, C, H, W
         for scale in range(self.num_scales):
             scale_feats = [prev_feature_list[cam][scale] for cam in range(camera_channel_num)]
             scale_feats_stacked = torch.stack(scale_feats, dim=1)
@@ -258,16 +259,44 @@ class FpTTC(nn.Module):
             scale_feats = [curr_feature_list[cam][scale] for cam in range(camera_channel_num)]
             scale_feats_stacked = torch.stack(scale_feats, dim=1)
             curr_feat_stacked.append(scale_feats_stacked)
+        
+        # range image 特征图作为 query
+        dtype = prev_feat_stacked[0].dtype
+        prev_ri_query_llvl, prev_ri_query_hlvl, curr_ri_query_llvl, curr_ri_query_hlvl = [
+            self.range_image_embeds[key].weight.to(dtype) 
+            for key in ['prev_llvl', 'prev_hlvl', 'curr_llvl', 'curr_hlvl']
+        ]
 
-        prev_feature_0 = self.rangeimageencoder(prev_query_0, prev_feat_stacked, feature_lvl=0, reference_points_cam=None, range_image_mask=None)
-        curr_feature_0 = self.rangeimageencoder(curr_query_0, prev_feat_stacked, feature_lvl=0, reference_points_cam=None, range_image_mask=None)
-        prev_feature_1 = self.rangeimageencoder(prev_query_1, curr_feat_stacked, feature_lvl=1, reference_points_cam=None, range_image_mask=None)
-        curr_feature_1 = self.rangeimageencoder(curr_query_1, curr_feat_stacked, feature_lvl=1, reference_points_cam=None, range_image_mask=None)
+        prev_feature_llvl, curr_feature_llvl = [
+            self.RI_Encoder(
+            range_features=query,
+            img_feats=prev_feat_stacked,
+            sensor_metas=sensor_metas[0] if query is prev_ri_query_llvl else sensor_metas[1],
+            range_image_h=self.range_image_feat_shape[0][0],
+            range_image_w=self.range_image_feat_shape[0][1],
+            feature_lvl=0,
+            reference_points_cam=None,
+            range_image_mask=None
+            )
+            for query in (prev_ri_query_llvl, curr_ri_query_llvl)
+        ]
+        prev_feature_hlvl, curr_feature_hlvl = [
+            self.RI_Encoder(
+            range_features=query,
+            img_feats=curr_feat_stacked,
+            sensor_metas=sensor_metas[0] if query is prev_ri_query_hlvl else sensor_metas[1],
+            range_image_h=self.range_image_feat_shape[1][0],
+            range_image_w=self.range_image_feat_shape[1][1],
+            feature_lvl=1,
+            reference_points_cam=None,
+            range_image_mask=None
+            )
+            for query in (prev_ri_query_hlvl, curr_ri_query_hlvl)
+        ]
 
-        feature0_listc.append(prev_feature_0)
-        feature0_listc.append(prev_feature_1)
-        feature1_listc.append(curr_feature_0)
-        feature1_listc.append(curr_feature_1)
+        feature0_listc = [prev_feature_llvl, prev_feature_hlvl]
+        feature1_listc = [curr_feature_llvl, curr_feature_hlvl]
+
         # # 将不同视角的图像按照channel维度拼接
         # for i in range(num_feat_levels):
         #     tensor_to_concat = [entry[i] for entry in prev_feature_list]

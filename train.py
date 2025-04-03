@@ -157,6 +157,7 @@ def main():
                     num_head=args.num_head,
                     ffn_dim_expansion=args.ffn_dim_expansion,
                     num_transformer_layers=args.num_transformer_layers,
+                    range_image_feat_shape=[(20, 240), (40, 480)],
                     reg_refine=args.reg_refine,
                     train=True).cuda()
     
