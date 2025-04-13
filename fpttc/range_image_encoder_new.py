@@ -448,11 +448,11 @@ class RangeImageEncoder(nn.Module):
         lidar_calib = lidar_metas['calibrated_sensor']
         # 将 translation 和 rotation 从 CPU 转为 GPU 上的 torch.tensor
         lidar_calib_translation = torch.tensor(
-            [t.item() for t in lidar_calib['translation']],
+            [t[0].item() if t.numel() > 1 else t.item() for t in lidar_calib['translation']],
             dtype=torch.float32, device=device
         )  # shape (3,)
         # 利用 pyquaternion 计算旋转矩阵，再转换为 torch.tensor
-        lidar_calib_rotation = Quaternion([t.item() for t in lidar_calib['rotation']]).rotation_matrix
+        lidar_calib_rotation = Quaternion([t[0].item() if t.numel() > 1 else t.item() for t in lidar_calib['rotation']]).rotation_matrix
         rotation_lidar2ego = torch.tensor(lidar_calib_rotation, dtype=torch.float32, device=device)  # (3,3)
 
         # --------------------------------------
@@ -460,10 +460,10 @@ class RangeImageEncoder(nn.Module):
         # --------------------------------------
         lidar_pose = lidar_metas['ego_pose']
         lidar_pose_translation = torch.tensor(
-            [t.item() for t in lidar_pose['translation']],
+            [t[0].item() if t.numel() > 1 else t.item() for t in lidar_pose['translation']],
             dtype=torch.float32, device=device
         )  # shape (3,)
-        lidar_pose_rotation = Quaternion([t.item() for t in lidar_pose['rotation']]).rotation_matrix
+        lidar_pose_rotation = Quaternion([t[0].item() if t.numel() > 1 else t.item() for t in lidar_pose['rotation']]).rotation_matrix
         rotation_ego2global = torch.tensor(lidar_pose_rotation, dtype=torch.float32, device=device)  # (3,3)
 
         bs, num_points_in_ray, num_query, _ = reference_points.shape
@@ -495,10 +495,10 @@ class RangeImageEncoder(nn.Module):
         for channel,cam_calib in camera_metas['calibrated_sensor'].items():
             cam_pose = camera_metas['ego_pose'][channel]
             cam_pose_translation = torch.tensor(
-                [t.item() for t in cam_pose['translation']],
+                [t[0].item() if t.numel() > 1 else t.item() for t in cam_pose['translation']],
                 dtype=torch.float32, device=device
             )
-            cam_pose_rotation = Quaternion([t.item() for t in cam_pose['rotation']]).rotation_matrix
+            cam_pose_rotation = Quaternion([t[0].item() if t.numel() > 1 else t.item() for t in cam_pose['rotation']]).rotation_matrix
             # 注意：转换 global -> ego_cam 时，需要使用逆变换，因此通常使用平移取反，旋转矩阵取转置
             rotation_global2ego_cam = torch.tensor(cam_pose_rotation, dtype=torch.float32, device=device).T
             translation_global2ego_cam = -cam_pose_translation
@@ -509,10 +509,10 @@ class RangeImageEncoder(nn.Module):
             pc = torch.matmul(pc + translation_global2ego_cam, rotation_global2ego_cam.T)
             
             cam_calib_translation = torch.tensor(
-                [t.item() for t in cam_calib['translation']],
+                [t[0].item() if t.numel() > 1 else t.item() for t in cam_calib['translation']],
                 dtype=torch.float32, device=device
             )
-            cam_calib_rotation = Quaternion([t.item() for t in cam_calib['rotation']]).rotation_matrix
+            cam_calib_rotation = Quaternion([t[0].item() if t.numel() > 1 else t.item() for t in cam_calib['rotation']]).rotation_matrix
             # 注意：转换 ego_cam -> cam 时，需要使用逆变换，因此通常使用平移取反，旋转矩阵取转置
             rotation_ego2cam = torch.tensor(cam_calib_rotation, dtype=torch.float32, device=device).T
             translation_ego2cam = -cam_calib_translation
@@ -523,8 +523,11 @@ class RangeImageEncoder(nn.Module):
             # 4. 将点云从相机坐标系投影到图像平面
             # -------------------------------------
             # view_points_gpu 接受 shape 为 (3, n) 的点，因此需要对 batch 内每个样本分别处理
-            camera_intrinsic = torch.tensor([[elem.item() for elem in row] 
-                          for row in cam_calib['camera_intrinsic']], dtype=torch.float64)
+            camera_intrinsic = torch.tensor(
+                [[t[0].item() if t.numel() > 1 else t.item() for t in row]
+                for row in cam_calib['camera_intrinsic']],
+                dtype=torch.float64
+            )
             proj_points_list = []
             valid_mask_list = []
             for i in range(bs):

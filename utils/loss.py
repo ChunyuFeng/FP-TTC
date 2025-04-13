@@ -300,7 +300,7 @@ def get_loss_mix(scale, gt_scale_with_mask):
     # 返回 sloss 作为最终的损失
     return sloss, valid
 
-def get_loss_range_image(scale, gt_scale_with_mask):
+def get_loss_scale_map(scale, gt_scale_with_mask):
     # 移除单个维度，使所有张量形状为 (320, 640)
     scale = scale.squeeze(1)  # 将形状从 [batch_size, 1, H, W] 压缩为 [batch_size, H, W]
     gt_scale = gt_scale_with_mask[:,0,:,:]
@@ -329,4 +329,25 @@ def get_loss_range_image(scale, gt_scale_with_mask):
     # sloss = (maskdc * d_loss).sum() / maskdc.sum()
     sloss = d_loss[maskdc].mean()
     # 返回 sloss 作为最终的损失
-    return sloss, valid
+    return sloss
+
+def get_loss_risk_score_map(risk_score, gt_risk_score_with_mask):
+    # 移除单个维度，使所有张量形状为 (320, 640)
+    risk_score = risk_score.squeeze(1)  # 将形状从 [batch_size, 1, H, W] 压缩为 [batch_size, H, W]
+    gt_risk_score = gt_risk_score_with_mask[:,0,:,:]
+    valid_mask = gt_risk_score_with_mask[:,1,:,:].bool()
+
+    # 创建 SmoothL1Loss 对象，采用均值（mean）归约
+    criterion = torch.nn.SmoothL1Loss(reduction='mean')
+    
+    # 如果没有有效区域，则返回 0 的 loss（避免除以 0）
+    if valid_mask.sum() == 0:
+        return torch.tensor(0.0, device=risk_score.device, requires_grad=True)
+    
+    # 只选择有效区域的值
+    risk_score_valid = risk_score[valid_mask]
+    gt_risk_score_valid = gt_risk_score[valid_mask]
+    
+    # 计算有效区域内的 SmoothL1Loss
+    loss = criterion(risk_score_valid, gt_risk_score_valid)
+    return loss

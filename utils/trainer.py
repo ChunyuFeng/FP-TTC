@@ -21,7 +21,7 @@ import torch.distributed as dist
 
 from PIL import Image
 
-from .loss import get_loss, get_loss_multi, get_loss_nusc, get_loss_mix, get_loss_range_image
+from .loss import get_loss, get_loss_multi, get_loss_nusc, get_loss_mix, get_loss_scale_map, get_loss_risk_score_map
 from .draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_image
 
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
@@ -217,31 +217,49 @@ class TTCTrainer(object):
 
             # nusc_tokens = {}
 
-            (prev_imgs, curr_imgs, gt_scale_with_mask, sensor_metas) = data
+            (prev_surr_view_imgs_tensor,
+             curr_surr_view_imgs_tensor,
+             gt_scale_map_with_mask,
+             gt_risk_score_map_with_mask,
+             gt_depth_map_with_mask,
+             sensor_meta) = data
+            
+            prev_surr_view_imgs_tensor, curr_surr_view_imgs_tensor = \
+                prev_surr_view_imgs_tensor.to(self.device), curr_surr_view_imgs_tensor.to(self.device)
+
+            # (prev_imgs, curr_imgs, gt_scale_with_mask, sensor_metas) = data
             
             # token_keys = ['prev_images_token', 'curr_images_token', 'prev_lidar_token', 'curr_lidar_token']
             # nusc_tokens.update(dict(zip(token_keys, tokens)))
 
-            prev_imgs, curr_imgs = prev_imgs.to(self.device), curr_imgs.to(self.device)
-            gt_scale_with_mask = gt_scale_with_mask.to(self.device)
+            # prev_imgs, curr_imgs = prev_imgs.to(self.device), curr_imgs.to(self.device)
+            # gt_scale_with_mask = gt_scale_with_mask.to(self.device)
 
             self.optimizer.zero_grad()
 
-            scale, flow, scale_pre = self.model(prev_imgs, curr_imgs, sensor_metas,
-                                    attn_type=self.attn_type,
-                                    attn_splits_list=self.attn_splits_list,
-                                    corr_radius_list=self.corr_radius_list,
-                                    prop_radius_list=self.prop_radius_list,
-                                    num_reg_refine=self.num_reg_refine,
-                                    )
+            scale, risk_score = self.model(prev_surr_view_imgs_tensor,
+                                           curr_surr_view_imgs_tensor,
+                                           sensor_meta,
+                                           attn_type=self.attn_type,
+                                           attn_splits_list=self.attn_splits_list,
+                                           corr_radius_list=self.corr_radius_list,
+                                           prop_radius_list=self.prop_radius_list,
+                                           num_reg_refine=self.num_reg_refine)
 
+            gt_scale_map_with_mask = gt_scale_map_with_mask.to(self.device)
+            loss_scale = get_loss_scale_map(scale, gt_scale_map_with_mask)
+            
+            gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.to(self.device)
+            loss_risk_score = get_loss_risk_score_map(risk_score, gt_risk_score_map_with_mask)
 
-            loss, valid_vis = get_loss_range_image(scale, gt_scale_with_mask)
+            loss = torch.exp(-self.model.log_sigma_scale) * loss_scale + self.model.log_sigma_scale \
+               + torch.exp(-self.model.log_sigma_risk) * loss_risk_score + self.model.log_sigma_risk
+
             loss_last = None
 
-            gt_scale = gt_scale_with_mask[:,0,:,:]
+            gt_scale = gt_scale_map_with_mask[:,0,:,:]
             gt_scale = torch.nan_to_num(gt_scale, nan=0.0)
-            gt_scale_valid_mask = gt_scale_with_mask[:,1,:,:]
+            gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]
 
             if i % 10 == 0:
                 self.writer.add_scalar("Train/Batch_Loss", loss.item(), epoch * len(self.train_loader) + i)
@@ -270,79 +288,6 @@ class TTCTrainer(object):
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.jpg"), normalized_pred, cmap='seismic', vmin=-1, vmax=1)
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.jpg"), normalized_gt, cmap='seismic', vmin=-1, vmax=1)
 
-
-                # img = ((img0[0]).transpose(0,1).transpose(1,2))
-                # img = np.clip(img.detach().cpu().numpy(), 0.0, 255.0)
-                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'img1'+'.jpg'),
-                #             cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-                #
-                # # 处理 prediction_scale
-                # prediction_scale = (scale[0].transpose(0, 1).transpose(1, 2) - 0.5) / 1.0
-                # prediction_scale_np = prediction_scale.detach().squeeze(2).cpu().numpy()
-                # prediction_scale_clipped = np.clip(prediction_scale_np, 0.0, 1.0)
-                #
-                # # 处理 gt_scale
-                # ground_truth_scale = (gt_scale[:1].transpose(0, 1).transpose(1, 2) - 0.5) / 1.0
-                # ground_truth_scale_np = ground_truth_scale.detach().squeeze(2).cpu().numpy()
-                # ground_truth_scale_clipped = np.clip(ground_truth_scale_np, 0.0, 1.0)
-                #
-                # # 共同计算最小值和最大值
-                # combined = np.concatenate([prediction_scale_clipped.flatten(), ground_truth_scale_clipped.flatten()])
-                # scale_min = combined.min()
-                # scale_max = combined.max()
-                #
-                # if scale_max - scale_min > 0:
-                #     prediction_scale_normalized = (prediction_scale_clipped - scale_min) / (scale_max - scale_min)
-                #     ground_truth_scale_normalized = (ground_truth_scale_clipped - scale_min) / (scale_max - scale_min)
-                # else:
-                #     prediction_scale_normalized = prediction_scale_clipped
-                #     ground_truth_scale_normalized = ground_truth_scale_clipped
-                #
-                # # 转换为 RGB
-                # rgb_pred = disp2rgb_normalized(prediction_scale_normalized, colormap_name='inferno')
-                # rgb_gt = disp2rgb_normalized(ground_truth_scale_normalized, colormap_name='inferno')
-                #
-                # # 转换为 0-255 范围并转换为 uint8 类型
-                # rgb_pred_uint8 = (rgb_pred * 255).astype(np.uint8)
-                # rgb_gt_uint8 = (rgb_gt * 255).astype(np.uint8)
-                #
-                # # 保存图像
-                # cv2.imwrite(os.path.join(out_dir, f"{epoch}_{i}_ttcs.jpg"),
-                #             cv2.cvtColor(rgb_pred_uint8, cv2.COLOR_RGB2BGR))
-                # cv2.imwrite(os.path.join(out_dir, f"{epoch}_{i}_ttcx.jpg"),
-                #             cv2.cvtColor(rgb_gt_uint8, cv2.COLOR_RGB2BGR))
-
-
-                # prediction_scale = ((scale[0]).transpose(0,1).transpose(1,2) - 0.5) / (1.0)
-                # prediction_scale = disp2rgb(np.clip(prediction_scale.detach().cpu().numpy(), 0.0, 1.0))
-                # prediction_scale = prediction_scale*255.0
-                # cv2.imwrite(os.path.join(out_dir, str(epoch)+'_'+str(i)+'ttcs'+'.jpg'), prediction_scale)
-                #
-                #
-                # ground_truth_scale = (gt_scale[:1].transpose(0, 1).transpose(1, 2) - 0.5) / (1.0)
-                # ground_truth_scale = disp2rgb(np.clip(ground_truth_scale.detach().cpu().numpy(), 0.0, 1.0))
-                # ground_truth_scale = ground_truth_scale * 255.0
-                # cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'ttcx' + '.jpg'), ground_truth_scale)
-                #
-                # # # visualize gt_scale_valid_mask
-                # # gt_scale_valid_mask = gt_scale_valid_mask.bool()
-                # # gt_scale_valid_mask = gt_scale_valid_mask[:1].squeeze(0).cpu().numpy().astype(np.uint8)
-                # # bool_mask_img = gt_scale_valid_mask * 255
-                # # cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'mask' + '.jpg'), bool_mask_img)
-                #
-                # valid_vis = valid_vis[:1].squeeze(0).cpu().numpy().astype(np.uint8)
-                # bool_mask_img = valid_vis * 255
-                # cv2.imwrite(os.path.join(out_dir, str(epoch) + '_' + str(i) + 'mask' + '.jpg'), bool_mask_img)
-
-
-            # if (self.parallel and torch.distributed.get_rank()==0):
-            #     dist.all_reduce(loss, op = dist.ReduceOp.SUM)
-            #     loss /= float(dist.get_world_size())
-            #     if i % 10 == 0:
-            #         print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
-            #             ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
-            #             '{:6.4f}'.format(loss.item()))
-            # else:
             if loss_last is not None:
                 self.loss_per_epoch += loss.item()
                 self.loss_sum_per_epoch += loss_last.item()
