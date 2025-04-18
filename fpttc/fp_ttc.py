@@ -10,7 +10,7 @@ from utils.loss import get_loss_scale_map, get_loss_risk_score_map
 from .scale_net.backbone import CNNEncoder
 from .scale_net.feature_net.feature_net import FeatureNet
 from .scale_net.flow_net import FlowNet
-from .scale_net.scale_net import ScaleNet
+from .scale_net.scale_net import MultiTaskScaleNet
 
 from .range_image_encoder_new import RangeImageEncoder
 # from .range_image_encoder import RangeImageEncoder
@@ -52,13 +52,22 @@ class FpTTC(nn.Module):
         self.corrnet = FlowNet(num_scales=num_scales, feature_channels=feature_channels,
                                upsample_factor=upsample_factor, reg_refine=reg_refine)
         self.conv_corr = CorrEncoder(dim_in=2, dim_out=feature_channels+1)
-        self.scalenet = ScaleNet(num_scales=num_scales, feature_channels=feature_channels,
-                                 upsample_factor=upsample_factor, num_head=8,
-                                 scale_level=num_scales, reg_refine=reg_refine, head_type='scale')
-        self.risknet = ScaleNet(num_scales=num_scales, feature_channels=feature_channels,
-                                 upsample_factor=upsample_factor, num_head=8,
-                                 scale_level=num_scales, reg_refine=reg_refine, head_type='risk')
-        
+        # self.scalenet = ScaleNet(num_scales=num_scales, feature_channels=feature_channels,
+        #                          upsample_factor=upsample_factor, num_head=8,
+        #                          scale_level=num_scales, reg_refine=reg_refine, head_type='scale')
+        # self.risknet = ScaleNet(num_scales=num_scales, feature_channels=feature_channels,
+        #                          upsample_factor=upsample_factor, num_head=8,
+        #                          scale_level=num_scales, reg_refine=reg_refine, head_type='risk')
+        self.multinet = MultiTaskScaleNet(
+            num_scales=num_scales,
+            feature_channels=feature_channels,
+            upsample_factor=upsample_factor,
+            num_head=num_head,
+            num_transformer_layers=num_transformer_layers,
+            scale_level=num_scales,
+            reg_refine=reg_refine,
+            query_lvl=-1,
+            num_blocks=2)
 
         # Transformer
         # self.rangeimageencoder = RangeImageEncoder(num_layers=num_transformer_layers,
@@ -212,9 +221,11 @@ class FpTTC(nn.Module):
                                                              prop_radius_list, num_reg_refine, False, corr)
 
         corr = self.conv_corr(corr)
-        ini_scale, corr = corr[:, 0:1, ...], corr[:, 1:, ...]
-        scales = self.scalenet(corr, mlvl_feats0, mlvl_feats1, ini_scale)
-        risk_score = self.risknet(corr, mlvl_feats0, mlvl_feats1, ini_scale)
+        ini_scale = corr[:, :1, ...]
+        corr_remain = corr[:, 1:, ...]
+        # multi-task decode
+        scales, risk_score = self.multinet(corr_remain, mlvl_feats0, mlvl_feats1, ini_scale)
+        return scales, risk_score
 
         return scales, risk_score
 

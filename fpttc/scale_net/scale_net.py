@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .scale_encoder import ScaleEncoder
-from .decoder import ScaleDecoder
+from .decoder import SharedDecoder
 from ..modules.attention import SelfAttnPropagation
 from ..modules.geometry import flow_wrap
 
@@ -28,7 +28,7 @@ class FeatureFusion(nn.Module):
         return out
 
 
-class ScaleNet(nn.Module):
+class MultiTaskScaleNet(nn.Module):
     def __init__(self,
                  num_scales=2,
                  feature_channels=128,
@@ -36,65 +36,47 @@ class ScaleNet(nn.Module):
                  num_head=1,
                  num_transformer_layers=6,
                  scale_level=1,
-                 reg_refine=False,  # optional local regression refinement
-                 query_lvl = -1,
-                 head_type = 'scale', # 'scale' or 'risk'
-                 ):
-        super(ScaleNet, self).__init__()
-
-        self.feature_channels = feature_channels
-        self.num_scales = num_scales
-        self.upsample_factor = upsample_factor
-        self.reg_refine = reg_refine
-
-        # the level of features, flows while generating query
-        self.query_lvl = query_lvl
-
-        from .decoder import ScaleHead
-        if head_type == 'scale':
-            head_cls = ScaleHead
-        elif head_type == 'risk':
-            from .decoder import RiskHead
-            head_cls = RiskHead
-        else:
-            raise ValueError(f"Unknown heat_type: {head_type}. Must be 'scale' or 'risk'.")
-        
-
-        # Transformer
-        self.encoder = ScaleEncoder(num_layers=num_transformer_layers,
-                                    d_model=feature_channels,
-                                    nhead=num_head,
-                                    num_feature_levels=num_scales,
-                                    num_level=scale_level
-                                    )
-
-        # propagation with self-attn
-        self.decoder = ScaleDecoder(
+                 reg_refine=False,
+                 query_lvl=-1,
+                 num_blocks=2):
+        super(MultiTaskScaleNet, self).__init__()
+        # encoder + attention
+        self.encoder = ScaleEncoder(
+            num_layers=num_transformer_layers,
             input_dim=feature_channels,
+            d_model=feature_channels,
+            nhead=num_head,
+            num_feature_levels=num_scales,
+            num_level=scale_level)
+        self.gma = GmaAtten(
+            num_scales=1,
+            feature_channels=feature_channels,
+            num_head=num_head,
+            ffn_dim_expansion=2,
+            num_transformer_layers=1)
+        # shared decoder
+        self.decoder = SharedDecoder(
+            input_dim=feature_channels,
+            hidden_dim=feature_channels//1,
             upsample_factor=upsample_factor,
-            num_blocks=num_transformer_layers,
-            head_cls=head_cls
-        )
+            num_blocks=num_blocks)
 
-        # self.atten = GMA(d_model=feature_channels)
-        self.gma = GmaAtten(num_scales=1, feature_channels=feature_channels, 
-                                  num_head=1, ffn_dim_expansion=2, 
-                                  num_transformer_layers=1)
-
-    def forward(self, corr, 
-                    feature0_listc, feature1_listc, ini_scale=None
-                ):
-
-        cfeat0 = feature0_listc[-1]
-
-        scale_feature = self.encoder(feature0_listc, feature1_listc, \
-                                    self.query_lvl, ini_query=corr)     #(bs, c, h, w)
-        
-        agg_corr = self.gma(scale_feature, corr, 'swin', [2,8])
-
-        scale = self.decoder(scale_feature, cfeat0, agg_corr, ini_scale)
-
-        return scale
+    def forward(self, corr, feature0_listc, feature1_listc, ini_scale):
+        # encode
+        scale_feat = self.encoder(feature0_listc,
+                                  feature1_listc,
+                                  query_lvl=-1,
+                                  ini_query=corr)
+        # aggregate correlation
+        agg_corr = self.gma(scale_feat, corr,
+                            attn_type='swin',
+                            attn_splits_list=[2,8])
+        # decode multi-task
+        scale, risk = self.decoder(scale_feat,
+                                   feature0_listc[-1],
+                                   agg_corr,
+                                   ini_scale)
+        return scale, risk
 
 
 
