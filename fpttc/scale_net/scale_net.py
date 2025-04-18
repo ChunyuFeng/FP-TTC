@@ -37,7 +37,8 @@ class ScaleNet(nn.Module):
                  num_transformer_layers=6,
                  scale_level=1,
                  reg_refine=False,  # optional local regression refinement
-                 query_lvl = -1
+                 query_lvl = -1,
+                 head_type = 'scale', # 'scale' or 'risk'
                  ):
         super(ScaleNet, self).__init__()
 
@@ -49,16 +50,31 @@ class ScaleNet(nn.Module):
         # the level of features, flows while generating query
         self.query_lvl = query_lvl
 
+        from .decoder import ScaleHead
+        if head_type == 'scale':
+            head_cls = ScaleHead
+        elif head_type == 'risk':
+            from .decoder import RiskHead
+            head_cls = RiskHead
+        else:
+            raise ValueError(f"Unknown heat_type: {head_type}. Must be 'scale' or 'risk'.")
+        
+
         # Transformer
         self.encoder = ScaleEncoder(num_layers=num_transformer_layers,
-                                              d_model=feature_channels,
-                                              nhead=num_head,
-                                              num_feature_levels=num_scales,
-                                              num_level=scale_level
-                                              )
+                                    d_model=feature_channels,
+                                    nhead=num_head,
+                                    num_feature_levels=num_scales,
+                                    num_level=scale_level
+                                    )
 
         # propagation with self-attn
-        self.decoder = ScaleDecoder(upsample_factor=upsample_factor)
+        self.decoder = ScaleDecoder(
+            input_dim=feature_channels,
+            upsample_factor=upsample_factor,
+            num_blocks=num_transformer_layers,
+            head_cls=head_cls
+        )
 
         # self.atten = GMA(d_model=feature_channels)
         self.gma = GmaAtten(num_scales=1, feature_channels=feature_channels, 

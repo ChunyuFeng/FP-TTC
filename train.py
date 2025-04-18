@@ -12,6 +12,8 @@ import dataloader.dataset as datasets
 from fpttc.fp_ttc import FpTTC
 from utils.trainer import TTCTrainer
 
+import neptune
+
 time_stamp = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
 out_dir = "./log/%s_selfcon_ttc"%(time_stamp)
 
@@ -151,15 +153,19 @@ else:
 
 def main():
 
-    model = FpTTC( num_scales=args.num_scales,
-                    feature_channels=args.feature_channels,
-                    upsample_factor=args.upsample_factor,
-                    num_head=args.num_head,
-                    ffn_dim_expansion=args.ffn_dim_expansion,
-                    num_transformer_layers=args.num_transformer_layers,
-                    range_image_feat_shape=[(20, 240), (40, 480)],
-                    reg_refine=args.reg_refine,
-                    train=True).cuda()
+    run = neptune.init_run(
+        project="fengchunyu/FPTTC"
+    )
+
+    model = FpTTC(num_scales=args.num_scales,
+                  feature_channels=args.feature_channels,
+                  upsample_factor=args.upsample_factor,
+                  num_head=args.num_head,
+                  ffn_dim_expansion=args.ffn_dim_expansion,
+                  num_transformer_layers=args.num_transformer_layers,
+                  range_image_feat_shape=[(20, 240), (40, 480)],
+                  reg_refine=args.reg_refine,
+                  train=True).cuda()
     
     max_lr = args.lr
     ini_lr = max_lr / 25
@@ -224,7 +230,8 @@ def main():
 
     trainer = TTCTrainer(model=model, dataset=dataset, optimizer=optimizer, args=args, 
                         start_epoch=epoch, device=device, model_path=args.resume, 
-                        parallel=parallel, time_stamp=time_stamp, max_lr=max_lr, crop_size=args.image_size)
+                        parallel=parallel, time_stamp=time_stamp, max_lr=max_lr,
+                        crop_size=args.image_size, neptune_run=run)
 
     trainer.train()
 

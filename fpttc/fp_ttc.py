@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from .modules.utils import normalize_img
 from .modules.matching import (global_correlation_softmax, local_correlation_softmax, \
                                 local_correlation_with_flow, local_scale_correlation)
+from utils.loss import get_loss_scale_map, get_loss_risk_score_map
 
 from .scale_net.backbone import CNNEncoder
 from .scale_net.feature_net.feature_net import FeatureNet
@@ -53,10 +54,10 @@ class FpTTC(nn.Module):
         self.conv_corr = CorrEncoder(dim_in=2, dim_out=feature_channels+1)
         self.scalenet = ScaleNet(num_scales=num_scales, feature_channels=feature_channels,
                                  upsample_factor=upsample_factor, num_head=8,
-                                 scale_level=num_scales, reg_refine=reg_refine)
+                                 scale_level=num_scales, reg_refine=reg_refine, head_type='scale')
         self.risknet = ScaleNet(num_scales=num_scales, feature_channels=feature_channels,
                                  upsample_factor=upsample_factor, num_head=8,
-                                 scale_level=num_scales, reg_refine=reg_refine)
+                                 scale_level=num_scales, reg_refine=reg_refine, head_type='risk')
         
 
         # Transformer
@@ -88,141 +89,6 @@ class FpTTC(nn.Module):
 
         self.log_sigma_scale = nn.Parameter(torch.zeros(1))
         self.log_sigma_risk = nn.Parameter(torch.zeros(1))
-
-    '''
-    # 3 views & 3 views
-    def forward(self, img0, img1,
-            attn_type=None,
-            attn_splits_list=None,
-            corr_radius_list=None,
-            prop_radius_list=None,
-            num_reg_refine=6,
-            pred_bidir_flow=False,
-            testing=False,
-            ):
-
-        if self.is_trainning and not testing:
-            self.eval()
-            torch.set_grad_enabled(False)
-
-        scale, corr, final = None, None, None
-        mlvl_feats0, mlvl_feats1, mlvl_flows, mlvl_flows_back = [], [], [], []
-
-        start = time.time()
-
-        # 这一步现在还有用吗？
-        img0, img1 = normalize_img(img0, img1)
-
-        camera_channel_num = 6
-        prev_feature_list = []
-        curr_feature_list = []
-
-        for view in range(camera_channel_num):
-            prev_feature, curr_feature = self.extract_feature(img0[:, view, :, :, :], img1[:, view, :, :, :])
-            prev_feature_list.append(prev_feature)
-            curr_feature_list.append(curr_feature)
-
-        num_feat_levels = len(prev_feature_list[0])
-        feature0_listc = []
-        feature1_listc = []
-        for i in range(num_feat_levels):
-            tensor_to_concat = [entry[i] for entry in prev_feature_list]
-            concat_tensor = torch.cat(tensor_to_concat, dim=3)
-            feature0_listc.append(concat_tensor)
-
-            tensor_to_concat = [entry[i] for entry in curr_feature_list]
-            concat_tensor = torch.cat(tensor_to_concat, dim=3)
-            feature1_listc.append(concat_tensor)
-
-        del concat_tensor, img0, img1, prev_feature, curr_feature, prev_feature_list, curr_feature_list
-        torch.cuda.empty_cache()
-
-        for i in range(len(feature0_listc)):
-            feature0_listc[i] = self.rangeimageencoder(feature0_listc, feature1_listc, query_lvl=i, ini_query=None)
-            feature1_listc[i] = self.rangeimageencoder(feature0_listc, feature1_listc, query_lvl=i, ini_query=None)
-
-
-        mlvl_feats0_view0123, mlvl_feats1_view0123 = [], []
-        mlvl_feats0_view3450, mlvl_feats1_view3450 = [], []
-        mlvl_feats0, mlvl_feats1 = [], []
-        if self.is_trainning and not testing:
-            torch.set_grad_enabled(True)
-            self.train()
-
-        corr_view0123 = None
-        corr_view3450 = None
-        # 视角 0 1 2 3
-
-        for scale_idx in range(self.num_scales):
-            if scale_idx < 1:
-                feature0, feature1 = feature0_listc[scale_idx][:, :, :, 0:192], feature1_listc[scale_idx][:, :, :,
-                                                                                0:192]
-                feature0, feature1 = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
-                                                    corr_view0123)
-                mlvl_feats0_view0123.append(feature0)
-                mlvl_feats1_view0123.append(feature1)
-                corr_view0123, final_view0123 = self.corrnet(feature0, feature1, scale_idx, corr_radius_list,
-                                                                prop_radius_list, num_reg_refine, False, corr_view0123)
-                corr_view0123 = F.interpolate(corr_view0123, scale_factor=2, mode='bilinear',
-                                                align_corners=True) * 2
-            else:
-                feature0, feature1 = feature0_listc[scale_idx][:, :, :, 0:384], feature1_listc[scale_idx][:, :, :,
-                                                                                0:384]
-                feature0_f, feature1_f = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
-                                                        corr_view0123)
-                mlvl_feats0_view0123.append(feature0_f)
-                mlvl_feats1_view0123.append(feature1_f)
-                corr_view0123, final_view0123 = self.corrnet(feature0_f, feature1_f, scale_idx, corr_radius_list,
-                                                                prop_radius_list, num_reg_refine, False, corr_view0123)
-
-        # 清理视角0-3的计算结果，释放显存
-        del feature0, feature1, feature0_f, feature1_f, final_view0123
-        torch.cuda.empty_cache()
-
-        # 视角 3 4 5 0
-        for scale_idx in range(self.num_scales):
-            if scale_idx < 1:
-                feature0 = feature0_listc[scale_idx][:, :, :, 192:384]
-                feature1 = feature1_listc[scale_idx][:, :, :, 192:384]
-                feature0, feature1 = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
-                                                    corr_view3450)
-                mlvl_feats0_view3450.append(feature0)
-                mlvl_feats1_view3450.append(feature1)
-                corr_view3450, final_view3450 = self.corrnet(feature0, feature1, scale_idx, corr_radius_list,
-                                                                prop_radius_list, num_reg_refine, False, corr_view3450)
-                corr_view3450 = F.interpolate(corr_view3450, scale_factor=2, mode='bilinear',
-                                                align_corners=True) * 2
-            else:
-                feature0 = feature0_listc[scale_idx][:, :, :, 384:768]
-                feature1 = feature1_listc[scale_idx][:, :, :, 384:768]
-
-                del feature0_listc, feature1_listc
-                torch.cuda.empty_cache()
-
-                feature0_f, feature1_f = self.featnet(feature0, feature1, scale_idx, attn_type, attn_splits_list,
-                                                        corr_view3450)
-                mlvl_feats0_view3450.append(feature0_f)
-                mlvl_feats1_view3450.append(feature1_f)
-                corr_view3450, final_view3450 = self.corrnet(feature0_f, feature1_f, scale_idx, corr_radius_list,
-                                                                prop_radius_list, num_reg_refine, False, corr_view3450)
-
-        # 清理视角3-5的计算结果，释放显存
-        del feature0, feature1, feature0_f, feature1_f, final_view3450
-        torch.cuda.empty_cache()
-
-        # 特征融合
-        corr = torch.cat((corr_view0123, corr_view3450), dim=3)
-        mlvl_feats0 = [torch.cat((mlvl_feats0_view0123[i], mlvl_feats0_view3450[i]), dim=3) for i in
-                       range(self.num_scales)]
-        mlvl_feats1 = [torch.cat((mlvl_feats1_view0123[i], mlvl_feats1_view3450[i]), dim=3) for i in
-                       range(self.num_scales)]
-
-        corr = self.conv_corr(corr)
-        ini_scale, corr = corr[:, 0:1, ...], corr[:, 1:, ...]
-        scales = self.scalenet(corr, mlvl_feats0, mlvl_feats1, ini_scale)
-
-        return scales, None, None
-        '''
 
     # 0 ~ 5 6个视角 同时处理
     def forward(self, img0, img1, sensor_metas,
@@ -352,6 +218,20 @@ class FpTTC(nn.Module):
 
         return scales, risk_score
 
+    def forward_with_loss(self, img0, img1, sensor_meta, 
+                          gt_scale_map_with_mask, gt_risk_score_map_with_mask, **kwargs):
+        """
+        完整前向流程：先计算预测，再计算各任务损失，最后用不确定性加权得到总损失。
+        """
+        scale, risk_score = self.forward(img0, img1, sensor_meta, **kwargs)
+        loss_scale = get_loss_scale_map(scale, gt_scale_map_with_mask)
+        loss_risk  = get_loss_risk_score_map(risk_score, gt_risk_score_map_with_mask)
+        # 使用不确定性加权损失公式：loss = exp(-log_sigma) * L + log_sigma
+        # loss = (torch.exp(-self.log_sigma_scale) * loss_scale + self.log_sigma_scale +
+        #         torch.exp(-self.log_sigma_risk)  * loss_risk  + self.log_sigma_risk)
+        loss = loss_scale + loss_risk
+        return scale, risk_score, loss_scale, loss_risk, loss
+    
     def extract_feature(self, img0, img1):
         concat = torch.cat((img0, img1), dim=0)  # [2B, C, H, W]
         features = self.cnet(concat)  # list of [2B, C, H, W], resolution from high to low
@@ -417,7 +297,7 @@ class FpTTC(nn.Module):
 
         b = flow_change / (d_w**2+d_h**2)
         return 1/b
-
+    
 
 class CorrEncoder(nn.Module):
     def __init__(self, dim_in, dim_out):

@@ -254,17 +254,11 @@ def main(args):
     scene_flow_lut = []
     # count = 0
     for folder, timestamp in folders_with_timestamps:
-        # token = find_lidar_top_token(nusc, timestamp)
-        # if token:
-        #     scene_flow_lut.append({
-        #     'token': token,
-        #     'folder_name': folder,
-        #     'timestamp': timestamp
-        #     })
-        #     count += 1
         lidar_sample_data = find_lidar_top_sample_data(nusc, timestamp)
+        scene_indice = folder.split('_')[1]
         if lidar_sample_data:
             lidar_sample_data['folder_name'] = folder
+            lidar_sample_data['scene_indice'] = scene_indice
             scene_flow_lut.append(lidar_sample_data)
         else:
             # lidar_sweep_not_found_in_nusc.append(folder)
@@ -356,9 +350,13 @@ def main(args):
         # 计算时间戳差值
         time_diff_cam = camera_timestamp_2 - camera_timestamp_1
 
-        # 如果时间戳差值小于 25 毫秒或者大于 125 毫秒，则跳过
+        # 每秒内的数据分布:
+        # LiDAR  20hz: | x x x x x x x x x x x x x x x x x x x x |
+        # Camera 12hz: | x   x   x x   x   x x   x   x x   x   x |  
+        #              | x<->x<->x x<->x<->x x<->x<->x x<->x<->x |  只选择100ms间隔的图像对
+        # 如果时间戳差值小于 75 毫秒或者大于 125 毫秒，则跳过
         # 50 ms 为激光雷达的采样间隔，25 ms 为余量
-        if time_diff_cam > (50*2+25) * 1e3 or time_diff_cam < (50*0+25) * 1e3:
+        if time_diff_cam > (50*2+25) * 1e3 or time_diff_cam < (50*1+25) * 1e3:
             continue
 
         # 相邻帧图像数据的时间戳差值为 n*50 ms
@@ -367,6 +365,8 @@ def main(args):
         # 取出 scene flow 数据
         previous_sf_record = lidar_data_matched_with_images[i-1]
         current_sf_record = lidar_data_matched_with_images[i]
+
+        scene_indice = current_sf_record['scene_indice']
 
         # 读取 scene flow 数据
         if (not os.path.exists(os.path.join(args.scene_flow_path, current_sf_record['folder_name'], 'pc_prev.npy'))
@@ -451,6 +451,7 @@ def main(args):
             'sensor_metas': sensor_metas,
             'gt_map_path': range_image_save_path,
             'scene_flow_path': os.path.join(args.scene_flow_path, current_sf_record['folder_name']),
+            'scene_indice': scene_indice
         }
         
         trainval_infos.append(info)
@@ -470,7 +471,7 @@ def main(args):
                 pos_risk = risk_score_display[pos_mask]
                 pos_max = pos_risk.max()
                 pos_min = pos_risk.min()
-                if pos_max >= pos_min >= 0:
+                if pos_max > pos_min >= 0:
                     normalized_risk_score[pos_mask] = (pos_risk - pos_min) / (pos_max - pos_min)
                 else:
                     normalized_risk_score[pos_mask] = 0.0
@@ -479,7 +480,7 @@ def main(args):
                 neg_risk = risk_score_display[neg_mask]
                 neg_max = neg_risk.max()
                 neg_min = neg_risk.min()
-                if neg_min <= neg_max <= 0:
+                if neg_min < neg_max <= 0:
                     normalized_risk_score[neg_mask] = (neg_risk - neg_min) / (neg_max - neg_min) - 1.0
                 else:
                     normalized_risk_score[neg_mask] = 0.0
@@ -490,7 +491,7 @@ def main(args):
             if not os.path.exists(risk_score_vis_save_path):
                 os.makedirs(risk_score_vis_save_path)
 
-            risk_score_vis_name = f"risk_score_map_{i}.png"
+            risk_score_vis_name = f"scene_{scene_indice}_risk_score_map_{i}.png"
 
             plt.imsave(os.path.join(risk_score_vis_save_path, risk_score_vis_name),
                        normalized_risk_score, cmap='seismic', vmin=-1, vmax=1)
@@ -505,28 +506,6 @@ def main(args):
             scale_display = np.copy(proj_scale)
 
             valid_mask = scale_display >= 0
-
-            analysed_scale = scale_display[valid_mask]
-            # plt.figure()
-            # plt.hist(analysed_scale, bins=50, color='blue', alpha=0.7)
-            # plt.title("Distribution of Analysed Scale")
-            # plt.xlabel("Scale")
-            # plt.ylabel("Frequency")
-            # plt.show()
-            # t0 = 0.05
-            # t1 = 0.1
-            # t2 = 0.2
-            # t3 = 0.5
-            # 计算在 [1-t, 1+t] 范围内的百分比
-            # percentage_in_range = compute_percentage_in_range(analysed_scale, t0)
-            # print(f"在 [1-{t0}, 1+{t0}] 范围内的百分比: {percentage_in_range:.2f}%")
-            # percentage_in_range = compute_percentage_in_range(analysed_scale, t1)
-            # print(f"在 [1-{t1}, 1+{t1}] 范围内的百分比: {percentage_in_range:.2f}%")
-            # percentage_in_range = compute_percentage_in_range(analysed_scale, t2)
-            # print(f"在 [1-{t2}, 1+{t2}] 范围内的百分比: {percentage_in_range:.2f}%")
-            # percentage_in_range = compute_percentage_in_range(analysed_scale, t3)
-            # print(f"在 [1-{t3}, 1+{t3}] 范围内的百分比: {percentage_in_range:.2f}%")
-
 
             # 将用于可视化的尺度值裁切到 [0.5, 1.5] 范围
             scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.85, 1.15)
@@ -547,7 +526,7 @@ def main(args):
                 pos_devs = deviations[pos_mask]
                 pos_max = pos_devs.max()
                 pos_min = pos_devs.min()
-                if pos_max >= pos_min >= 0:
+                if pos_max > pos_min >= 0:
                     normalized_display[pos_mask] = (pos_devs - pos_min) / (pos_max - pos_min)  # 归一化到 [0,1]
                 else:
                     normalized_display[pos_mask] = 0.0  # 如果没有变化，设为0
@@ -557,7 +536,7 @@ def main(args):
                 neg_devs = deviations[neg_mask]
                 neg_max = neg_devs.max()
                 neg_min = neg_devs.min()
-                if neg_min <= neg_max <= 0:
+                if neg_min < neg_max <= 0:
                     normalized_display[neg_mask] = (neg_devs - neg_min) / (neg_max - neg_min) - 1.0  # 归一化到 [-1,0]
                     # normalized_display[neg_mask] = neg_devs / abs(neg_min)  # 归一化到 [-1,0]
                 else:
@@ -571,10 +550,10 @@ def main(args):
             if not os.path.exists(scale_map_vis_save_path):
                 os.makedirs(scale_map_vis_save_path)
 
-            out_name = f"scale_map_{i}.png"
+            out_name = f"scene_{scene_indice}_scale_map_{i}.png"
             out_path = os.path.join(scale_map_vis_save_path, out_name)
 
-            plt.imsave(out_path, normalized_display, cmap='seismic', vmin=-1, vmax=1)
+            plt.imsave(out_path, -normalized_display, cmap='seismic', vmin=-1, vmax=1)
 
         # TODO: 处理 depth map 的可视化:
         if args.depth_map_vis:
@@ -586,16 +565,16 @@ def main(args):
           Sorted by timestamp. {len(trainval_infos)} items in total.")
 
     # 将 trainval_test_infos 保存为 pickle 文件
-    pkl_data = dict(infos=trainval_infos)
-    if not os.path.exists(args.pkl_save_path):
-        os.makedirs(args.pkl_save_path)
-    with open(os.path.join(args.pkl_save_path, f"dict_nusc_trainval_infos_{args.image_size[0]}_{args.image_size[1]*6}.pkl"), 'wb') as f:
-        pickle.dump(pkl_data, f)
-    print(f"Saved dict_nusc_trainval_infos.pkl to {args.pkl_save_path}")
+    # pkl_data = dict(infos=trainval_infos)
+    # if not os.path.exists(args.pkl_save_path):
+    #     os.makedirs(args.pkl_save_path)
+    # with open(os.path.join(args.pkl_save_path, f"dict_nusc_trainval_infos_{args.image_size[0]}_{args.image_size[1]*6}.pkl"), 'wb') as f:
+    #     pickle.dump(pkl_data, f)
+    # print(f"Saved dict_nusc_trainval_infos.pkl to {args.pkl_save_path}")
 
-    with open(os.path.join(args.pkl_save_path, f"list_nusc_trainval_infos_{args.image_size[0]}_{args.image_size[1]*6}.pkl"), 'wb') as f:
+    with open(os.path.join(args.pkl_save_path, f"nusc_trainval_infos_{args.image_size[0]}_{args.image_size[1]*6}.pkl"), 'wb') as f:
         pickle.dump(trainval_infos, f)
-    print(f"Saved list_nusc_trainval_infos.pkl to {args.pkl_save_path}")
+    print(f"Saved nusc_trainval_infos.pkl to {args.pkl_save_path}")
 
 if __name__ == "__main__":
     # NuScenes 数据集路径

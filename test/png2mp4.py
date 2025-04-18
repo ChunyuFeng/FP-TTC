@@ -134,7 +134,7 @@ from glob import glob
 
 def create_video_from_images(image_folder, output_video, frame_rate=30):
     """
-    将指定文件夹中的 proj_risk_mask{i}.png 图像按数字顺序拼接为 MP4 视频。
+    将指定文件夹中的 risk_score_map_{i}.png 图像按数字顺序拼接为 MP4 视频。
 
     参数:
         image_folder (str): 图像所在的文件夹路径。
@@ -143,12 +143,12 @@ def create_video_from_images(image_folder, output_video, frame_rate=30):
     """
     # 获取所有 proj_risk_mask{i}.png 文件，并按文件名中的数字排序
     image_files = sorted(
-        glob(os.path.join(image_folder, 'proj_risk_mask*.png')),
-        key=lambda x: int(os.path.basename(x).split('proj_risk_mask')[-1].split('.png')[0])
+        glob(os.path.join(image_folder, 'risk_score_map_*.png')),
+        key=lambda x: int(os.path.basename(x).split('risk_score_map_')[-1].split('.png')[0])
     )
 
     if not image_files:
-        print("No 'proj_risk_mask*.png' files found in the folder.")
+        print("No 'risk_score_map_*.png' files found in the folder.")
         return
 
     # 读取第一张图像以获取宽和高
@@ -180,8 +180,8 @@ def create_video_from_images(image_folder, output_video, frame_rate=30):
 
 # 示例用法
 if __name__ == "__main__":
-    image_folder = "/mnt/fpttc_data/output_vis/risk_region"  # 图像所在的文件夹路径
-    output_video = "/mnt/fpttc_data/output_vis/risk_region/risk_region.mp4"  # 输出视频文件路径
+    image_folder = "/mnt/data/fpttc_ground_truth/3_visualization/risk_score_map/160_1920"  # 图像所在的文件夹路径
+    output_video = "/mnt/data/fpttc_ground_truth/3_visualization/risk_score_map/160_1920/risk_score_map.mp4"  # 输出视频文件路径
     frame_rate = 10  # 帧率
 
     create_video_from_images(image_folder, output_video, frame_rate)

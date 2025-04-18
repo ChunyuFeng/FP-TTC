@@ -22,7 +22,7 @@ import torch.distributed as dist
 from PIL import Image
 
 from .loss import get_loss, get_loss_multi, get_loss_nusc, get_loss_mix, get_loss_scale_map, get_loss_risk_score_map
-from .draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_image
+from .draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_image, visual_risk_score_map_range_image
 
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
 
@@ -31,7 +31,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 class TTCTrainer(object):
     def __init__(self, model, dataset, optimizer, args, device, model_path = None, 
-                start_epoch=0, parallel=False, time_stamp=None, max_lr=1e-4, crop_size=[352,1152]):
+                start_epoch=0, parallel=False, time_stamp=None, max_lr=1e-4, crop_size=[352,1152],
+                neptune_run=None):
         self.model = model
         self.parallel = parallel
         self.batch_size = args.batch_size
@@ -71,17 +72,7 @@ class TTCTrainer(object):
                         115, 120, 125, 130, 135, 140, 145, 160, 170, 180, 190, 200, 210], gamma=0.5, last_epoch=max((self.start_epoch-1),-1))
         self.lr_scheduler2 = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, \
                         milestones=[200], gamma=2, last_epoch=max((self.start_epoch-1),-1))
-        # self.lr_scheduler3 = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, \
-        #                 milestones=[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 115, 120, 125, 130], gamma=0.5, last_epoch=max((self.start_epoch-1),-1))
-        # self.lr_scheduler3 = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, \
-        #                 milestones=[3,6,9,12,15,18,21,24,27,30,33,36,39,42,57,60,63,66,69,86,89,92,95], gamma=0.75, last_epoch=max((self.start_epoch-1),-1))
-        # self.lr_scheduler3 = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, \
-        #                 milestones=[5,10,15,20,25,30,35,40,45,55,65,75,85], gamma=0.5, last_epoch=max((self.start_epoch-1),-1))
-        # self.lr_scheduler3 = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, \
-        #                 milestones=[10,20,30,40,50,60,70,75,80,85,90,95,100,110,115,120], gamma=0.5, last_epoch=max((self.start_epoch-1),-1))
-        # self.lr_scheduler3 = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, \
-        #                 milestones=[5,10,15,20,25,30,35,40,50,60,70,80,90,100,110,115,120], gamma=0.6, last_epoch=max((self.start_epoch-1),-1))
-    
+
         self.device = device
         self.train_loss_history = []
         self.plt_train_epoch = []
@@ -101,7 +92,7 @@ class TTCTrainer(object):
         self.num_reg_refine=args.num_reg_refine
 
         self.grad_clip = 1.0
-        self.checkpoint = 1
+        self.checkpoint_interval = 20 # 保存模型的间隔
 
         self.loss_per_epoch = 0
         self.loss_sum_per_epoch = 0
@@ -110,6 +101,7 @@ class TTCTrainer(object):
         aug_params = {'crop_size': crop_size, 'min_scale': -0.2, 'max_scale': 0.4, 'do_flip': True}
 
         self.writer = SummaryWriter(log_dir="./log/tensorboard")
+        self.neptune_run = neptune_run
 
     def get_optimizer(self):
         params = list(self.model.named_parameters())
@@ -122,100 +114,47 @@ class TTCTrainer(object):
         return optimizer
 
     def train(self):
-        start = time.time()
         out_dir = "./log/%s_selfcon_ttc"%(self.time_stamp)
-        loss_txt = out_dir + '/0.txt'
-        # file = open(loss_txt,'w')
-        # file.close()
-        #self.lr_scheduler2.step()
         print("Learning rate: ", self.optimizer.state_dict()['param_groups'][0]['lr'])
-        # loss_now = self.eval_epoch()
-        # print('Eval: ', loss_now)
 
         for epoch in range(self.start_epoch, self.epoch):
             print('Epoch:', epoch)
             self.loss_per_epoch = 0
             self.loss_sum_per_epoch = 0
             self.iters = 0
-            # loss_now
-            # if torch.distributed.get_rank()==0:
-            #print(('Train %f %f '%(self.loss_per_epoch/max(1,self.iters), self.loss_sum_per_epoch/max(1,self.iters))))
             self.train_epoch(epoch)
 
-            # loss_now = self.eval_epoch()
-            # print('Eval: ', loss_now)
-            # if (self.parallel and torch.distributed.get_rank()==0) or (not self.parallel):
-            #     file = open(loss_txt,'a')
-            #     file.write('Loss in epoch %d: '%(epoch))
-            #     # file.write('Train %f %f '%(self.loss_per_epoch/max(1,self.iters), self.loss_sum_per_epoch/max(1,self.iters)))
-            #     file.write('Train %f'%(self.loss_per_epoch/max(1,self.iters)))
-            #     file.write('Test %f\n'%(loss_now))
-            #     file.close()
-            #
-            #     if (epoch<self.epoch and epoch%self.checkpoint==0):
-            #         checkpoint = {
-            #                 "net": self.model.state_dict(),
-            #                 'optimizer':self.optimizer.state_dict(),
-            #                 "epoch": epoch+1
-            #             }
-            #         temp_pth = self.model_path[:-8] + str(epoch) + 'y.pth.tar'
-            #         # temp_pth = self.model_path[:-10] + '_y' + str(epoch) + '.pth.tar'
-            #         torch.save(checkpoint, temp_pth)
-            #
-            #     print("Loss in epoch", epoch, ":", self.loss_per_epoch/max(1,self.iters))
-            #     print("Learning rate: ", self.optimizer.state_dict()['param_groups'][0]['lr'])
-
             if (self.parallel and torch.distributed.get_rank() == 0) or (not self.parallel):
-                # file = open(loss_txt, 'a')
-                # file.write('Loss in epoch %d: ' % (epoch))
-                # # file.write('Train %f %f '%(self.loss_per_epoch/max(1,self.iters), self.loss_sum_per_epoch/max(1,self.iters)))
-                # file.write('Train %f' % (self.loss_per_epoch / max(1, self.iters)))
-                # file.write('Test %f\n' % (loss_now))
-                # file.close()
 
-                if (epoch < self.epoch and epoch % self.checkpoint == 0):
+                if (epoch < self.epoch and epoch % self.checkpoint_interval == 0):
                     checkpoint = {
                         "net": self.model.state_dict(),
                         'optimizer': self.optimizer.state_dict(),
                         "epoch": epoch + 1
                     }
                     # # 用当前的时间戳为模型保存路径命名
-                    # current_time = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
-                    # ckpt_save_path = os.path.join('./log', current_time)
-                    # os.makedirs(ckpt_save_path, exist_ok=True)
                     temp_pth = os.path.join(out_dir, f'{epoch}y.pth.tar')
-
-                    # temp_pth = ckpt_save_path + str(epoch) + 'y.pth.tar'
-                    # temp_pth = self.model_path[:-10] + '_y' + str(epoch) + '.pth.tar'
                     torch.save(checkpoint, temp_pth)
 
                 print("Loss in epoch", epoch, ":", self.loss_per_epoch / max(1, self.iters))
                 print("Learning rate: ", self.optimizer.state_dict()['param_groups'][0]['lr'])
 
-            # # 每个epoch结束后记录平均损失
-            # self.writer.add_scalar("Train/Epoch_Loss", self.loss_per_epoch / max(1, self.iters), epoch)
-
         # 训练结束后关闭SummaryWriter
         self.writer.close()
-
-        # end = time.time()
-        # total_time = end-start
-        # print(f'TOTAL-TIME: {total_time//60:.0f}m{total_time%60:.0f}s')
-        # torch.save(self.model.state_dict(), self.model_path)
     
     def train_epoch(self, epoch):
         total_samples = len(self.train_loader.dataset)
         if self.parallel:
             self.train_sampler.set_epoch(epoch)
         self.model.train()
-        ten_loss_sum = 0
+        
+        epoch_loss = 0
+        steps = 0
 
         out_dir = "./log/%s_selfcon_ttc"%(self.time_stamp)
-        save_index = 400 if not self.parallel else random.randint(int(4000/self.batch_size),int(8000/self.batch_size))
-
+        # save_index = 400 if not self.parallel else random.randint(int(4000/self.batch_size),int(8000/self.batch_size))
+        save_index = 400
         for i, data in enumerate(self.train_loader):
-
-            # nusc_tokens = {}
 
             (prev_surr_view_imgs_tensor,
              curr_surr_view_imgs_tensor,
@@ -224,36 +163,40 @@ class TTCTrainer(object):
              gt_depth_map_with_mask,
              sensor_meta) = data
             
-            prev_surr_view_imgs_tensor, curr_surr_view_imgs_tensor = \
-                prev_surr_view_imgs_tensor.to(self.device), curr_surr_view_imgs_tensor.to(self.device)
-
-            # (prev_imgs, curr_imgs, gt_scale_with_mask, sensor_metas) = data
-            
-            # token_keys = ['prev_images_token', 'curr_images_token', 'prev_lidar_token', 'curr_lidar_token']
-            # nusc_tokens.update(dict(zip(token_keys, tokens)))
-
-            # prev_imgs, curr_imgs = prev_imgs.to(self.device), curr_imgs.to(self.device)
-            # gt_scale_with_mask = gt_scale_with_mask.to(self.device)
+            prev_surr_view_imgs_tensor = prev_surr_view_imgs_tensor.to(self.device)
+            curr_surr_view_imgs_tensor = curr_surr_view_imgs_tensor.to(self.device)
+            gt_scale_map_with_mask = gt_scale_map_with_mask.to(self.device)
+            gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.to(self.device)
 
             self.optimizer.zero_grad()
 
-            scale, risk_score = self.model(prev_surr_view_imgs_tensor,
-                                           curr_surr_view_imgs_tensor,
-                                           sensor_meta,
-                                           attn_type=self.attn_type,
-                                           attn_splits_list=self.attn_splits_list,
-                                           corr_radius_list=self.corr_radius_list,
-                                           prop_radius_list=self.prop_radius_list,
-                                           num_reg_refine=self.num_reg_refine)
-
-            gt_scale_map_with_mask = gt_scale_map_with_mask.to(self.device)
-            loss_scale = get_loss_scale_map(scale, gt_scale_map_with_mask)
-            
-            gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.to(self.device)
-            loss_risk_score = get_loss_risk_score_map(risk_score, gt_risk_score_map_with_mask)
-
-            loss = torch.exp(-self.model.log_sigma_scale) * loss_scale + self.model.log_sigma_scale \
-               + torch.exp(-self.model.log_sigma_risk) * loss_risk_score + self.model.log_sigma_risk
+            # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
+            if hasattr(self.model, "module"):
+                scale, risk_score, loss_scale, loss_risk, loss = self.model.module.forward_with_loss(
+                    prev_surr_view_imgs_tensor,
+                    curr_surr_view_imgs_tensor,
+                    sensor_meta,
+                    gt_scale_map_with_mask=gt_scale_map_with_mask,
+                    gt_risk_score_map_with_mask=gt_risk_score_map_with_mask,
+                    attn_type=self.attn_type,
+                    attn_splits_list=self.attn_splits_list,
+                    corr_radius_list=self.corr_radius_list,
+                    prop_radius_list=self.prop_radius_list,
+                    num_reg_refine=self.num_reg_refine
+                )
+            else:
+                scale, risk_score, loss_scale, loss_risk, loss = self.model.forward_with_loss(
+                    prev_surr_view_imgs_tensor,
+                    curr_surr_view_imgs_tensor,
+                    sensor_meta,
+                    gt_scale_map_with_mask=gt_scale_map_with_mask,
+                    gt_risk_score_map_with_mask=gt_risk_score_map_with_mask,
+                    attn_type=self.attn_type,
+                    attn_splits_list=self.attn_splits_list,
+                    corr_radius_list=self.corr_radius_list,
+                    prop_radius_list=self.prop_radius_list,
+                    num_reg_refine=self.num_reg_refine
+                )
 
             loss_last = None
 
@@ -271,38 +214,75 @@ class TTCTrainer(object):
             self.optimizer.step()
             self.lr_scheduler3.step()
 
+            epoch_loss += loss.item()
+            steps += 1
+
             if type(scale) == list:
                 scale = scale[-1]
             if i%int(save_index)==0:
 
                 # 可视化 prediction_scale 和 gt_scale
-                gt_scale_np = gt_scale[:1].squeeze(0).cpu().numpy()
-                gt_scale_valid_mask_np = gt_scale_valid_mask[:1].squeeze(0).cpu().bool()
+                gt_scale_np = gt_scale[:1].detach().squeeze(0).cpu().numpy()
+                gt_scale_valid_mask_np = gt_scale_valid_mask[:1].squeeze(0).cpu().detach().bool()
                 normalized_gt = visual_scale_map_range_image(gt_scale_np, gt_scale_valid_mask_np)
 
                 scale_np = scale[0].detach().squeeze(0).cpu().numpy()
                 pred_valid_mask = scale_np > 0
                 normalized_pred = visual_scale_map_range_image(scale_np, pred_valid_mask)
 
-                # 保存可视化结果
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.jpg"), normalized_pred, cmap='seismic', vmin=-1, vmax=1)
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.jpg"), normalized_gt, cmap='seismic', vmin=-1, vmax=1)
+                # 可视化 risk_score 和 gt_risk_score
+                gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
+                gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
+                normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np)
 
+                risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
+                normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np)
+
+                # 保存可视化结果
+                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), normalized_pred, cmap='seismic', vmin=-1, vmax=1)
+                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), normalized_gt, cmap='seismic', vmin=-1, vmax=1)
+                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), normalized_pred_risk_score, cmap='seismic', vmin=-1, vmax=1)
+                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), normalized_gt_risk_score, cmap='seismic', vmin=-1, vmax=1)
+
+            # If an auxiliary loss (loss_last) is available, use it for reporting.
             if loss_last is not None:
                 self.loss_per_epoch += loss.item()
                 self.loss_sum_per_epoch += loss_last.item()
                 if i % 10 == 0:
-                        print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
-                            ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
-                            '{:6.4f}'.format(loss_last.item()) + '    ' + '{:6.4f}'.format(loss.item()), '    ' + '{:6.4f}'.format(f1.item()))
+                    print(
+                        f"[{i * self.train_loader.batch_size:5}/{total_samples:5} "
+                        f"({100 * i / len(self.train_loader):3.0f}%)]  "
+                        f"Loss_now (aux): {loss_last.item():6.4f}    "
+                        f"Loss: {loss.item():6.4f}    "
+                        f"F1: {f1.item():6.4f}"
+                    )
             else:
                 self.loss_per_epoch += loss.item()
                 if i % 10 == 0:
-                    print('[' +  '{:5}'.format(i *self.train_loader.batch_size) + '/' + '{:5}'.format(total_samples) +
-                        ' (' + '{:3.0f}'.format(100 * i / len(self.train_loader)) + '%)]  Loss_now: ' +
-                        '{:6.4f}'.format(loss.item()))
+                    print(
+                        f"[{i * self.train_loader.batch_size:5}/{total_samples:5} "
+                        f"({100 * i / len(self.train_loader):3.0f}%)]  "
+                        f"Loss_now: {loss.item():6.4f}"
+                    )
 
             self.iters += 1
+
+            # 记录每个 batch 的 loss 和全局步数
+            global_step = epoch * len(self.train_loader) + i
+            if self.neptune_run is not None:
+                self.neptune_run["train/batch_loss"].append(loss.item(), step=global_step)
+                self.neptune_run["train/batch_loss_scale"].append(loss_scale.item(), step=global_step)
+                self.neptune_run["train/batch_loss_risk"].append(loss_risk.item(), step=global_step)
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            if self.neptune_run is not None:
+                self.neptune_run["train/batch_learning_rate"].append(current_lr, step=global_step)
+        
+        avg_loss = epoch_loss / steps
+        current_lr = self.optimizer.param_groups[0]["lr"]
+
+        if self.neptune_run is not None:
+            self.neptune_run["train/epoch_loss"].append(avg_loss, step=epoch)
+            self.neptune_run["train/epoch_learning_rate"].append(current_lr, step=epoch)
 
         
     @torch.no_grad()

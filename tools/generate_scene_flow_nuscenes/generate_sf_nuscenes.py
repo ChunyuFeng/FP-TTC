@@ -281,7 +281,7 @@ def main(nusc, val_list, indice, args):
     # # 2*N+1 frames in total. N has to be equal or larger than 1.
     # N = 15
 
-    for i in trange((1, len(dict_list)), desc="Processing frames"):
+    for i in trange(1, len(dict_list), desc="Processing frames"):
         # if i <= N-1:
         #     i += 1
         #     continue
@@ -420,9 +420,9 @@ def main(nusc, val_list, indice, args):
         curr_scene_points = curr_scene_points[intersection_points_mask]
 
         ################## visualization ##################
-        point_cloud_static_vis = o3d.geometry.PointCloud()
-        point_cloud_static_vis.points = o3d.utility.Vector3dVector(prev_scene_points)
-        o3d.visualization.draw_geometries([point_cloud_static_vis])
+        # point_cloud_static_vis = o3d.geometry.PointCloud()
+        # point_cloud_static_vis.points = o3d.utility.Vector3dVector(prev_scene_points)
+        # o3d.visualization.draw_geometries([point_cloud_static_vis])
 
         # ################## voxel downsampling ##################
         # voxel_size = 0.01  # Set the voxel size for downsampling
@@ -436,7 +436,8 @@ def main(nusc, val_list, indice, args):
 
         ################## save the scene points and object points  ########################
         pc_file_name_folder = curr_dict['pc_file_name'].replace('.pcd.bin', '')
-        dirs = os.path.join(save_path, 'scene_flow_all_frames/' ,pc_file_name_folder)
+        pc_file_name_folder = f"scene_{indice}_{pc_file_name_folder}"
+        dirs = os.path.join(save_path, 'scene_flow_all_frames/', pc_file_name_folder)
         if not os.path.exists(dirs):
             os.makedirs(dirs)
 
@@ -458,14 +459,12 @@ if __name__ == '__main__':
     parse = ArgumentParser()
 
     parse.add_argument('--dataset', type=str, default='nuscenes')
-    # parse.add_argument('--config_path', type=str, default='./tools/generate_sceneflow_nuscenes/config.yaml')
     parse.add_argument('--split', type=str, default='train')
     parse.add_argument('--save_path', type=str, default='./Datasets/nuscenes/0_scene_flow')
     parse.add_argument('--start', type=int, default=0)
     parse.add_argument('--end', type=int, default=2)
     parse.add_argument('--dataroot', type=str, default='./Datasets/nuscenes/')
     parse.add_argument('--nusc_val_list', type=str, default='./tools/generate_scene_flow_nuscenes/nuscenes_val_list.txt')
-    # parse.add_argument('--label_mapping', type=str, default='./tools/generate_scene_flow_nuscenes/nuscenes.yaml')
     args=parse.parse_args()
 
     if args.dataset=='nuscenes':

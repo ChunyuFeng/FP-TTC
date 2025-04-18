@@ -4,6 +4,16 @@ import torch.nn.functional as F
 from ..modules.utils import upsample_scale_with_mask
 from ..modules.attention import SelfAttnPropagation
 
+class RiskHead(nn.Module):
+    def __init__(self, input_dim=128, hidden_dim=256):
+        super(RiskHead, self).__init__()
+        self.conv1 = nn.Conv2d(input_dim, hidden_dim, 3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(hidden_dim, 1, 3, padding=1)
+
+    def forward(self, x):
+        return self.conv2(self.relu(self.conv1(x)))
+
 class ScaleHead(nn.Module):
     def __init__(self, input_dim=128, hidden_dim=256):
         super(ScaleHead, self).__init__()
@@ -60,15 +70,32 @@ class SepConvGRU(nn.Module):
         return h
 
 
+# class BasicUpdateBlock(nn.Module):
+#     def __init__(self, hidden_dim=128, input_dim=128):
+#         super(BasicUpdateBlock, self).__init__()
+#         self.encoder = BasicMotionEncoder(dim=input_dim)
+#         self.gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=128+hidden_dim)
+#         self.scale_head = ScaleHead(hidden_dim, hidden_dim=256)
+
+#     def forward(self, net, inp, agg_corr, scale):
+#         motion_features = self.encoder(scale,agg_corr)
+#         inp = torch.cat([inp, motion_features], dim=1)
+
+#         net = self.gru(net, inp)
+#         scale = self.scale_head(net)
+
+#         return net, scale
+
 class BasicUpdateBlock(nn.Module):
-    def __init__(self, hidden_dim=128, input_dim=128):
+    def __init__(self, hidden_dim=128, input_dim=128, head_cls=ScaleHead):
         super(BasicUpdateBlock, self).__init__()
         self.encoder = BasicMotionEncoder(dim=input_dim)
-        self.gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=128+hidden_dim)
-        self.scale_head = ScaleHead(hidden_dim, hidden_dim=256)
+        self.gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=hidden_dim+input_dim)
+        # 根据外部传入的 head_cls 构造 head
+        self.scale_head = head_cls(input_dim=hidden_dim, hidden_dim=256)
 
     def forward(self, net, inp, agg_corr, scale):
-        motion_features = self.encoder(scale,agg_corr)
+        motion_features = self.encoder(scale, agg_corr)
         inp = torch.cat([inp, motion_features], dim=1)
 
         net = self.gru(net, inp)
@@ -80,7 +107,7 @@ class BasicUpdateBlock(nn.Module):
 class ScaleDecoder(nn.Module):
     def __init__(self, input_dim=128, hidden_dim=96,
                  out_dim=1, upsample_factor=4, num_blocks=2,
-                 ):
+                 head_cls=ScaleHead):
         super(ScaleDecoder, self).__init__()
 
         self.upsample_factor = upsample_factor
@@ -91,36 +118,32 @@ class ScaleDecoder(nn.Module):
         self.scale_estimator = nn.ModuleList()
 
         for l in range(num_blocks):
-            layer = BasicUpdateBlock(input_dim, input_dim)     
+            layer = BasicUpdateBlock(input_dim, input_dim, head_cls=head_cls)     
             self.scale_estimator.append(layer)
 
-        self.upsampler = nn.Sequential(nn.Conv2d(1 + input_dim, 256, 3, 1, 1),
-                                        nn.ReLU(inplace=True),
-                                        nn.Conv2d(256, upsample_factor ** 2 * 9, 1, 1, 0))
+        self.upsampler = nn.Sequential(
+            nn.Conv2d(1 + input_dim, 256, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, upsample_factor ** 2 * 9, 1, 1, 0)
+            )
 
 
     def forward(self, scale_feature, cfeat0, agg_corr, ini_scale):
-
         b, _, h, w = scale_feature.shape
-        scale_preds = []
-
         proj = self.refine_proj(torch.cat([scale_feature, cfeat0], dim=1))
         net, inp = torch.chunk(proj, chunks=2, dim=1)
-
         net = torch.tanh(net)
         inp = torch.relu(inp)
 
         scale = ini_scale
-
         for l in range(self.num_blocks):
             net, scale_out = self.scale_estimator[l](net, inp, agg_corr, scale)
-            if l==0:
+            if l == 0:
                 scale = scale_out
             else:
-                scale = scale * scale_out  
+                scale = scale * scale_out
 
         scale_f = self.upsample_scale(scale, cfeat0)
-
         return scale_f
 
     def upsample_flow_with_mask(self, flow, up_mask, upsample_factor):

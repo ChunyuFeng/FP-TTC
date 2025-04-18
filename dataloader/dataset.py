@@ -629,20 +629,6 @@ class nuScenes_range_image(data.Dataset):
         # TODO: 目前 depth map 是将碰撞点反投影回图像平面时使用的，仅在可视化时使用
         self.depth_map_list = []
 
-        # infos = self.data['infos']
-
-        # # 服务器上的路径前缀和本地路径前缀不一样，需要进行替换
-        # local_scale_map_path_prefix = '/mnt/fpttc_data/scale_map/'
-        # eden_scale_map_path_prefix = '/mnt/pool/fcy/FP-TTC/Datasets/scale_map/'
-        # if self.train_location == 'local':
-        #     print('Training on Odyssey...')
-        # elif self.train_location == 'remote-eden':
-        #     for info in infos:
-        #         if info['scale_map_path'].startswith(local_scale_map_path_prefix):
-        #             info['scale_map_path'] = info['scale_map_path'].replace(local_scale_map_path_prefix,eden_scale_map_path_prefix)
-        # else:
-        #     raise ValueError('Invalid train_location: ', self.train_location)
-
         for i in range(len(self.data)):
             
             range_image_path = os.path.join(self.data[i]['gt_map_path'], 'range_image.npy')
@@ -659,16 +645,6 @@ class nuScenes_range_image(data.Dataset):
             self.risk_score_map_list.append(range_image['risk_score'])
             self.depth_map_list.append(range_image['depth'])
 
-            # current_info = infos[i]
-
-            # # 25 ms < timestamp_diff < 125 ms
-            # if abs(next_info['timestamp'] - current_info['timestamp'])/1e3 < 25 or abs(next_info['timestamp'] - current_info['timestamp'])/1e3 > 125:
-            #     continue
-            # else:
-            #     self.image_list.append([current_info['original_imgs_path'], next_info['original_imgs_path']])
-            #     self.timestamp_list.append([current_info['timestamp'], next_info['timestamp']])
-            #     self.depth_list.append([current_info['scale_map_path'], next_info['scale_map_path']])
-            #     self.sensor_meta_list.append([current_info['sensor_metas'], next_info['sensor_metas']])
 
     def __len__(self):
         return len(self.image_list)
@@ -727,71 +703,6 @@ class nuScenes_range_image(data.Dataset):
                 gt_depth_map_with_mask, # model 的输入以及真值
                 sensor_meta)
 
-        # surr_view_imgs1 = {}
-        # surr_view_imgs2 = {}
-        # surr_view_imgs_path1, surr_view_imgs_path2 = self.image_list[index]
-
-        # timestamp1, timestamp2 = self.timestamp_list[index]
-
-        # # 使用更接近当前时刻的 scale map 作为真值
-        # range_image_scale_path1, range_image_scale_path2 = self.depth_list[index]
-
-        # if self.train_location == 'local':
-        #     image_path_prefix = '/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes/'
-        # elif self.train_location == 'remote-eden':
-        #     image_path_prefix = '/mnt/pool/fcy/FP-TTC/Datasets/nuscenes/'
-        # else:
-        #     raise ValueError('Invalid train_location: ', self.train_location)
-
-        # # camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
-        # #                    'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
-        # camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-        #                    'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
-
-        # # 读取图像和 scale 真值（range image）数据
-        # for channel in camera_channels:
-        #     if not surr_view_imgs_path1[channel].startswith(image_path_prefix):
-        #         surr_view_imgs_path1[channel] = image_path_prefix + surr_view_imgs_path1[channel]
-        #     if not surr_view_imgs_path2[channel].startswith(image_path_prefix):
-        #         surr_view_imgs_path2[channel] = image_path_prefix + surr_view_imgs_path2[channel]
-        #     surr_view_imgs1[channel] = frame_utils.read_nusc_image(surr_view_imgs_path1[channel])
-        #     surr_view_imgs2[channel] = frame_utils.read_nusc_image(surr_view_imgs_path2[channel])
-
-        # gt_scale = frame_utils.read_nusc_scale_range_image(range_image_scale_path2)
-
-        # # 数据增强
-        # if self.augmentor is not None:
-        #     surr_view_imgs1 = self.augmentor(surr_view_imgs1)
-        #     surr_view_imgs2 = self.augmentor(surr_view_imgs2)
-
-        # mask = gt_scale > 0
-
-        # # 转换为 Tensor，不同视角的图像放到同一个 tensor 中
-        # for channel in camera_channels:
-        #     surr_view_imgs1[channel] = torch.from_numpy(surr_view_imgs1[channel]).permute(2, 0, 1).float()
-        #     surr_view_imgs2[channel] = torch.from_numpy(surr_view_imgs2[channel]).permute(2, 0, 1).float()
-
-        # prev_surr_view_imgs_tensor = torch.stack([surr_view_imgs1[channel] for channel in camera_channels], dim=0)
-        # curr_surr_view_imgs_tensor = torch.stack([surr_view_imgs2[channel] for channel in camera_channels], dim=0)
-
-        # gt_scale = torch.from_numpy(gt_scale).float()
-        # mask = torch.from_numpy(mask)
-
-        # # 拼接gt_scale和mask
-        # gt_scale_with_mask = torch.cat((gt_scale.unsqueeze(0), mask.unsqueeze(0).float()), dim=0)
-
-        # sensor_meta = self.sensor_meta_list[index]
-
-        # # # 将 images token 和 lidar token 也传入模型
-        # # # 方便后续调用投影函数，实现 Range Image 和 Surround View Image 之间特征位置的对应
-        # # prev_surr_view_imgs_token, curr_surr_view_imgs_token = self.image_token_list[index]
-        # # prev_lidar_token, curr_lidar_token = self.lidar_token_list[index]          
-
-        # return (prev_surr_view_imgs_tensor,
-        #         curr_surr_view_imgs_tensor,
-        #         gt_scale_with_mask, # model 的输入以及真值
-        #         sensor_meta) # 传入模型的 sensor_meta 信息，包括 lidar 和 camera 的内参、外参等
-
     def __rmul__(self, v):
         self.image_list = v * self.image_list
         self.sensor_meta_list = v * self.sensor_meta_list
@@ -828,26 +739,15 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
 
     elif args.stage == 'nuscenes_range_image':
         aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
-        train_info_file = 'list_nusc_trainval_infos_160_1920.pkl'
+        train_info_file = 'nusc_trainval_infos_160_1920.pkl'
         train_info_path = './Datasets/nuscenes/2_trainval_test_infos'
 
-
-        # train_location = args.train_location
-        # if train_location == 'local':
-        #     root='/mnt/fpttc_data/TVT_infos'
-        # elif train_location == 'remote-eden':
-        #     root='/mnt/pool/fcy/FP-TTC/Datasets/tvt_infos/'
-        # else:
-        #     raise ValueError('Invalid train_location: ', train_location)
-        
         nuscenes = nuScenes_range_image(aug_params,
                                         train_info_file=train_info_file,
                                         train_info_path=train_info_path,
-                                        split='training'
-                                        )
-                                        # train_location=train_location,
-                                        # root=root)
-        train_dataset = 100*nuscenes
+                                        split='training')
+
+        train_dataset = 1*nuscenes
 
     elif args.stage == 'mix':
         nusc_aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': True, 'rotate_prob': 0.2, 'rotate_angle': 90}

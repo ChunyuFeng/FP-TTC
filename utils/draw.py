@@ -388,7 +388,7 @@ def visual_scale_map_range_image(scale_map, valid_mask, colormap_name='seismic')
         pos_devs = deviations[pos_mask]
         pos_max = pos_devs.max()
         pos_min = pos_devs.min()
-        if pos_max >= pos_min >= 0:
+        if pos_max > pos_min >= 0:
             normalized_display[pos_mask] = (pos_devs - pos_min) / (pos_max - pos_min)  # 归一化到 [0,1]
         else:
             normalized_display[pos_mask] = 0.0  # 如果没有变化，设为0
@@ -398,7 +398,7 @@ def visual_scale_map_range_image(scale_map, valid_mask, colormap_name='seismic')
         neg_devs = deviations[neg_mask]
         neg_max = neg_devs.max()
         neg_min = neg_devs.min()
-        if neg_min <= neg_max <= 0:
+        if neg_min < neg_max <= 0:
             normalized_display[neg_mask] = (neg_devs - neg_min) / (neg_max - neg_min) - 1.0  # 归一化到 [-1,0]
             # normalized_display[neg_mask] = neg_devs / abs(neg_min)  # 归一化到 [-1,0]
         else:
@@ -411,3 +411,35 @@ def visual_scale_map_range_image(scale_map, valid_mask, colormap_name='seismic')
     normalized_display[~valid_mask] = 0.0
 
     return normalized_display
+
+def visual_risk_score_map_range_image(risk_score_map):
+
+    risk_score_display = risk_score_map
+
+    pos_mask = risk_score_display > 0
+    neg_mask = risk_score_display < 0
+
+    normalized_risk_score = np.zeros_like(risk_score_display, dtype=np.float32)
+
+    # 分段归一化，大于 0 表示朝向自车运动，小于 0 表示远离自车运动
+    # 处理大于0的部分
+    if np.any(pos_mask):
+        pos_risk = risk_score_display[pos_mask]
+        pos_max = pos_risk.max()
+        pos_min = pos_risk.min()
+        if pos_max > pos_min >= 0:
+            normalized_risk_score[pos_mask] = (pos_risk - pos_min) / (pos_max - pos_min)
+        else:
+            normalized_risk_score[pos_mask] = 0.0
+    # 处理小于0的部分
+    if np.any(neg_mask):
+        neg_risk = risk_score_display[neg_mask]
+        neg_max = neg_risk.max()
+        neg_min = neg_risk.min()
+        if neg_min < neg_max <= 0:
+            normalized_risk_score[neg_mask] = (neg_risk - neg_min) / (neg_max - neg_min) - 1.0
+        else:
+            normalized_risk_score[neg_mask] = 0.0
+    
+    return normalized_risk_score
+    

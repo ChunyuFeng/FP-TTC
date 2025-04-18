@@ -2,7 +2,7 @@
 
 Official implementation of "FP-TTC: Fast Prediction of Time-to-Collision using Monocular Images". Submitted to T-CSVT on May **, 2024.
 
-![pipeline](./images/pipeline.png)
+![pipeline](./images/pipeline_pano.png)
 
 
 
@@ -118,16 +118,17 @@ KITTI:
 ![viz](./images/viz.png)
 
 ## TODO
-- [ ] 维护一张修改过的模型图
+- [x] 维护一张修改过的模型图
+- [ ] 单任务分别训练，记录其 loss 变化情况 - llw可视化工具
 
-- [ ] 将每个场景的数据分别制作真值，以场景idx作为循环值
+- [ ] 将每个场景的数据分别制作真值，记录场景idx，方便后续训练使用连续场景
 - [ ] 通过限制深度的离群值、或者限制scale的比值，来限制一下真值的最大、最小值；否则可视化图像中会出现颜色深浅不一，制作成视频后会闪烁
 
-- [ ] 由于真值中需要保存路径信息，做如下统一：
+- [x] 由于真值中需要保存路径信息，做如下统一：
   - [x] pkl文件中只保留相对路径，文件保存到 /mnt/data 中，创建符号链接指向 ./Datasets
-  - [x] 将 scale map、depth map、risk score map 作为同一张图的三个通道，存储为 npy 文件；
+  - [x] 将 scale map、depth map、risk score map 放到同一个 npy 文件中；
 
-- [ ] 图像Input选择合适的帧率，且尽量保持一致。
+- [ ] 图像Input选择合适的帧率，且尽量保持一致。（目前 1/3 image pairs 的时间间隔为 50ms，2/3 image pairs 的时间间隔为 100ms）
   - nuscenes原始数据中，图像帧率为12hz，激光雷达帧率为20hz，选择一个合适的帧率，要求是：
     - 在这个帧率下，LiDAR和Camera都有数据；
     - 相邻帧之间的时间间隔 < 0.1*判断碰撞风险设定的时间阈值 (0.1参数还需要根据实际调整)
