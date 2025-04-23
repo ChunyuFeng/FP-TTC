@@ -20,14 +20,9 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from PIL import Image
-
 from .loss import get_loss, get_loss_multi, get_loss_nusc, get_loss_mix, get_loss_scale_map, get_loss_risk_score_map
 from .draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_image, visual_risk_score_map_range_image
-
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
-
-from torch.utils.tensorboard import SummaryWriter
-
 
 class TTCTrainer(object):
     def __init__(self, model, dataset, optimizer, args, device, model_path = None, 
@@ -100,7 +95,6 @@ class TTCTrainer(object):
 
         aug_params = {'crop_size': crop_size, 'min_scale': -0.2, 'max_scale': 0.4, 'do_flip': True}
 
-        self.writer = SummaryWriter(log_dir="./log/tensorboard")
         self.neptune_run = neptune_run
 
     def get_optimizer(self):
@@ -138,9 +132,6 @@ class TTCTrainer(object):
 
                 print("Loss in epoch", epoch, ":", self.loss_per_epoch / max(1, self.iters))
                 print("Learning rate: ", self.optimizer.state_dict()['param_groups'][0]['lr'])
-
-        # 训练结束后关闭SummaryWriter
-        self.writer.close()
     
     def train_epoch(self, epoch):
         total_samples = len(self.train_loader.dataset)
@@ -169,7 +160,6 @@ class TTCTrainer(object):
             gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.to(self.device)
 
             self.optimizer.zero_grad()
-
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
             if hasattr(self.model, "module"):
                 scale, risk_score, loss_scale, loss_risk, loss = self.model.module.forward_with_loss(
@@ -204,13 +194,8 @@ class TTCTrainer(object):
             gt_scale = torch.nan_to_num(gt_scale, nan=0.0)
             gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]
 
-            if i % 10 == 0:
-                self.writer.add_scalar("Train/Batch_Loss", loss.item(), epoch * len(self.train_loader) + i)
-
             loss.backward()
-
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-
             self.optimizer.step()
             self.lr_scheduler3.step()
 
@@ -239,8 +224,8 @@ class TTCTrainer(object):
                 normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np)
 
                 # 保存可视化结果
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), normalized_pred, cmap='seismic', vmin=-1, vmax=1)
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), normalized_gt, cmap='seismic', vmin=-1, vmax=1)
+                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
+                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), normalized_pred_risk_score, cmap='seismic', vmin=-1, vmax=1)
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), normalized_gt_risk_score, cmap='seismic', vmin=-1, vmax=1)
 
@@ -254,7 +239,6 @@ class TTCTrainer(object):
                         f"({100 * i / len(self.train_loader):3.0f}%)]  "
                         f"Loss_now (aux): {loss_last.item():6.4f}    "
                         f"Loss: {loss.item():6.4f}    "
-                        f"F1: {f1.item():6.4f}"
                     )
             else:
                 self.loss_per_epoch += loss.item()

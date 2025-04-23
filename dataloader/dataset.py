@@ -654,8 +654,11 @@ class nuScenes_range_image(data.Dataset):
         prev_surr_view_imgs = {}
         curr_surr_view_imgs = {}
 
-        camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
-                           'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
+        # camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
+        #                    'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
+        # 后续会按照这个顺序拼接，和 Range Image 对应 
+        camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                           'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
         
         path_prefix = './Datasets/nuscenes/'
         for channel in camera_channels:

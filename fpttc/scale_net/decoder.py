@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..modules.utils import upsample_scale_with_mask
 from ..modules.attention import SelfAttnPropagation
+from torch.utils.checkpoint import checkpoint
 
 class RiskHead(nn.Module):
     def __init__(self, input_dim=128, hidden_dim=256):
@@ -136,8 +137,17 @@ class ScaleDecoder(nn.Module):
         inp = torch.relu(inp)
 
         scale = ini_scale
+        # for l in range(self.num_blocks):
+        #     net, scale_out = self.scale_estimator[l](net, inp, agg_corr, scale)
+        #     if l == 0:
+        #         scale = scale_out
+        #     else:
+        #         scale = scale * scale_out
         for l in range(self.num_blocks):
-            net, scale_out = self.scale_estimator[l](net, inp, agg_corr, scale)
+            net, scale_out = checkpoint(
+                self.scale_estimator[l],
+                net, inp, agg_corr, scale
+                )
             if l == 0:
                 scale = scale_out
             else:

@@ -145,13 +145,12 @@ def resize_and_crop(img, width, height):
     """将图像缩放并裁剪到指定大小"""
     w, h = img.size
     crop_h, crop_w = height, width
-    resize = max(crop_h / h, crop_w / w)
+    resize = crop_w / w
 
     resize_h, resize_w = int(h * resize), int(w * resize)
-    crop_h_start = (resize_h - crop_h) // 2
+    crop_h_start = 0
     crop_w_start = (resize_w - crop_w) // 2
     crop = (crop_w_start, crop_h_start, crop_w_start + crop_w, crop_h_start + crop_h)
-
 
     img = img.resize((resize_w, resize_h), Image.BILINEAR)
 
@@ -160,18 +159,16 @@ def resize_and_crop(img, width, height):
     return img
 
 def main():
-    # from utils.unimatch.unimatch import UniMatch
     model_loaded = FpTTC(num_scales=args.num_scales,
-                            feature_channels=args.feature_channels,
-                            upsample_factor=args.upsample_factor,
-                            num_head=args.num_head,
-                            ffn_dim_expansion=args.ffn_dim_expansion,
-                            num_transformer_layers=args.num_transformer_layers,
-                            reg_refine=args.reg_refine,
-                            train=False).to(device)
+                         feature_channels=args.feature_channels,
+                         upsample_factor=args.upsample_factor,
+                         num_head=args.num_head,
+                         ffn_dim_expansion=args.ffn_dim_expansion,
+                         num_transformer_layers=args.num_transformer_layers,
+                         reg_refine=args.reg_refine,
+                         train=False).to(device)
     num_params = sum(p.numel() for p in model_loaded.parameters())
     print('Number of params:', num_params)
-
 
     if args.resume is not None:
         loc = 'cuda:{}'.format(args.local_rank) if torch.cuda.is_available() else 'cpu'
@@ -197,32 +194,36 @@ def main():
     # # print(filenames)
     # print('%d images found' % len(filenames))
 
-    test_info_path = './Datasets/nuscenes/2_trainval_test_infos/list_nusc_trainval_infos_160_1920.pkl'
+    test_info_path = './Datasets/nuscenes/2_trainval_test_infos/nusc_trainval_infos_160_1920.pkl'
     with open(test_info_path, 'rb') as file:
         test_info = pickle.load(file)
     
     camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
                        'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
+    # camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+    #                    'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
 
     prev_surr_view_imgs = {}
     curr_surr_view_imgs = {}
     for i in tqdm(range(len(test_info)), desc='Processing surround view images'):
         for channel in camera_channels:
             prev_file_path = os.path.join('./Datasets/nuscenes', test_info[i]['prev_camera_data'][channel]['filename'])
-            prev_surr_view_imgs[channel] = Image.open(prev_file_path).convert('RGB')
+            prev_surr_view_imgs[channel] = Image.open(prev_file_path)
             prev_surr_view_imgs[channel] = resize_and_crop(prev_surr_view_imgs[channel], 320, 160)
             prev_surr_view_imgs[channel] = np.array(prev_surr_view_imgs[channel])
-            prev_surr_view_imgs[channel] = torch.from_numpy(prev_surr_view_imgs[channel]).permute(2, 0, 1).float().unsqueeze(0).to(device)
+            prev_surr_view_imgs[channel] = torch.from_numpy(prev_surr_view_imgs[channel]).permute(2, 0, 1).float()
 
             curr_file_path = os.path.join('./Datasets/nuscenes', test_info[i]['curr_camera_data'][channel]['filename'])
-            curr_surr_view_imgs[channel] = Image.open(curr_file_path).convert('RGB')
+            curr_surr_view_imgs[channel] = Image.open(curr_file_path)
             curr_surr_view_imgs[channel] = resize_and_crop(curr_surr_view_imgs[channel], 320, 160)
             curr_surr_view_imgs[channel] = np.array(curr_surr_view_imgs[channel])
-            curr_surr_view_imgs[channel] = torch.from_numpy(curr_surr_view_imgs[channel]).permute(2, 0, 1).float().unsqueeze(0).to(device)
+            curr_surr_view_imgs[channel] = torch.from_numpy(curr_surr_view_imgs[channel]).permute(2, 0, 1).float()
 
-        prev_surr_view_imgs_tensor = torch.stack([prev_surr_view_imgs[channel] for channel in camera_channels], dim=1)
-        curr_surr_view_imgs_tensor = torch.stack([curr_surr_view_imgs[channel] for channel in camera_channels], dim=1)
+        prev_surr_view_imgs_tensor = torch.stack([prev_surr_view_imgs[channel] for channel in camera_channels], dim=0)
+        curr_surr_view_imgs_tensor = torch.stack([curr_surr_view_imgs[channel] for channel in camera_channels], dim=0)
 
+        prev_surr_view_imgs_tensor = prev_surr_view_imgs_tensor.unsqueeze(0).to(device)
+        curr_surr_view_imgs_tensor = curr_surr_view_imgs_tensor.unsqueeze(0).to(device)
         sensor_meta = test_info[i]['sensor_metas']
 
         gt_map_path = os.path.join(test_info[i]['gt_map_path'], 'range_image.npy')
@@ -241,7 +242,7 @@ def main():
         gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            scale, risk_score, loss = model_loaded.forward_with_loss(
+            scale, risk_score, loss_scale, loss_risk, loss = model_loaded.forward_with_loss(
                 prev_surr_view_imgs_tensor,
                 curr_surr_view_imgs_tensor,
                 sensor_meta,
@@ -274,93 +275,14 @@ def main():
         normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np)
 
         # 保存可视化结果
-        plt.imsave(os.path.join(out_dir, f"pred_scale_{i}.png"), normalized_pred_scale, cmap='seismic', vmin=-1, vmax=1)
-        plt.imsave(os.path.join(out_dir, f"gt_scale_{i}.png"), normalized_gt_scale, cmap='seismic', vmin=-1, vmax=1)
+        plt.imsave(os.path.join(out_dir, f"pred_scale_{i}.png"), -normalized_pred_scale, cmap='seismic', vmin=-1, vmax=1)
+        plt.imsave(os.path.join(out_dir, f"gt_scale_{i}.png"), -normalized_gt_scale, cmap='seismic', vmin=-1, vmax=1)
         plt.imsave(os.path.join(out_dir, f"pred_risk_{i}.png"), normalized_pred_risk_score, cmap='seismic', vmin=-1, vmax=1)
         plt.imsave(os.path.join(out_dir, f"gt_risk_{i}.png"), normalized_gt_risk_score, cmap='seismic', vmin=-1, vmax=1)
 
         # 释放当前循环中分配的 GPU 内存
         del prev_surr_view_imgs_tensor, curr_surr_view_imgs_tensor, scale, risk_score
         torch.cuda.empty_cache()
-    # image_list= []
-    # scale_map_list = []
-    # infos = camera_lut['infos']
-    # for i in range(len(infos) - 1):
-    #     current_info = infos[i]
-    #     next_info = infos[i + 1]
-
-    #     # 25 ms < timestamp_diff < 125 ms
-    #     if abs(next_info['timestamp'] - current_info['timestamp']) / 1e3 < 25 or abs(
-    #             next_info['timestamp'] - current_info['timestamp']) / 1e3 > 125:
-    #         continue
-    #     else:
-    #         image_list.append([current_info['original_imgs_path'], next_info['original_imgs_path']])
-    #         scale_map_list.append([current_info['scale_map_path'], next_info['scale_map_path']])
-
-    # surr_view_imgs1 = {}
-    # surr_view_imgs2 = {}
-    # image_path_prefix = '/home/chunyu/WorkSpace/BugStudio/FP-TTC/Datasets/nuscenes/'
-    # camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-    #                    'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
-
-    # for i in tqdm(range(len(image_list)), desc='Processing'):
-    #     surr_view_imgs_path1, surr_view_imgs_path2 = image_list[i]
-    #     scale_map_path1, scale_map_path2 = scale_map_list[i]
-    #     for channel in camera_channels:
-    #         if not surr_view_imgs_path1[channel].startswith(image_path_prefix):
-    #             surr_view_imgs_path1[channel] = image_path_prefix + surr_view_imgs_path1[channel]
-    #         if not surr_view_imgs_path2[channel].startswith(image_path_prefix):
-    #             surr_view_imgs_path2[channel] = image_path_prefix + surr_view_imgs_path2[channel]
-    #         surr_view_imgs1[channel] = Image.open(surr_view_imgs_path1[channel]).convert('RGB')
-    #         surr_view_imgs1[channel] = resize_and_crop(surr_view_imgs1[channel], 320, 160)
-    #         surr_view_imgs1[channel] = np.array(surr_view_imgs1[channel])
-    #         surr_view_imgs2[channel] = Image.open(surr_view_imgs_path2[channel]).convert('RGB')
-    #         surr_view_imgs2[channel] = resize_and_crop(surr_view_imgs2[channel], 320, 160)
-    #         surr_view_imgs2[channel] = np.array(surr_view_imgs2[channel])
-
-    #     for channel in camera_channels:
-    #         surr_view_imgs1[channel] = torch.from_numpy(surr_view_imgs1[channel]).permute(2, 0, 1).float().unsqueeze(0).to(device)
-    #         surr_view_imgs2[channel] = torch.from_numpy(surr_view_imgs2[channel]).permute(2, 0, 1).float().unsqueeze(0).to(device)
-
-    #     prev_surr_view_imgs_tensor = torch.stack([surr_view_imgs1[channel] for channel in camera_channels], dim=1)
-    #     curr_surr_view_imgs_tensor = torch.stack([surr_view_imgs2[channel] for channel in camera_channels], dim=1)
-
-    #     # 服务器上的路径前缀和本地路径前缀不一样，需要进行替换
-    #     local_scale_map_path_prefix = '/mnt/fpttc_data/scale_map/'
-    #     eden_scale_map_path_prefix = '/mnt/pool/fcy/FP-TTC/Datasets/scale_map/'
-    #     if args.train_location == 'local':
-    #         print('Training on Odyssey...')
-    #     elif args.train_location == 'remote-eden':
-    #         for info in infos:
-    #             if info['scale_map_path'].startswith(local_scale_map_path_prefix):
-    #                 info['scale_map_path'] = info['scale_map_path'].replace(local_scale_map_path_prefix,
-    #                                                                         eden_scale_map_path_prefix)
-    #     else:
-    #         raise ValueError('Invalid train_location: ', args.train_location)
-
-    #     gt_scale = np.load(scale_map_path1)
-    #     gt_scale = torch.from_numpy(gt_scale).float()
-    #     mask = gt_scale > 0
-
-    #     scale, flow, _ = model_loaded(prev_surr_view_imgs_tensor, curr_surr_view_imgs_tensor,
-    #                                   attn_type=args.attn_type,
-    #                                   attn_splits_list=args.attn_splits_list,
-    #                                   corr_radius_list=args.corr_radius_list,
-    #                                   prop_radius_list=args.prop_radius_list,
-    #                                   num_reg_refine=args.num_reg_refine,
-    #                                   testing=False)
-
-    #     # visualization
-    #     gt_scale_np = gt_scale.detach().squeeze(0).cpu().numpy()
-    #     gt_valid_mask = gt_scale_np > 0
-    #     normalized_gt = visual_scale_map_range_image(gt_scale_np, gt_valid_mask)
-
-    #     scale_np = scale[0].detach().squeeze(0).cpu().numpy()
-    #     pred_valid_mask = scale_np > 0
-    #     normalized_pred = visual_scale_map_range_image(scale_np, pred_valid_mask)
-
-    #     plt.imsave(os.path.join(out_dir, f"gt{i}.jpg"), normalized_gt, cmap='seismic', vmin=-1, vmax=1)
-    #     plt.imsave(os.path.join(out_dir, f"pred{i}.jpg"), normalized_pred, cmap='seismic', vmin=-1, vmax=1)
 
 if __name__ == "__main__":
     main()

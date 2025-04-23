@@ -370,7 +370,7 @@ def visual_scale_map_range_image(scale_map, valid_mask, colormap_name='seismic')
     scale_display = np.copy(scale_map)
 
     # 将用于可视化的尺度值裁切到 [0.5, 1.5] 范围
-    scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.5, 1.5)
+    scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.85, 1.15)
 
     # 将尺度的分界线从 1 移至 0（scale - 1）
     deviations = np.zeros_like(scale_display, dtype=np.float32)
