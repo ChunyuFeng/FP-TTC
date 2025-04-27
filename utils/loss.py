@@ -316,7 +316,7 @@ def get_loss_scale_map(scale, gt_scale_with_mask):
     maskdc = (gt_scale < 3) & (gt_scale > 0.3) & valid & (scale > 0)
 
     if maskdc.sum() == 0:
-        return torch.tensor(0.0, device=scale.device)  # 返回 0 作为损失
+        return scale.sum() * 0.0  # 返回 0 作为损失
 
     # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
     epsilon = 1e-6  # 预防性的小值

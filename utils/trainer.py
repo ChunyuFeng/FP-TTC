@@ -133,6 +133,143 @@ class TTCTrainer(object):
                 print("Loss in epoch", epoch, ":", self.loss_per_epoch / max(1, self.iters))
                 print("Learning rate: ", self.optimizer.state_dict()['param_groups'][0]['lr'])
     
+    # def train_epoch(self, epoch):
+    #     total_samples = len(self.train_loader.dataset)
+    #     if self.parallel:
+    #         self.train_sampler.set_epoch(epoch)
+    #     self.model.train()
+        
+    #     epoch_loss = 0
+    #     steps = 0
+
+    #     out_dir = "./log/%s_selfcon_ttc"%(self.time_stamp)
+    #     # save_index = 400 if not self.parallel else random.randint(int(4000/self.batch_size),int(8000/self.batch_size))
+    #     save_index = 400 if not self.parallel else random.randint(int(400/self.batch_size),int(1200/self.batch_size))
+    #     for i, data in enumerate(self.train_loader):
+
+    #         (prev_surr_view_imgs_tensor,
+    #          curr_surr_view_imgs_tensor,
+    #          gt_scale_map_with_mask,
+    #          gt_risk_score_map_with_mask,
+    #          gt_depth_map_with_mask,
+    #          sensor_meta) = data
+            
+    #         prev_surr_view_imgs_tensor = prev_surr_view_imgs_tensor.to(self.device)
+    #         curr_surr_view_imgs_tensor = curr_surr_view_imgs_tensor.to(self.device)
+    #         gt_scale_map_with_mask = gt_scale_map_with_mask.to(self.device)
+    #         gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.to(self.device)
+
+    #         self.optimizer.zero_grad()
+    #         # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
+    #         if hasattr(self.model, "module"):
+    #             scale, risk_score, loss_scale, loss_risk, loss, loss_s_u, loss_r_u = self.model.module.forward_with_loss(
+    #                 prev_surr_view_imgs_tensor,
+    #                 curr_surr_view_imgs_tensor,
+    #                 sensor_meta,
+    #                 gt_scale_map_with_mask=gt_scale_map_with_mask,
+    #                 gt_risk_score_map_with_mask=gt_risk_score_map_with_mask,
+    #                 attn_type=self.attn_type,
+    #                 attn_splits_list=self.attn_splits_list,
+    #                 corr_radius_list=self.corr_radius_list,
+    #                 prop_radius_list=self.prop_radius_list,
+    #                 num_reg_refine=self.num_reg_refine
+    #             )
+    #         else:
+    #             scale, risk_score, loss_scale, loss_risk, loss, loss_s_u, loss_r_u = self.model.forward_with_loss(
+    #                 prev_surr_view_imgs_tensor,
+    #                 curr_surr_view_imgs_tensor,
+    #                 sensor_meta,
+    #                 gt_scale_map_with_mask=gt_scale_map_with_mask,
+    #                 gt_risk_score_map_with_mask=gt_risk_score_map_with_mask,
+    #                 attn_type=self.attn_type,
+    #                 attn_splits_list=self.attn_splits_list,
+    #                 corr_radius_list=self.corr_radius_list,
+    #                 prop_radius_list=self.prop_radius_list,
+    #                 num_reg_refine=self.num_reg_refine
+    #             )
+
+    #         loss_last = None
+
+    #         gt_scale = gt_scale_map_with_mask[:,0,:,:]
+    #         gt_scale = torch.nan_to_num(gt_scale, nan=0.0)
+    #         gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]
+
+    #         loss.backward()
+    #         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+    #         self.optimizer.step()
+    #         self.lr_scheduler3.step()
+
+    #         epoch_loss += loss.item()
+    #         steps += 1
+
+    #         if type(scale) == list:
+    #             scale = scale[-1]
+    #         if i%int(save_index)==0:
+
+    #             # 可视化 prediction_scale 和 gt_scale
+    #             gt_scale_np = gt_scale[:1].detach().squeeze(0).cpu().numpy()
+    #             gt_scale_valid_mask_np = gt_scale_valid_mask[:1].squeeze(0).cpu().detach().bool()
+    #             normalized_gt = visual_scale_map_range_image(gt_scale_np, gt_scale_valid_mask_np)
+
+    #             scale_np = scale[0].detach().squeeze(0).cpu().numpy()
+    #             pred_valid_mask = scale_np > 0
+    #             normalized_pred = visual_scale_map_range_image(scale_np, pred_valid_mask)
+
+    #             # 可视化 risk_score 和 gt_risk_score
+    #             gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
+    #             gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
+    #             normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np)
+
+    #             risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
+    #             normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np)
+
+    #             # 保存可视化结果
+    #             plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
+    #             plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
+    #             plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), normalized_pred_risk_score, cmap='seismic', vmin=-1, vmax=1)
+    #             plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), normalized_gt_risk_score, cmap='seismic', vmin=-1, vmax=1)
+
+    #         # If an auxiliary loss (loss_last) is available, use it for reporting.
+    #         if loss_last is not None:
+    #             self.loss_per_epoch += loss.item()
+    #             self.loss_sum_per_epoch += loss_last.item()
+    #             if i % 10 == 0:
+    #                 print(
+    #                     f"[{i * self.train_loader.batch_size:5}/{total_samples:5} "
+    #                     f"({100 * i / len(self.train_loader):3.0f}%)]  "
+    #                     f"Loss_now (aux): {loss_last.item():6.4f}    "
+    #                     f"Loss: {loss.item():6.4f}    "
+    #                 )
+    #         else:
+    #             self.loss_per_epoch += loss.item()
+    #             if i % 10 == 0:
+    #                 print(
+    #                     f"[{i * self.train_loader.batch_size:5}/{total_samples:5} "
+    #                     f"({100 * i / len(self.train_loader):3.0f}%)]  "
+    #                     f"Loss_now: {loss.item():6.4f}"
+    #                 )
+
+    #         self.iters += 1
+
+    #         # 记录每个 batch 的 loss 和全局步数
+    #         global_step = epoch * len(self.train_loader) + i
+    #         if self.neptune_run is not None:
+    #             self.neptune_run["train/batch_loss"].append(loss.item(), step=global_step)
+    #             self.neptune_run["train/batch_loss_scale"].append(loss_scale.item(), step=global_step)
+    #             self.neptune_run["train/batch_loss_risk"].append(loss_risk.item(), step=global_step)
+    #             self.neptune_run["train/batch_loss_scale_uncertainty"].append(loss_s_u.item(), step=global_step)
+    #             self.neptune_run["train/batch_loss_risk_uncertainty"].append(loss_r_u.item(), step=global_step)
+    #         current_lr = self.optimizer.param_groups[0]["lr"]
+    #         if self.neptune_run is not None:
+    #             self.neptune_run["train/batch_learning_rate"].append(current_lr, step=global_step)
+        
+    #     avg_loss = epoch_loss / steps
+    #     current_lr = self.optimizer.param_groups[0]["lr"]
+
+    #     if self.neptune_run is not None:
+    #         self.neptune_run["train/epoch_loss"].append(avg_loss, step=epoch)
+    #         self.neptune_run["train/epoch_learning_rate"].append(current_lr, step=epoch)
+
     def train_epoch(self, epoch):
         total_samples = len(self.train_loader.dataset)
         if self.parallel:
@@ -162,12 +299,11 @@ class TTCTrainer(object):
             self.optimizer.zero_grad()
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
             if hasattr(self.model, "module"):
-                scale, risk_score, loss_scale, loss_risk, loss, loss_s_u, loss_r_u = self.model.module.forward_with_loss(
+                scale, loss = self.model.module.forward_with_loss(
                     prev_surr_view_imgs_tensor,
                     curr_surr_view_imgs_tensor,
                     sensor_meta,
                     gt_scale_map_with_mask=gt_scale_map_with_mask,
-                    gt_risk_score_map_with_mask=gt_risk_score_map_with_mask,
                     attn_type=self.attn_type,
                     attn_splits_list=self.attn_splits_list,
                     corr_radius_list=self.corr_radius_list,
@@ -175,12 +311,11 @@ class TTCTrainer(object):
                     num_reg_refine=self.num_reg_refine
                 )
             else:
-                scale, risk_score, loss_scale, loss_risk, loss, loss_s_u, loss_r_u = self.model.forward_with_loss(
+                scale, loss = self.model.forward_with_loss(
                     prev_surr_view_imgs_tensor,
                     curr_surr_view_imgs_tensor,
                     sensor_meta,
                     gt_scale_map_with_mask=gt_scale_map_with_mask,
-                    gt_risk_score_map_with_mask=gt_risk_score_map_with_mask,
                     attn_type=self.attn_type,
                     attn_splits_list=self.attn_splits_list,
                     corr_radius_list=self.corr_radius_list,
@@ -215,19 +350,9 @@ class TTCTrainer(object):
                 pred_valid_mask = scale_np > 0
                 normalized_pred = visual_scale_map_range_image(scale_np, pred_valid_mask)
 
-                # 可视化 risk_score 和 gt_risk_score
-                gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
-                gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
-                normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np)
-
-                risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
-                normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np)
-
                 # 保存可视化结果
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), normalized_pred_risk_score, cmap='seismic', vmin=-1, vmax=1)
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), normalized_gt_risk_score, cmap='seismic', vmin=-1, vmax=1)
 
             # If an auxiliary loss (loss_last) is available, use it for reporting.
             if loss_last is not None:
@@ -255,10 +380,6 @@ class TTCTrainer(object):
             global_step = epoch * len(self.train_loader) + i
             if self.neptune_run is not None:
                 self.neptune_run["train/batch_loss"].append(loss.item(), step=global_step)
-                self.neptune_run["train/batch_loss_scale"].append(loss_scale.item(), step=global_step)
-                self.neptune_run["train/batch_loss_risk"].append(loss_risk.item(), step=global_step)
-                self.neptune_run["train/batch_loss_scale_uncertainty"].append(loss_s_u.item(), step=global_step)
-                self.neptune_run["train/batch_loss_risk_uncertainty"].append(loss_r_u.item(), step=global_step)
             current_lr = self.optimizer.param_groups[0]["lr"]
             if self.neptune_run is not None:
                 self.neptune_run["train/batch_learning_rate"].append(current_lr, step=global_step)

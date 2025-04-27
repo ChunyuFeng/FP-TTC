@@ -165,6 +165,8 @@ def main():
                   num_transformer_layers=args.num_transformer_layers,
                   range_image_feat_shape=[(20, 240), (40, 480)],
                   reg_refine=args.reg_refine,
+                  pretrained_cnet_path="./pretrained/fpttc_mix.pth.tar",
+                  freeze_cnet=True,
                   train=True).cuda()
     
     max_lr = args.lr
