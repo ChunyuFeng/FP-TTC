@@ -49,5 +49,6 @@ if __name__ == "__main__":
     parser.add_argument('--pkl_file_path', type=str, required=True, help="Path to the pkl file.")
     parser.add_argument('--nusc_root', type=str, default='/mnt/data/nuScenes', help="Root directory of the nuScenes dataset.")
     parser.add_argument('--output_dir', type=str, default='/mnt/data/custom_nusc', help="Output directory for copied files.")
+    parser.add_argument('--surr_view_imgs_vis', action='store_true', help="view the raw surrounding images.")
     args = parser.parse_args()
     main(args=args)

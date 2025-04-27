@@ -62,8 +62,11 @@ class FpTTC(nn.Module):
                                     upsample_factor=upsample_factor, reg_refine=reg_refine)
         self.conv_corr_risk = CorrEncoder(dim_in=2, dim_out=feature_channels+1)
         self.risknet = ScaleNet(num_scales=num_scales, feature_channels=feature_channels,
-                                upsample_factor=upsample_factor, num_head=8,
+                                upsample_factor=upsample_factor, num_head=4,
                                 scale_level=num_scales, reg_refine=reg_refine, head_type='risk')
+        
+        self.log_sigma_scale = nn.Parameter(torch.zeros(1))
+        self.log_sigma_risk = nn.Parameter(torch.zeros(1))
 
     def forward(self, img0, img1, sensor_metas,
                 attn_type=None,
@@ -136,8 +139,11 @@ class FpTTC(nn.Module):
         scales, risks = self.forward(img0, img1, sensor_meta, **kwargs)
         loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
         loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
-        loss = loss_s + loss_r
-        return scales, risks, loss_s, loss_r, loss
+        loss = (torch.exp(-self.log_sigma_scale) * loss_s + self.log_sigma_scale +
+                torch.exp(-self.log_sigma_risk)  * loss_r  + self.log_sigma_risk)
+        loss_s_uncertainty = torch.exp(-self.log_sigma_scale) * loss_s + self.log_sigma_scale
+        loss_r_uncertainty = torch.exp(-self.log_sigma_risk) * loss_r + self.log_sigma_risk
+        return scales, risks, loss_s, loss_r, loss, loss_s_uncertainty, loss_r_uncertainty
 
     def extract_feature(self, im0, im1):
         x = torch.cat([im0, im1], dim=0)

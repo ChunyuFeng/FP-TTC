@@ -136,29 +136,15 @@ class ScaleEncoder(nn.Module):
             spatial_shapes, dtype=torch.long, device=feat0_flatten.device)
         level_start_index = torch.cat((spatial_shapes.new_zeros(
             (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-        
 
-        # for i, layer in enumerate(self.layers):
-        #     query = layer(query, value,
-        #                     height=h,
-        #                     width=w,
-        #                     query_location=query_location,
-        #                     spatial_shapes=spatial_shapes,
-        #                     level_start_index=level_start_index,
-        #                     )
-
-        # 所有中间激活包括sampling offsets, attention weights等在前向传播时不会保留，
-        # 在反向传播时会重新计算，已减小显存
-         # Apply checkpointed TransformerBlock layers
-        for layer in self.layers:
-            query = checkpoint(
-                layer,
-                query, value,
-                h, w,
-                query_location,
-                spatial_shapes,
-                level_start_index
-            )
+        for i, layer in enumerate(self.layers):
+            query = layer(query, value,
+                            height=h,
+                            width=w,
+                            query_location=query_location,
+                            spatial_shapes=spatial_shapes,
+                            level_start_index=level_start_index,
+                            )
 
         scale_feat = query.view(bs, height, width, self.d_model).permute(0,3,1,2).contiguous()
 

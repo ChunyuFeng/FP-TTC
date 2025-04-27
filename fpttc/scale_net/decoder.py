@@ -137,17 +137,8 @@ class ScaleDecoder(nn.Module):
         inp = torch.relu(inp)
 
         scale = ini_scale
-        # for l in range(self.num_blocks):
-        #     net, scale_out = self.scale_estimator[l](net, inp, agg_corr, scale)
-        #     if l == 0:
-        #         scale = scale_out
-        #     else:
-        #         scale = scale * scale_out
         for l in range(self.num_blocks):
-            net, scale_out = checkpoint(
-                self.scale_estimator[l],
-                net, inp, agg_corr, scale
-                )
+            net, scale_out = self.scale_estimator[l](net, inp, agg_corr, scale)
             if l == 0:
                 scale = scale_out
             else:

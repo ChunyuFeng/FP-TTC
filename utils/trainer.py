@@ -144,7 +144,7 @@ class TTCTrainer(object):
 
         out_dir = "./log/%s_selfcon_ttc"%(self.time_stamp)
         # save_index = 400 if not self.parallel else random.randint(int(4000/self.batch_size),int(8000/self.batch_size))
-        save_index = 400
+        save_index = 400 if not self.parallel else random.randint(int(400/self.batch_size),int(1200/self.batch_size))
         for i, data in enumerate(self.train_loader):
 
             (prev_surr_view_imgs_tensor,
@@ -162,7 +162,7 @@ class TTCTrainer(object):
             self.optimizer.zero_grad()
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
             if hasattr(self.model, "module"):
-                scale, risk_score, loss_scale, loss_risk, loss = self.model.module.forward_with_loss(
+                scale, risk_score, loss_scale, loss_risk, loss, loss_s_u, loss_r_u = self.model.module.forward_with_loss(
                     prev_surr_view_imgs_tensor,
                     curr_surr_view_imgs_tensor,
                     sensor_meta,
@@ -175,7 +175,7 @@ class TTCTrainer(object):
                     num_reg_refine=self.num_reg_refine
                 )
             else:
-                scale, risk_score, loss_scale, loss_risk, loss = self.model.forward_with_loss(
+                scale, risk_score, loss_scale, loss_risk, loss, loss_s_u, loss_r_u = self.model.forward_with_loss(
                     prev_surr_view_imgs_tensor,
                     curr_surr_view_imgs_tensor,
                     sensor_meta,
@@ -257,6 +257,8 @@ class TTCTrainer(object):
                 self.neptune_run["train/batch_loss"].append(loss.item(), step=global_step)
                 self.neptune_run["train/batch_loss_scale"].append(loss_scale.item(), step=global_step)
                 self.neptune_run["train/batch_loss_risk"].append(loss_risk.item(), step=global_step)
+                self.neptune_run["train/batch_loss_scale_uncertainty"].append(loss_s_u.item(), step=global_step)
+                self.neptune_run["train/batch_loss_risk_uncertainty"].append(loss_r_u.item(), step=global_step)
             current_lr = self.optimizer.param_groups[0]["lr"]
             if self.neptune_run is not None:
                 self.neptune_run["train/batch_learning_rate"].append(current_lr, step=global_step)
