@@ -188,6 +188,13 @@ class FpTTC(nn.Module):
         self.scalenet = ScaleNet(num_scales=num_scales, feature_channels=feature_channels,
                                  upsample_factor=upsample_factor, num_head=4,
                                  scale_level=num_scales, reg_refine=reg_refine, head_type='scale')
+        
+        self.risknet = ScaleNet(num_scales=num_scales, feature_channels=feature_channels,
+                                 upsample_factor=upsample_factor, num_head=4,
+                                 scale_level=num_scales, reg_refine=reg_refine, head_type='risk')
+        
+        self.log_sigma_scale = nn.Parameter(torch.zeros(1))
+        self.log_sigma_risk = nn.Parameter(torch.zeros(1))
     
     def _load_pretrained_cnet(self, ckpt_path: str, freeze: bool):
         """
@@ -204,7 +211,7 @@ class FpTTC(nn.Module):
         else:
             raw_state = ckpt
 
-        # 2) 筛选出 only cnet keys
+        # 2) 筛选出 cnet keys
         enc_state = {}
         for k, v in raw_state.items():
             # 可能的前缀有："module.cnet." 或 "cnet."
@@ -223,7 +230,7 @@ class FpTTC(nn.Module):
         if unexpected:
             print(f"[WARN] cnet unexpected keys: {unexpected}")
 
-        # 4) 可选冻结
+        # 4) freeze cnet 参数
         if freeze:
             for p in self.cnet.parameters():
                 p.requires_grad = False
@@ -274,15 +281,24 @@ class FpTTC(nn.Module):
         corr_enc_s = corr_enc_s[:, 1:]
         scales = self.scalenet(corr_enc_s, mlvl_s0, mlvl_s1, ini_scale)
 
+        corr_enc_r = self.conv_corr_scale(corr_s)
+        ini_risk = corr_enc_r[:, :1]
+        corr_enc_r = corr_enc_r[:, 1:]
+        risk_score = self.risknet(corr_enc_r, mlvl_s0, mlvl_s1, ini_risk)
+
         del corr_s, mlvl_s0, mlvl_s1
 
-        return scales
+        return scales, risk_score
 
     def forward_with_loss(self, img0, img1, sensor_meta,
-                          gt_scale_map_with_mask, **kwargs):
-        scales = self.forward(img0, img1, sensor_meta, **kwargs)
-        loss = get_loss_scale_map(scales, gt_scale_map_with_mask)
-        return scales, loss
+                          gt_scale_map_with_mask, gt_risk_score_map_with_mask, **kwargs):
+        scales, risk_score = self.forward(img0, img1, sensor_meta, **kwargs)
+        loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
+        loss_r = get_loss_risk_score_map(risk_score, gt_risk_score_map_with_mask)
+        loss_s_term = 0.5 * torch.exp(-2.0 * self.log_sigma_scale) * loss_s + self.log_sigma_scale
+        loss_r_term = 0.5 * torch.exp(-2.0 * self.log_sigma_risk) * loss_r + self.log_sigma_risk
+        loss = loss_s_term + loss_r_term
+        return scales, risk_score, loss_s, loss_s_term, loss_r, loss_r_term, loss
 
     def extract_feature(self, im0, im1):
         x = torch.cat([im0, im1], dim=0)

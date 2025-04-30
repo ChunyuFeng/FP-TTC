@@ -71,6 +71,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load a pkl file and print its content.")
+    parser.add_argument('--pkl_file_path', type=str, required=True, help="Path to the pkl file.")
     parser.add_argument('--vis_dir', type=str, default='/mnt/data/fpttc_ground_truth/3_visualization/raw_surround_view_imgs/160_1920',
                         help="Directory to save visualizations.")
     args = parser.parse_args()

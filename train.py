@@ -166,15 +166,44 @@ def main():
                   range_image_feat_shape=[(20, 240), (40, 480)],
                   reg_refine=args.reg_refine,
                   pretrained_cnet_path="./pretrained/fpttc_mix.pth.tar",
-                  freeze_cnet=True,
+                  freeze_cnet=False,
                   train=True).cuda()
     
     max_lr = args.lr
     ini_lr = max_lr / 25
     min_lr = ini_lr / 1e4
 
-    optimizer = torch.optim.AdamW([{"params":model.parameters(), "max_lr":max_lr, "initial_lr":ini_lr, "min_lr":min_lr}],\
-                                     lr=max_lr, weight_decay=args.weight_decay)
+    # optimizer = torch.optim.AdamW([{"params":model.parameters(), "max_lr":max_lr, "initial_lr":ini_lr, "min_lr":min_lr}],\
+    #                                  lr=max_lr, weight_decay=args.weight_decay)
+    
+    ########################### 微调 cnet ############################
+    net = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    
+    # 为 cnet 设置更小的学习率，仅仅微调
+    cnet_lr = max_lr * 0.1
+    cnet_ini_lr = ini_lr * 0.1
+    cnet_min_lr = min_lr * 0.1
+
+    other_lr = max_lr
+    other_ini_lr = ini_lr
+    other_min_lr = min_lr
+
+    optimizer = torch.optim.AdamW([
+        {
+            "params": net.cnet.parameters(),
+            "max_lr": cnet_lr,
+            "initial_lr": cnet_ini_lr,
+            "min_lr": cnet_min_lr
+        },
+        {
+            "params": [p for n,p in net.named_parameters() if not n.startswith("cnet.")],
+            "max_lr": other_lr,
+            "initial_lr": other_ini_lr,
+            "min_lr": other_min_lr
+        },
+    ],
+    lr=max_lr, weight_decay=args.weight_decay)
+    ########################### 微调 cnet ############################
 
     epoch = 0
 

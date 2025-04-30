@@ -496,11 +496,6 @@ def main(args):
             plt.imsave(os.path.join(risk_score_vis_save_path, risk_score_vis_name),
                        normalized_risk_score, cmap='seismic', vmin=-1, vmax=1)
 
-            # # 使用 seismic 色表可视化 proj_risk_score_normalized
-            # plt.imshow(normalized_risk_score, cmap='seismic', vmin=-1, vmax=1)
-            # plt.colorbar(label='Risk Score')
-            # plt.title('Risk Score Visualization')
-            # plt.show()
                 
         if args.scale_map_vis:
             scale_display = np.copy(proj_scale)
@@ -563,14 +558,6 @@ def main(args):
     # 对 camera_lut 和 lidar_data_matched_with_images 
     print(f"Succesfully created (Surround View Images Pair & Lidar Sample Data Pair & Scene Flow & Scale Map & Depth Map & Risk Score Map). \
           Sorted by timestamp. {len(trainval_infos)} items in total.")
-
-    # 将 trainval_test_infos 保存为 pickle 文件
-    # pkl_data = dict(infos=trainval_infos)
-    # if not os.path.exists(args.pkl_save_path):
-    #     os.makedirs(args.pkl_save_path)
-    # with open(os.path.join(args.pkl_save_path, f"dict_nusc_trainval_infos_{args.image_size[0]}_{args.image_size[1]*6}.pkl"), 'wb') as f:
-    #     pickle.dump(pkl_data, f)
-    # print(f"Saved dict_nusc_trainval_infos.pkl to {args.pkl_save_path}")
 
     with open(os.path.join(args.pkl_save_path, f"nusc_trainval_infos_{args.image_size[0]}_{args.image_size[1]*6}.pkl"), 'wb') as f:
         pickle.dump(trainval_infos, f)

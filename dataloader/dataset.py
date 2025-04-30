@@ -693,11 +693,15 @@ class nuScenes_range_image(data.Dataset):
         gt_risk_score_map = torch.from_numpy(gt_risk_score_map).float()
         gt_depth_map = torch.from_numpy(gt_depth_map).float()
 
-        mask = gt_scale_map > 0
+        # scale 取 (0.3, 3.0) 之间的值
+        mask_scale = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
+        # risk score & depth 取相同的 mask
+        mask_risk_score = mask_scale
+        mask_depth = mask_scale
         # 拼接gt_scale和mask
-        gt_scale_map_with_mask = torch.cat((gt_scale_map.unsqueeze(0), mask.unsqueeze(0).float()), dim=0)
-        gt_risk_score_map_with_mask = torch.cat((gt_risk_score_map.unsqueeze(0), mask.unsqueeze(0).float()), dim=0)
-        gt_depth_map_with_mask = torch.cat((gt_depth_map.unsqueeze(0), mask.unsqueeze(0).float()), dim=0)
+        gt_scale_map_with_mask = torch.cat((gt_scale_map.unsqueeze(0), mask_scale.unsqueeze(0).float()), dim=0)
+        gt_risk_score_map_with_mask = torch.cat((gt_risk_score_map.unsqueeze(0), mask_risk_score.unsqueeze(0).float()), dim=0)
+        gt_depth_map_with_mask = torch.cat((gt_depth_map.unsqueeze(0), mask_depth.unsqueeze(0).float()), dim=0)
 
         return (prev_surr_view_imgs_tensor,
                 curr_surr_view_imgs_tensor,

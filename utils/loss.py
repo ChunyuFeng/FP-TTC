@@ -304,47 +304,33 @@ def get_loss_scale_map(scale, gt_scale_with_mask):
     # 移除单个维度，使所有张量形状为 (320, 640)
     scale = scale.squeeze(1)  # 将形状从 [batch_size, 1, H, W] 压缩为 [batch_size, H, W]
     gt_scale = gt_scale_with_mask[:,0,:,:]
-    valid = gt_scale_with_mask[:,1,:,:].bool()
+    mask = gt_scale_with_mask[:,1,:,:].bool()
 
-    gt_scale = torch.nan_to_num(gt_scale, nan=10)
-
-    # 处理 gt_scale 的有效范围
-    gt_scale[gt_scale <= 0] = 10
-    gt_scale[gt_scale > 3] = 10
-
-    # 创建有效的深度变化掩膜
-    maskdc = (gt_scale < 3) & (gt_scale > 0.3) & valid & (scale > 0)
-
-    if maskdc.sum() == 0:
-        return scale.sum() * 0.0  # 返回 0 作为损失
-
+    if mask.sum() == 0:
+        return scale.sum() * 0.0
+    
     # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
     epsilon = 1e-6  # 预防性的小值
     scale = torch.clamp(scale, min=epsilon)
     gt_scale = torch.clamp(gt_scale, min=epsilon)
 
     # 计算 scale loss
-    d_loss = (scale.log() - gt_scale.log()).abs()
+    loss = (scale.log() - gt_scale.log()).abs()
+    loss = loss[mask].mean()
 
-    # sloss = (maskdc * d_loss).sum() / maskdc.sum()
-    sloss = d_loss[maskdc].mean()
-    # 返回 sloss 作为最终的损失
-    return sloss
+    return loss
 
 def get_loss_risk_score_map(risk_score, gt_risk_score_with_mask):
     # 移除单个维度，使所有张量形状为 (B, H, W)
     risk_score = risk_score.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
     gt_risk_score = gt_risk_score_with_mask[:, 0, :, :]
-    valid_mask = gt_risk_score_with_mask[:, 1, :, :].bool()
+    mask = gt_risk_score_with_mask[:, 1, :, :].bool()
+
+    # 如果没有有效区域，则返回可导的 0（避免断梯度）
+    if mask.sum() == 0:
+        return risk_score.sum() * 0.0
 
     criterion = torch.nn.MSELoss(reduction='mean')
     
-    # 如果没有有效区域，则返回可导的 0（避免断梯度）
-    if valid_mask.sum() == 0:
-        return (risk_score * 0.0).sum()
-    
-    risk_score_valid = risk_score[valid_mask]
-    gt_risk_score_valid = gt_risk_score[valid_mask]
-    
-    loss = criterion(risk_score_valid, gt_risk_score_valid)
+    loss = criterion(risk_score[mask], gt_risk_score[mask])
     return loss
