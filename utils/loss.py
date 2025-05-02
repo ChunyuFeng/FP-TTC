@@ -308,14 +308,19 @@ def get_loss_scale_map(scale, gt_scale_with_mask):
 
     if mask.sum() == 0:
         return scale.sum() * 0.0
+        print("[WARN]:Scale branch no valid area, return 0 loss")
     
+    with torch.no_grad():
+        print("scale before clamp:", scale.min().item(), scale.max().item())
+
+    # mask = mask & (scale>0)   
     # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
-    epsilon = 1e-6  # 预防性的小值
-    scale = torch.clamp(scale, min=epsilon)
-    gt_scale = torch.clamp(gt_scale, min=epsilon)
+    epsilon = 1e-12  # 预防性的小值
+    log_scale = torch.log(scale + epsilon)
+    log_gt_scale = torch.log(gt_scale + epsilon)
 
     # 计算 scale loss
-    loss = (scale.log() - gt_scale.log()).abs()
+    loss = (log_scale - log_gt_scale).abs()
     loss = loss[mask].mean()
 
     return loss
@@ -329,6 +334,7 @@ def get_loss_risk_score_map(risk_score, gt_risk_score_with_mask):
     # 如果没有有效区域，则返回可导的 0（避免断梯度）
     if mask.sum() == 0:
         return risk_score.sum() * 0.0
+        print("[WARN]:Risk score branch no valid area, return 0 loss")
 
     criterion = torch.nn.MSELoss(reduction='mean')
     

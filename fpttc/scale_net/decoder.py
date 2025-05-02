@@ -13,7 +13,9 @@ class RiskHead(nn.Module):
         self.conv2 = nn.Conv2d(hidden_dim, 1, 3, padding=1)
 
     def forward(self, x):
-        return self.conv2(self.relu(self.conv1(x)))
+        x = self.relu(self.conv1(x))
+        raw = self.conv2(x)
+        return F.softplus(raw) + 1e-3
 
 class ScaleHead(nn.Module):
     def __init__(self, input_dim=128, hidden_dim=256):
@@ -142,7 +144,7 @@ class ScaleDecoder(nn.Module):
             if l == 0:
                 scale = scale_out
             else:
-                scale = scale * scale_out
+                scale = scale + scale_out
 
         scale_f = self.upsample_scale(scale, cfeat0)
         return scale_f

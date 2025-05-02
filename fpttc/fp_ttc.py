@@ -81,8 +81,8 @@ class FpTTC(nn.Module):
                                 upsample_factor=upsample_factor, num_head=4,
                                 scale_level=num_scales, reg_refine=reg_refine, head_type='risk')
         
-        self.log_sigma_scale = nn.Parameter(torch.zeros(1))
-        self.log_sigma_risk = nn.Parameter(torch.zeros(1))
+        # self.log_sigma_scale = nn.Parameter(torch.zeros(1))
+        # self.log_sigma_risk = nn.Parameter(torch.zeros(1))
     
     def _load_pretrained_cnet(self, ckpt_path: str, freeze: bool):
         """
@@ -164,8 +164,8 @@ class FpTTC(nn.Module):
             corr_s, _ = self.corrnet_scale(f0_s, f1_s, lvl, corr_radius_list, prop_radius_list, num_reg_refine, False, corr_s)
             if lvl < self.num_scales - 1:
                 corr_s = F.interpolate(corr_s, scale_factor=2, mode='bilinear', align_corners=True) * 2
-        corr_enc_s = F.relu(self.conv_corr_scale(corr_s))
-        ini_scale = corr_enc_s[:, :1]
+        corr_enc_s = self.conv_corr_scale(corr_s)
+        ini_scale = F.softplus(corr_enc_s[:, :1]) + 1e-3
         corr_enc_s = corr_enc_s[:, 1:]
         scales = self.scalenet(corr_enc_s, mlvl_s0, mlvl_s1, ini_scale)
 
@@ -211,10 +211,10 @@ class FpTTC(nn.Module):
         scales, risks = self.forward(img0, img1, sensor_meta, **kwargs)
         loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
         loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
-        loss_s_term = torch.exp(-2 * self.log_sigma_scale) * loss_s + 2 * self.log_sigma_scale
-        loss_r_term = torch.exp(-2 * self.log_sigma_risk)  * loss_r + 2 * self.log_sigma_risk
-        loss = 0.5 * (loss_s_term + loss_r_term)
-        return scales, risks, loss_s, loss_s_term, loss_r, loss_r_term, loss
+        # loss_s_term = torch.exp(-2 * self.log_sigma_scale) * loss_s + 2 * self.log_sigma_scale
+        # loss_r_term = torch.exp(-2 * self.log_sigma_risk)  * loss_r + 2 * self.log_sigma_risk
+        # loss = 0.5 * (loss_s_term + loss_r_term)
+        return scales, risks, loss_s, loss_r
 
     def extract_feature(self, im0, im1, branch):
         x = torch.cat([im0, im1], dim=0)
