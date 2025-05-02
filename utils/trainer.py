@@ -186,10 +186,23 @@ class TTCTrainer(object):
             gt_scale_map_with_mask = gt_scale_map_with_mask.to(self.device)
             gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.to(self.device)
 
+
+            # with torch.no_grad():
+            #     dummy = torch.randn(1,6,3,160,320).to(self.device)
+            #     dummy_scale, dummy_risk = self.model(dummy, dummy, sensor_meta,
+            #                         attn_type=self.attn_type,
+            #                         attn_splits_list=self.attn_splits_list,
+            #                         corr_radius_list=self.corr_radius_list,
+            #                         prop_radius_list=self.prop_radius_list,
+            #                         num_reg_refine=self.num_reg_refine,
+            #                         testing=True,
+            #                         )
+            #     print(">>> dummy test scale:", dummy_scale.min().item(), dummy_scale.max().item())
+            #     print(">>> dummy test risk:", dummy_risk.min().item(), dummy_risk.max().item())
             self.optimizer.zero_grad()
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
             if hasattr(self.model, "module"):
-                scale, risk_score, loss_s, loss_s_term, loss_r, loss_r_term, loss = self.model.module.forward_with_loss(
+                scale, risk_score, loss_s, loss_r = self.model.module.forward_with_loss(
                     prev_surr_view_imgs_tensor,
                     curr_surr_view_imgs_tensor,
                     sensor_meta,
@@ -202,7 +215,7 @@ class TTCTrainer(object):
                     num_reg_refine=self.num_reg_refine
                 )
             else:
-                scale, risk_score, loss_s, loss_s_term, loss_r, loss_r_term, loss = self.model.forward_with_loss(
+                scale, risk_score, loss_s, loss_r = self.model.forward_with_loss(
                     prev_surr_view_imgs_tensor,
                     curr_surr_view_imgs_tensor,
                     sensor_meta,
@@ -217,9 +230,51 @@ class TTCTrainer(object):
 
             loss_last = None
 
-            gt_scale = gt_scale_map_with_mask[:,0,:,:]
-            # gt_scale = torch.nan_to_num(gt_scale, nan=0.0)
-            gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]
+            # —— 1. 定义各自参数关键字 —— 
+            scale_keys = [
+                "featnet_scale",
+                "corrnet_scale",
+                "conv_corr_scale",
+                "scale_net"
+            ]
+            risk_keys = [k.replace("scale", "risk") for k in scale_keys]
+
+            # —— 2. 收集参数 —— 
+            # 如果用了 DataParallel/DistributedDataParallel 要取 self.model.module
+            model_ref = getattr(self.model, "module", self.model)
+            scale_params = [
+                p for n, p in model_ref.named_parameters()
+                if any(k in n for k in scale_keys)
+            ]
+            risk_params = [
+                p for n, p in model_ref.named_parameters()
+                if any(k in n for k in risk_keys)
+            ]
+
+            # —— 3. 只计算各自分支的梯度（保留图） —— 
+            grads_s = torch.autograd.grad(loss_s, scale_params,
+                                          retain_graph=True, allow_unused=True)
+            grads_r = torch.autograd.grad(loss_r,  risk_params,
+                                          retain_graph=True, allow_unused=True)
+            
+            # for p, g in zip(scale_params, grads_s):
+            #     print(p.shape, "→ grad is", None if g is None else g.norm().item())
+            
+            grads_s = [g if g is not None else torch.zeros_like(p)
+                       for g, p in zip(grads_s, scale_params)]
+            grads_r = [g if g is not None else torch.zeros_like(p)
+                       for g, p in zip(grads_r, risk_params)]
+
+            norm_s = torch.sqrt(sum((g**2).sum() for g in grads_s))
+            norm_r = torch.sqrt(sum((g**2).sum() for g in grads_r))
+
+            # —— 4. 反比权重 —— 
+            eps = 1e-6
+            w_s = norm_r / (norm_s + norm_r + eps)
+            w_r = norm_s / (norm_s + norm_r + eps)
+
+            # —— 5. 合并 loss, 反向并更新 —— 
+            loss = w_s * loss_s + w_r * loss_r
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
@@ -227,6 +282,9 @@ class TTCTrainer(object):
             self.lr_scheduler3.step()
             epoch_loss += loss.item()
             steps += 1
+
+            gt_scale = gt_scale_map_with_mask[:,0,:,:]
+            gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]
 
             if type(scale) == list:
                 scale = scale[-1]
@@ -283,19 +341,19 @@ class TTCTrainer(object):
                 self.neptune_run["train/batch_loss"].append(loss.item(), step=global_step)
                 self.neptune_run["train/batch_loss_scale"].append(loss_s.item(), step=global_step)
                 self.neptune_run["train/batch_loss_risk"].append(loss_r.item(), step=global_step)
-                self.neptune_run["train/batch_loss_scale_uncertainty"].append(loss_s_term.item(), step=global_step)
-                self.neptune_run["train/batch_loss_risk_uncertainty"].append(loss_r_term.item(), step=global_step)
+                # self.neptune_run["train/batch_loss_scale_uncertainty"].append(loss_s_term.item(), step=global_step)
+                # self.neptune_run["train/batch_loss_risk_uncertainty"].append(loss_r_term.item(), step=global_step)
             if self.neptune_run is not None and is_main_process(self.parallel):
-                for i, pg in enumerate(self.optimizer.param_groups):
-                    tag = f"train/batch_learning_rate_group_{i}"
+                for group_idx, pg in enumerate(self.optimizer.param_groups):
+                    tag = f"train/batch_learning_rate_group_{group_idx}"
                     self.neptune_run[tag].append(pg["lr"], step=global_step)
         
         avg_loss = epoch_loss / steps
 
         if self.neptune_run is not None and is_main_process(self.parallel):
             self.neptune_run["train/epoch_loss"].append(avg_loss, step=epoch)
-            for i, pg in enumerate(self.optimizer.param_groups):
-                tag = f"train/epoch_learning_rate_group_{i}"
+            for group_idx, pg in enumerate(self.optimizer.param_groups):
+                tag = f"train/epoch_learning_rate_group_{group_idx}"
                 self.neptune_run[tag].append(pg["lr"], step=epoch)
         
     @torch.no_grad()
