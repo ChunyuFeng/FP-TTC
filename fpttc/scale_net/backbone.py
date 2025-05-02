@@ -80,6 +80,14 @@ class CNNEncoder(nn.Module):
                                                       paddings=1,
                                                       num_branch=self.num_branch,
                                                       )
+        
+        # # 不同的分支分别归一化
+        # self.final_norm_scale = norm_layer(output_dim)
+        # self.final_norm_risk  = norm_layer(output_dim)
+
+        self.final_norm_scale = nn.InstanceNorm2d(output_dim, affine=True, track_running_stats=False)
+        self.final_norm_risk  = nn.InstanceNorm2d(output_dim, affine=True, track_running_stats=False)
+
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -99,7 +107,7 @@ class CNNEncoder(nn.Module):
         self.in_planes = dim
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, branch=None):
         x = self.conv1(x)
         x = self.norm1(x)
         x = self.relu1(x)
@@ -111,8 +119,19 @@ class CNNEncoder(nn.Module):
         x = self.conv2(x)
 
         if self.num_branch > 1:
-            out = self.trident_conv([x] * self.num_branch)  # high to low res
+            feats = self.trident_conv([x] * self.num_branch)  # high to low res
         else:
-            out = [x]
+            feats = [x]
+        
+        if branch is None:
+            return feats
+        
+        # —— 分支归一化 —— 
+        out = []
+        for f in feats:
+            if branch == "scale":
+                out.append(self.final_norm_scale(f))
+            else:
+                out.append(self.final_norm_risk(f))
 
         return out

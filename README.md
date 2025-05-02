@@ -81,6 +81,25 @@ We use 3090 GPUs for training and testing.
 sh train.sh
 ```
 
+```
+CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=8 torchrun --standalone --nnodes=1 --nproc_per_node=4 train.py \
+--padding_factor 32 \
+--upsample_factor 4 \
+--num_scales 2 \
+--attn_splits_list 2 8 \
+--corr_radius_list -1 4 \
+--prop_radius_list -1 1 \
+--epoch 2000 \
+--lr 4e-5 \
+--batch_size 6 \
+--stage 'nuscenes_range_image' \
+--image_size 160 320 \
+--parallel \
+--load_cnet \
+--load_cnet_path './pretrained/fpttc_mix.pth.tar' \
+--freeze_cnet
+```
+
 
 
 ### inference with your own data
@@ -155,3 +174,11 @@ KITTI:
     - [x]  ~~不用做归一化，分析了 risk 的值，值域为 $(-2.5, 2.12)$~~
 - [x]  不再freeze，对cnet参数进行微调。
 - [ ]  scale的无效值设置为1，risk score的无效值设置为0，计算loss时不加mask，是否可以将空白区域也学习出来？
+- [ ]  数据预处理中，增加数据的随机旋转等图像增强；
+- [x]  只在主卡打印关键日志；
+- [x]  只在主卡输出neptune信息
+- [ ]  使用小数据集进行测试
+  - [ ]  目前选取了scene_indice=4的120条数据进行训练
+- [ ]  目前用1059组数据，4卡，bs=6，lr=3e-4会收敛很快，但是触底震荡；- 测试一下完整的训练过程；
+- [ ]  现在采用120组数据，4卡，bs=6，lr=1e-4实验；
+

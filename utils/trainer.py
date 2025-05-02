@@ -24,6 +24,11 @@ from .loss import get_loss, get_loss_multi, get_loss_nusc, get_loss_mix, get_los
 from .draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_image, visual_risk_score_map_range_image
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
 
+def is_main_process(parallel: bool) -> bool:
+    if not parallel:
+        return True
+    return dist.get_rank() == 0
+
 class TTCTrainer(object):
     def __init__(self, model, dataset, optimizer, args, device, model_path = None, 
                 start_epoch=0, parallel=False, time_stamp=None, max_lr=1e-4, crop_size=[352,1152],
@@ -53,16 +58,30 @@ class TTCTrainer(object):
         starte = -1
         if self.start_epoch>0:
             starte = self.start_epoch - 1
-        self.lr_scheduler3 = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=[max_lr*0.1, max_lr], # 微调 cnet 的学习率，以及其他模型正常学习率
-            epochs=self.epoch,
-            steps_per_epoch=steps_per_epoch,
-            pct_start=0.05,
-            cycle_momentum=False,
-            anneal_strategy='cos',
-            last_epoch=max(steps_per_epoch*starte,-1),
-        )
+        
+        if args.load_cnet and args.fine_tune_cnet:
+            self.lr_scheduler3 = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=[max_lr*0.1, max_lr], # 微调 cnet 的学习率，以及其他模型正常学习率
+                epochs=self.epoch,
+                steps_per_epoch=steps_per_epoch,
+                pct_start=0.05,
+                cycle_momentum=False,
+                anneal_strategy='cos',
+                last_epoch=max(steps_per_epoch*starte,-1),
+            )
+        else:
+            self.lr_scheduler3 = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=max_lr,
+                epochs=self.epoch,
+                steps_per_epoch=steps_per_epoch,
+                pct_start=0.05,
+                cycle_momentum=False,
+                anneal_strategy='cos',
+                last_epoch=max(steps_per_epoch*starte,-1),
+            )
+
         # self.lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, \
         #                 milestones=[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 105, 110,\
         #                 115, 120, 125, 130, 135, 140, 145, 160, 170, 180, 190, 200, 210], gamma=0.5, last_epoch=max((self.start_epoch-1),-1))
@@ -110,10 +129,14 @@ class TTCTrainer(object):
 
     def train(self):
         out_dir = "./log/%s_selfcon_ttc"%(self.time_stamp)
-        print("Learning rate: ", self.optimizer.state_dict()['param_groups'][0]['lr'])
+
+        if is_main_process(self.parallel):
+            for i, pg in enumerate(self.optimizer.param_groups):
+                print(f"  param group {i} lr = {pg['lr']:.3e}")
 
         for epoch in range(self.start_epoch, self.epoch):
-            print('Epoch:', epoch)
+            if is_main_process(self.parallel):
+                print('Epoch:', epoch)
             self.loss_per_epoch = 0
             self.loss_sum_per_epoch = 0
             self.iters = 0
@@ -130,9 +153,11 @@ class TTCTrainer(object):
                     # # 用当前的时间戳为模型保存路径命名
                     temp_pth = os.path.join(out_dir, f'{epoch}y.pth.tar')
                     torch.save(checkpoint, temp_pth)
+                if is_main_process(self.parallel):
+                    print("Loss in epoch", epoch, ":", self.loss_per_epoch / max(1, self.iters))
+                    for i, pg in enumerate(self.optimizer.param_groups):
+                        print(f"  param group {i} lr = {pg['lr']:.3e}")
 
-                print("Loss in epoch", epoch, ":", self.loss_per_epoch / max(1, self.iters))
-                print("Learning rate: ", self.optimizer.state_dict()['param_groups'][0]['lr'])
     
     def train_epoch(self, epoch):
         total_samples = len(self.train_loader.dataset)
@@ -145,7 +170,8 @@ class TTCTrainer(object):
 
         out_dir = "./log/%s_selfcon_ttc"%(self.time_stamp)
         # save_index = 400 if not self.parallel else random.randint(int(4000/self.batch_size),int(8000/self.batch_size))
-        save_index = 400 if not self.parallel else random.randint(int(400/self.batch_size),int(1200/self.batch_size))
+        # save_index = 400 if not self.parallel else random.randint(int(400/self.batch_size),int(1200/self.batch_size))
+        save_index = 1000
         for i, data in enumerate(self.train_loader):
 
             (prev_surr_view_imgs_tensor,
@@ -199,13 +225,12 @@ class TTCTrainer(object):
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             self.optimizer.step()
             self.lr_scheduler3.step()
-
             epoch_loss += loss.item()
             steps += 1
 
             if type(scale) == list:
                 scale = scale[-1]
-            if i%int(save_index)==0:
+            if i%int(save_index)==0 and is_main_process(self.parallel):
 
                 # 可视化 prediction_scale 和 gt_scale
                 gt_scale_np = gt_scale[:1].detach().squeeze(0).cpu().numpy()
@@ -234,7 +259,7 @@ class TTCTrainer(object):
             if loss_last is not None:
                 self.loss_per_epoch += loss.item()
                 self.loss_sum_per_epoch += loss_last.item()
-                if i % 10 == 0:
+                if i % 10 == 0 and is_main_process(self.parallel):
                     print(
                         f"[{i * self.train_loader.batch_size:5}/{total_samples:5} "
                         f"({100 * i / len(self.train_loader):3.0f}%)]  "
@@ -243,7 +268,7 @@ class TTCTrainer(object):
                     )
             else:
                 self.loss_per_epoch += loss.item()
-                if i % 10 == 0:
+                if i % 10 == 0 and is_main_process(self.parallel):
                     print(
                         f"[{i * self.train_loader.batch_size:5}/{total_samples:5} "
                         f"({100 * i / len(self.train_loader):3.0f}%)]  "
@@ -254,22 +279,24 @@ class TTCTrainer(object):
 
             # 记录每个 batch 的 loss 和全局步数
             global_step = epoch * len(self.train_loader) + i
-            if self.neptune_run is not None:
+            if self.neptune_run is not None and is_main_process(self.parallel):
                 self.neptune_run["train/batch_loss"].append(loss.item(), step=global_step)
                 self.neptune_run["train/batch_loss_scale"].append(loss_s.item(), step=global_step)
                 self.neptune_run["train/batch_loss_risk"].append(loss_r.item(), step=global_step)
                 self.neptune_run["train/batch_loss_scale_uncertainty"].append(loss_s_term.item(), step=global_step)
                 self.neptune_run["train/batch_loss_risk_uncertainty"].append(loss_r_term.item(), step=global_step)
-            current_lr = self.optimizer.param_groups[0]["lr"]
-            if self.neptune_run is not None:
-                self.neptune_run["train/batch_learning_rate"].append(current_lr, step=global_step)
+            if self.neptune_run is not None and is_main_process(self.parallel):
+                for i, pg in enumerate(self.optimizer.param_groups):
+                    tag = f"train/batch_learning_rate_group_{i}"
+                    self.neptune_run[tag].append(pg["lr"], step=global_step)
         
         avg_loss = epoch_loss / steps
-        current_lr = self.optimizer.param_groups[0]["lr"]
 
-        if self.neptune_run is not None:
+        if self.neptune_run is not None and is_main_process(self.parallel):
             self.neptune_run["train/epoch_loss"].append(avg_loss, step=epoch)
-            self.neptune_run["train/epoch_learning_rate"].append(current_lr, step=epoch)
+            for i, pg in enumerate(self.optimizer.param_groups):
+                tag = f"train/epoch_learning_rate_group_{i}"
+                self.neptune_run[tag].append(pg["lr"], step=epoch)
         
     @torch.no_grad()
     def eval_epoch(self, eval_path='/mnt/pool/lcl/data/kitti/data_scene_flow/training/'):

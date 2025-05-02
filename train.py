@@ -70,7 +70,6 @@ parser.add_argument('--num_scales', default=1, type=int,
 parser.add_argument('--num_head', default=1, type=int)
 parser.add_argument('--feature_channels', default=128, type=int)
 parser.add_argument('--upsample_factor', default=8, type=int)
-parser.add_argument('-- ', default=1, type=int)
 parser.add_argument('--ffn_dim_expansion', default=4, type=int)
 parser.add_argument('--num_transformer_layers', default=6, type=int)
 parser.add_argument('--reg_refine', action='store_true',
@@ -135,10 +134,20 @@ parser.add_argument('--count_time', action='store_true',
 
 parser.add_argument('--debug', action='store_true')
 
-parser.add_argument('--train_location', type=str, default='local', choices=['local', 'remote-eden'],
-                    help='Specify the training location. If "local", data will be stored in the local directory; if "remote", data will be stored in the remote specific path.')
+# 加载预训练的cnet
+parser.add_argument('--load_cnet', action='store_true',
+                    help='load pretrained cnet')
+parser.add_argument('--load_cnet_path', default='./pretrained/fpttc_mix.pth.tar', type=str,
+                    help='load pretrained cnet path')
+parser.add_argument('--freeze_cnet', action='store_true',
+                    help='freeze cnet')
+parser.add_argument('--fine_tune_cnet', action='store_true',
+                    help='fine tune cnet')
+
 
 args = parser.parse_args()
+if args.freeze_cnet and args.fine_tune_cnet:
+    raise ValueError("freeze_cnet and fine_tune_cnet cannot be used simultaneously")
 
 if args.parallel:
     dist.init_process_group(backend="nccl")
@@ -153,9 +162,10 @@ else:
 
 def main():
 
-    run = neptune.init_run(
-        project="fengchunyu/FPTTC"
-    )
+    if (not args.parallel) or dist.get_rank() == 0:
+        run = neptune.init_run(project="fengchunyu/FPTTC")
+    else:
+        run = None
 
     model = FpTTC(num_scales=args.num_scales,
                   feature_channels=args.feature_channels,
@@ -165,45 +175,54 @@ def main():
                   num_transformer_layers=args.num_transformer_layers,
                   range_image_feat_shape=[(20, 240), (40, 480)],
                   reg_refine=args.reg_refine,
-                  pretrained_cnet_path="./pretrained/fpttc_mix.pth.tar",
-                  freeze_cnet=False,
+                  load_cnet=args.load_cnet,
+                  pretrained_cnet_path=args.load_cnet_path,
+                  freeze_cnet=args.freeze_cnet,
                   train=True).cuda()
     
     max_lr = args.lr
     ini_lr = max_lr / 25
     min_lr = ini_lr / 1e4
 
-    # optimizer = torch.optim.AdamW([{"params":model.parameters(), "max_lr":max_lr, "initial_lr":ini_lr, "min_lr":min_lr}],\
-    #                                  lr=max_lr, weight_decay=args.weight_decay)
-    
-    ########################### 微调 cnet ############################
-    net = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    
-    # 为 cnet 设置更小的学习率，仅仅微调
-    cnet_lr = max_lr * 0.1
-    cnet_ini_lr = ini_lr * 0.1
-    cnet_min_lr = min_lr * 0.1
-
-    other_lr = max_lr
-    other_ini_lr = ini_lr
-    other_min_lr = min_lr
-
     optimizer = torch.optim.AdamW([
         {
-            "params": net.cnet.parameters(),
-            "max_lr": cnet_lr,
-            "initial_lr": cnet_ini_lr,
-            "min_lr": cnet_min_lr
-        },
-        {
-            "params": [p for n,p in net.named_parameters() if not n.startswith("cnet.")],
-            "max_lr": other_lr,
-            "initial_lr": other_ini_lr,
-            "min_lr": other_min_lr
-        },
+            "params":model.parameters(),
+            "max_lr":max_lr,
+            "initial_lr":ini_lr,
+            "min_lr":min_lr
+        }
     ],
     lr=max_lr, weight_decay=args.weight_decay)
-    ########################### 微调 cnet ############################
+    
+    if args.load_cnet and args.fine_tune_cnet:
+        ########################### 微调 cnet ############################
+        net = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        
+        # 为 cnet 设置更小的学习率，仅仅微调
+        cnet_lr = max_lr * 0.1
+        cnet_ini_lr = ini_lr * 0.1
+        cnet_min_lr = min_lr * 0.1
+
+        other_lr = max_lr
+        other_ini_lr = ini_lr
+        other_min_lr = min_lr
+
+        optimizer = torch.optim.AdamW([
+            {
+                "params": net.cnet.parameters(),
+                "max_lr": cnet_lr,
+                "initial_lr": cnet_ini_lr,
+                "min_lr": cnet_min_lr
+            },
+            {
+                "params": [p for n,p in net.named_parameters() if not n.startswith("cnet.")],
+                "max_lr": other_lr,
+                "initial_lr": other_ini_lr,
+                "min_lr": other_min_lr
+            },
+        ],
+        lr=max_lr, weight_decay=args.weight_decay)
+        ########################### 微调 cnet ############################
 
     epoch = 0
 
@@ -250,14 +269,15 @@ def main():
             with open(loss_txt, 'w') as file:
                 file.close()
 
+    
     start = time.time()
-    print('Start Loading ...')
+    if is_main_process(args.parallel):
+        print('Start Loading ...')
     dataset = datasets.fetch_dataloader(args)
-    
-    print('Done ', time.time()-start)
-    
-    # dataset = torch.utils.data.ConcatDataset([dataset_driving]*1 + [dataset_kitti]*100)
-    print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr'])
+    if is_main_process(args.parallel):
+        print('Done ', time.time()-start)
+    if is_main_process(args.parallel):
+        print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr'])
 
     trainer = TTCTrainer(model=model, dataset=dataset, optimizer=optimizer, args=args, 
                         start_epoch=epoch, device=device, model_path=args.resume, 
@@ -266,6 +286,15 @@ def main():
 
     trainer.train()
 
+def is_main_process(parallel: bool) -> bool:
+    """
+    返回 True 当且仅当：
+      - 没有并行模式，或
+      - 并行模式下当前进程 rank == 0
+    """
+    if not parallel:
+        return True
+    return dist.get_rank() == 0
 
 if __name__ == "__main__":
     main()

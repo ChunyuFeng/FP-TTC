@@ -611,6 +611,9 @@ class nuScenes_range_image(data.Dataset):
         else:
             raise FileNotFoundError(f"No such file: {pkl_file_path}")
 
+        # # 使用 scene_indice 为 4 的数据，做小数据集快速迭代测试
+        # self.data = [d for d in self.data if d.get('scene_indice') == '4']
+
         # 数据增强设置
         self.augmentor = None
         if self.aug_params is not None:
