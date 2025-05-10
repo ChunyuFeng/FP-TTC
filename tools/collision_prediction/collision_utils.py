@@ -163,10 +163,9 @@ def inverse_range_projection(u, v, depth, H=160, W=1920, fov_up=10.0, fov_down=-
 
     return np.array([x, y, z])
 
-def project_lidar_to_surround_view_img(nusc,
-                                       lidar_data,
-                                       lidar_token,
-                                       surround_view_img_token,
+def project_lidar_to_surround_view_img(lidar_data,
+                                       camera_data,
+                                       sensor_metas,
                                        min_dist=1.0):
     '''
     将 LiDAR 点云投影到相机视图上
@@ -186,20 +185,24 @@ def project_lidar_to_surround_view_img(nusc,
 
     projected_points = {}
 
-    # 获取 LiDAR 样本的基本信息，包括传感器标定信息、位姿信息等
-    lidar_sample_data = nusc.get('sample_data', lidar_token)
+    camera_channels = [
+        'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+        'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT'
+        ]
+    
+    lidar_sensor_meta = sensor_metas['lidar']
+    camera_sensor_meta = sensor_metas['camera']
 
-    for channel in surround_view_img_token:
-        cam_sample_data = nusc.get('sample_data', surround_view_img_token[channel])
+    for channel in camera_channels:
 
         # 获取 LiDAR 和 Camera 的标定数据以及位姿信息
-        lidar_cs_record = nusc.get('calibrated_sensor', lidar_sample_data['calibrated_sensor_token'])
-        cam_cs_record = nusc.get('calibrated_sensor', cam_sample_data['calibrated_sensor_token'])
-        lidar_pose = nusc.get('ego_pose', lidar_sample_data['ego_pose_token'])
-        cam_pose = nusc.get('ego_pose', cam_sample_data['ego_pose_token'])
+        lidar_cs_record = lidar_sensor_meta['calibrated_sensor']
+        cam_cs_record = camera_sensor_meta['calibrated_sensor'][channel]
+        lidar_pose = lidar_sensor_meta['ego_pose']
+        cam_pose = camera_sensor_meta['ego_pose'][channel]
 
         # 加载相机图像
-        im = Image.open(osp.join(nusc.dataroot, cam_sample_data['filename']))
+        im = Image.open(osp.join('./Datasets/nuscenes', camera_data[channel]['filename']))
 
         # 1. 从传感器坐标系到车辆坐标系
         rotation_matrix_sensor_to_ego = Quaternion(lidar_cs_record['rotation']).rotation_matrix

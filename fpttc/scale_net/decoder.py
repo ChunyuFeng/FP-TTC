@@ -13,9 +13,7 @@ class RiskHead(nn.Module):
         self.conv2 = nn.Conv2d(hidden_dim, 1, 3, padding=1)
 
     def forward(self, x):
-        x = self.relu(self.conv1(x))
-        raw = self.conv2(x)
-        return F.softplus(raw) + 1e-3
+        return self.conv2(self.relu(self.conv1(x)))
 
 class ScaleHead(nn.Module):
     def __init__(self, input_dim=128, hidden_dim=256):
@@ -25,7 +23,9 @@ class ScaleHead(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        return F.relu(self.conv2(self.relu(self.conv1(x))))
+        x = self.relu(self.conv1(x))
+        raw = self.conv2(x)
+        return F.softplus(raw) + 1e-3
 
 class BasicMotionEncoder(nn.Module):
     def __init__(self, dim):

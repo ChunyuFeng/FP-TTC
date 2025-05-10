@@ -1,6 +1,5 @@
 from PIL import Image
 import os
-import time
 import cv2
 import numpy as np
 import torch
@@ -10,278 +9,230 @@ import datetime
 from glob import glob
 from fpttc.fp_ttc import FpTTC
 from utils.trainer import TTCTrainer
-from utils.draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_image, visual_risk_score_map_range_image
+from utils.draw import (
+    visual_scale_map_range_image,
+    visual_risk_score_map_range_image
+)
+from dataloader.utils.augmentor import NuscRangeImageAugmentor
 import pickle
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 parser = argparse.ArgumentParser()
 
-# dataset
-parser.add_argument('--checkpoint_dir', default='tmp', type=str,
-                    help='where to save the training log and models')
-parser.add_argument('--stage', default='chairs', type=str,
-                    help='training stage on different datasets')
-parser.add_argument('--val_dataset', default=['chairs'], type=str, nargs='+',
-                    help='validation datasets')
-parser.add_argument('--max_flow', default=400, type=int,
-                    help='exclude very large motions during training')
+# Dataset & evaluation parameters
+parser.add_argument('--checkpoint_dir', default='tmp', type=str)
+parser.add_argument('--stage', default='chairs', type=str)
+parser.add_argument('--val_dataset', default=['chairs'], type=str, nargs='+')
+parser.add_argument('--max_flow', default=400, type=int)
 parser.add_argument('--image_size', default=[384, 512], type=int, nargs='+',
-                    help='image size for training')
-parser.add_argument('--padding_factor', default=16, type=int,
-                    help='the input should be divisible by padding_factor, otherwise do padding or resizing')
-
-# evaluation
-parser.add_argument('--eval', action='store_true',
-                    help='evaluation after training done')
+                    help='[height, width] for resize operations')
+parser.add_argument('--padding_factor', default=16, type=int)
+parser.add_argument('--eval', action='store_true')
 parser.add_argument('--save_eval_to_file', action='store_true')
 parser.add_argument('--evaluate_matched_unmatched', action='store_true')
 parser.add_argument('--val_things_clean_only', action='store_true')
-parser.add_argument('--with_speed_metric', action='store_true',
-                    help='with speed methic when evaluation')
+parser.add_argument('--with_speed_metric', action='store_true')
 
-# training
-parser.add_argument('--load_flow_param', action='store_true')
-parser.add_argument('--epoch', default=400, type=int)
-parser.add_argument('--lr', default=4e-4, type=float)
-parser.add_argument('--batch_size', default=1, type=int)
-parser.add_argument('--num_workers', default=4, type=int)
-parser.add_argument('--weight_decay', default=1e-4, type=float)
-parser.add_argument('--grad_clip', default=1.0, type=float)
-parser.add_argument('--num_steps', default=100000, type=int)
-parser.add_argument('--seed', default=326, type=int)
-parser.add_argument('--summary_freq', default=100, type=int)
-parser.add_argument('--val_freq', default=10000, type=int)
-parser.add_argument('--save_ckpt_freq', default=10000, type=int)
-parser.add_argument('--save_latest_ckpt_freq', default=1000, type=int)
-
-# resume pretrained model or resume training
-parser.add_argument('--resume', default=None, type=str,
-                    help='resume from pretrained model or resume from unexpectedly terminated training')
-parser.add_argument('--strict_resume', action='store_true',
-                    help='strict resume while loading pretrained weights')
+# Training hyperparameters (not used in test)
+parser.add_argument('--resume', default=None, type=str)
+parser.add_argument('--strict_resume', action='store_true')
 parser.add_argument('--no_resume_optimizer', action='store_true')
-
-# model: learnable parameters
-parser.add_argument('--num_scales', default=1, type=int,
-                    help='feature scales: 1/8 or 1/8 + 1/4')
+parser.add_argument('--num_scales', default=1, type=int)
 parser.add_argument('--feature_channels', default=128, type=int)
 parser.add_argument('--upsample_factor', default=8, type=int)
 parser.add_argument('--num_head', default=1, type=int)
 parser.add_argument('--ffn_dim_expansion', default=4, type=int)
 parser.add_argument('--num_transformer_layers', default=6, type=int)
-parser.add_argument('--reg_refine', action='store_true',
-                    help='optional task-specific local regression refinement')
-parser.add_argument('--parallel', action='store_true',
-                    help='optional task-specific local regression refinement')
-parser.add_argument('--load_opt', action='store_true',
-                    help='optional task-specific local regression refinement')
+parser.add_argument('--reg_refine', action='store_true')
+parser.add_argument('--parallel', action='store_true')
+parser.add_argument('--load_opt', action='store_true')
+parser.add_argument('--attn_type', default='swin', type=str)
+parser.add_argument('--attn_splits_list', default=[2], type=int, nargs='+')
+parser.add_argument('--corr_radius_list', default=[-1], type=int, nargs='+')
+parser.add_argument('--prop_radius_list', default=[-1], type=int, nargs='+')
+parser.add_argument('--num_reg_refine', default=1, type=int)
+parser.add_argument('--gamma', default=0.9, type=float)
 
-# model: parameter-free
-parser.add_argument('--attn_type', default='swin', type=str,
-                    help='attention function')
-parser.add_argument('--attn_splits_list', default=[2], type=int, nargs='+',
-                    help='number of splits in attention')
-parser.add_argument('--corr_radius_list', default=[-1], type=int, nargs='+',
-                    help='correlation radius for matching, -1 indicates global matching')
-parser.add_argument('--prop_radius_list', default=[-1], type=int, nargs='+',
-                    help='self-attention radius for propagation, -1 indicates global attention')
-parser.add_argument('--num_reg_refine', default=1, type=int,
-                    help='number of additional local regression refinement')
-
-# loss
-parser.add_argument('--gamma', default=0.9, type=float,
-                    help='exponential weighting')
-
-# predict on sintel and kitti test set for submission
+# Submission & inference
 parser.add_argument('--kittidataset', default='/mnt/pool2/lcl/data/data_scene_flow/training/', type=str)
 parser.add_argument('--drivingdataset', default='/mnt/pool2/lcl/data/Driving/', type=str)
-parser.add_argument('--submission', action='store_true',
-                    help='submission to sintel or kitti test sets')
-parser.add_argument('--output_path', default='output', type=str,
-                    help='where to save the prediction results')
-parser.add_argument('--save_vis_flow', action='store_true',
-                    help='visualize flow prediction as .png image')
-parser.add_argument('--no_save_flo', action='store_true',
-                    help='not save flow as .flo if only visualization is needed')
-
-# inference on images or videos
+parser.add_argument('--submission', action='store_true')
+parser.add_argument('--output_path', default='output', type=str)
+parser.add_argument('--save_vis_flow', action='store_true')
+parser.add_argument('--no_save_flo', action='store_true')
 parser.add_argument('--inference_dir', default=None, type=str)
 parser.add_argument('--inference_video', default=None, type=str)
-parser.add_argument('--inference_size', default=None, type=int, nargs='+',
-                    help='can specify the inference size for the input to the network')
+parser.add_argument('--inference_size', default=None, type=int, nargs='+')
 parser.add_argument('--save_flo_flow', action='store_true')
-parser.add_argument('--pred_bidir_flow', action='store_true',
-                    help='predict bidirectional flow')
-parser.add_argument('--pred_bwd_flow', action='store_true',
-                    help='predict backward flow only')
-parser.add_argument('--fwd_bwd_check', action='store_true',
-                    help='forward backward consistency check with bidirection flow')
+parser.add_argument('--pred_bidir_flow', action='store_true')
+parser.add_argument('--pred_bwd_flow', action='store_true')
+parser.add_argument('--fwd_bwd_check', action='store_true')
 parser.add_argument('--save_video', action='store_true')
 parser.add_argument('--concat_flow_img', action='store_true')
 
-# distributed training
+# Distributed & misc
 parser.add_argument('--local_rank', default=0, type=int)
 parser.add_argument('--distributed', action='store_true')
 parser.add_argument('--launcher', default='none', type=str, choices=['none', 'pytorch'])
 parser.add_argument('--gpu_ids', default=0, type=int, nargs='+')
-
-# misc
-parser.add_argument('--count_time', action='store_true',
-                    help='measure the inference time')
-
+parser.add_argument('--count_time', action='store_true')
 parser.add_argument('--debug', action='store_true')
 
-parser.add_argument('--train_location', type=str, default='local', choices=['local', 'remote-eden'],
-                    help='Specify the training location. If "local", data will be stored in the local directory; if "remote", data will be stored in the remote specific path.')
-
+# path
+parser.add_argument('--save_pred_npy', action='store_true',
+                    help='Save prediction as .npy files for collision map generation')
+parser.add_argument('--pred_npy_dir', default='./Datasets/nuscenes/3_visualization/collision_pred',
+                    type=str, help='Directory to save prediction .npy files')
+parser.add_argument('--test_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/nusc_trainval_infos_160_1920.pkl',
+                    type=str, help='Path to test info file (e.g., nusc_trainval_infos_160_1920.pkl)')
 
 args = parser.parse_args()
+
 torch.cuda.set_device(0)
-device = torch.device("cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-def resize_and_crop(img, width, height):
-    """将图像缩放并裁剪到指定大小"""
-    w, h = img.size
-    crop_h, crop_w = height, width
-    resize = crop_w / w
-
-    resize_h, resize_w = int(h * resize), int(w * resize)
-    crop_h_start = 0
-    crop_w_start = (resize_w - crop_w) // 2
-    crop = (crop_w_start, crop_h_start, crop_w_start + crop_w, crop_h_start + crop_h)
-
-    img = img.resize((resize_w, resize_h), Image.BILINEAR)
-
-    img = img.crop(crop)
-
-    return img
+# Instantiate augmentor using --image_size as [height, width]
+resize_height, resize_width = args.image_size  # height, width from CLI
+# crop_size expects (crop_h, crop_w)
+augmentor = NuscRangeImageAugmentor(crop_size=(resize_height, resize_width),
+                                   do_flip=False,
+                                   rotate=False)
 
 def main():
-    model_loaded = FpTTC(num_scales=args.num_scales,
-                         feature_channels=args.feature_channels,
-                         upsample_factor=args.upsample_factor,
-                         num_head=args.num_head,
-                         ffn_dim_expansion=args.ffn_dim_expansion,
-                         num_transformer_layers=args.num_transformer_layers,
-                         reg_refine=args.reg_refine,
-                         train=False).to(device)
-    num_params = sum(p.numel() for p in model_loaded.parameters())
-    print('Number of params:', num_params)
+    # Load model
+    model = FpTTC(num_scales=args.num_scales,
+                  feature_channels=args.feature_channels,
+                  upsample_factor=args.upsample_factor,
+                  num_head=args.num_head,
+                  ffn_dim_expansion=args.ffn_dim_expansion,
+                  num_transformer_layers=args.num_transformer_layers,
+                  reg_refine=args.reg_refine,
+                  train=False).to(device)
 
-    if args.resume is not None:
-        loc = 'cuda:{}'.format(args.local_rank) if torch.cuda.is_available() else 'cpu'
-        checkpoint = torch.load(args.resume, map_location=loc)
+    # Optionally resume checkpoint
+    if args.resume:
+        map_loc = f'cuda:{args.local_rank}' if torch.cuda.is_available() else 'cpu'
+        checkpoint = torch.load(args.resume, map_location=map_loc)
+        # Extract raw state dict
         if 'net' in checkpoint:
-            model_loaded.load_state_dict({k.replace('module.', ''): v for k, v in checkpoint['net'].items()})
+            raw_state_dict = checkpoint['net']
         elif 'state_dict' in checkpoint:
-            model_loaded.load_state_dict(checkpoint['state_dict'])
+            raw_state_dict = checkpoint['state_dict']
         else:
-            model_loaded.load_state_dict(checkpoint)
+            raw_state_dict = checkpoint
+        # Strip 'module.' prefix if present
+        processed_state_dict = {}
+        for key, value in raw_state_dict.items():
+            new_key = key[len('module.'):] if key.startswith('module.') else key
+            processed_state_dict[new_key] = value
+        # Load into model
+        model.load_state_dict(processed_state_dict)
 
+    model.eval()
 
+    # Prepare output directory
     time_stamp = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
+    output_dir = f"./test/{time_stamp}_surround_ttc"
+    os.makedirs(output_dir, exist_ok=True)
 
-    model_loaded.eval()
-    out_dir = "./test/%s_selfcon_ttc"%(time_stamp)
-    if not os.path.isdir(out_dir):
-        os.mkdir(out_dir)
+    # Load test info
+    info_path = args.test_info_path
+    with open(info_path, 'rb') as f:
+        test_entries = pickle.load(f)
 
-    # # path1, path2 = 'test_img/2341.jpg', 'test_img/2344.jpg'
-    # inference_dir = args.inference_dir
-    # filenames = sorted(glob(inference_dir + '/*.png') + glob(inference_dir + '/*.jpg'))
-    # # print(filenames)
-    # print('%d images found' % len(filenames))
+    camera_channels = [
+        'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+        'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT'
+        ]
 
-    test_info_path = './Datasets/nuscenes/2_trainval_test_infos/nusc_trainval_infos_160_1920.pkl'
-    with open(test_info_path, 'rb') as file:
-        test_info = pickle.load(file)
-    
-    camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
-                       'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
-    # camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-    #                    'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+    for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
+        # Load images
+        prev_images = {}
+        curr_images = {}
+        for ch in camera_channels:
+            prev_path = os.path.join('./Datasets/nuscenes', test_entries[idx]['prev_camera_data'][ch]['filename'])
+            curr_path = os.path.join('./Datasets/nuscenes', test_entries[idx]['curr_camera_data'][ch]['filename'])
+            prev_images[ch] = Image.open(prev_path)
+            curr_images[ch] = Image.open(curr_path)
 
-    prev_surr_view_imgs = {}
-    curr_surr_view_imgs = {}
-    for i in tqdm(range(len(test_info)), desc='Processing surround view images'):
-        for channel in camera_channels:
-            prev_file_path = os.path.join('./Datasets/nuscenes', test_info[i]['prev_camera_data'][channel]['filename'])
-            prev_surr_view_imgs[channel] = Image.open(prev_file_path)
-            prev_surr_view_imgs[channel] = resize_and_crop(prev_surr_view_imgs[channel], 320, 160)
-            prev_surr_view_imgs[channel] = np.array(prev_surr_view_imgs[channel])
-            prev_surr_view_imgs[channel] = torch.from_numpy(prev_surr_view_imgs[channel]).permute(2, 0, 1).float()
+        # Apply augmentor for resize+crop
+        augmented_prev = augmentor(prev_images)
+        augmented_curr = augmentor(curr_images)
 
-            curr_file_path = os.path.join('./Datasets/nuscenes', test_info[i]['curr_camera_data'][channel]['filename'])
-            curr_surr_view_imgs[channel] = Image.open(curr_file_path)
-            curr_surr_view_imgs[channel] = resize_and_crop(curr_surr_view_imgs[channel], 320, 160)
-            curr_surr_view_imgs[channel] = np.array(curr_surr_view_imgs[channel])
-            curr_surr_view_imgs[channel] = torch.from_numpy(curr_surr_view_imgs[channel]).permute(2, 0, 1).float()
+        # Convert to tensors and stack
+        prev_tensors = [torch.from_numpy(augmented_prev[ch]).permute(2,0,1).float() for ch in camera_channels]
+        curr_tensors = [torch.from_numpy(augmented_curr[ch]).permute(2,0,1).float() for ch in camera_channels]
 
-        prev_surr_view_imgs_tensor = torch.stack([prev_surr_view_imgs[channel] for channel in camera_channels], dim=0)
-        curr_surr_view_imgs_tensor = torch.stack([curr_surr_view_imgs[channel] for channel in camera_channels], dim=0)
+        prev_batch = torch.stack(prev_tensors, dim=0).unsqueeze(0).to(device)
+        curr_batch = torch.stack(curr_tensors, dim=0).unsqueeze(0).to(device)
+        sensor_meta = test_entries[idx]['sensor_metas']
 
-        prev_surr_view_imgs_tensor = prev_surr_view_imgs_tensor.unsqueeze(0).to(device)
-        curr_surr_view_imgs_tensor = curr_surr_view_imgs_tensor.unsqueeze(0).to(device)
-        sensor_meta = test_info[i]['sensor_metas']
+        # Load ground-truth maps
+        gt_item = np.load(os.path.join(test_entries[idx]['gt_map_path'], 'range_image.npy'), allow_pickle=True).item()
+        gt_scale_map = torch.from_numpy(gt_item['scale']).float()
+        gt_risk_map = torch.from_numpy(gt_item['risk_score']).float()
 
-        gt_map_path = os.path.join(test_info[i]['gt_map_path'], 'range_image.npy')
-        range_image = np.load(gt_map_path, allow_pickle=True).item()
-        
-        gt_scale_map = range_image['scale']
-        gt_risk_score_map = range_image['risk_score']
+        # Build masked GT tensors
+        valid_mask = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
+        gt_scale_tensor = torch.cat([
+            gt_scale_map.unsqueeze(0),
+            valid_mask.unsqueeze(0).float()
+        ], dim=0).unsqueeze(0).to(device)
+        gt_risk_tensor = torch.cat([
+            gt_risk_map.unsqueeze(0),
+            valid_mask.unsqueeze(0).float()
+        ], dim=0).unsqueeze(0).to(device)
 
-
-        gt_scale_map = torch.from_numpy(gt_scale_map).float()
-        gt_risk_score_map = torch.from_numpy(gt_risk_score_map).float()
-        mask = gt_scale_map > 0
-        gt_scale_map_with_mask = torch.cat((gt_scale_map.unsqueeze(0), mask.unsqueeze(0).float()), dim=0)
-        gt_risk_score_map_with_mask = torch.cat((gt_risk_score_map.unsqueeze(0), mask.unsqueeze(0).float()), dim=0)
-        gt_scale_map_with_mask = gt_scale_map_with_mask.unsqueeze(0).to(device)
-        gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.unsqueeze(0).to(device)
-
+        # Inference
         with torch.no_grad():
-            scale, risk_score, loss_scale, loss_risk, loss = model_loaded.forward_with_loss(
-                prev_surr_view_imgs_tensor,
-                curr_surr_view_imgs_tensor,
-                sensor_meta,
-                gt_scale_map_with_mask,      # 需要构造一个包含真实尺度和 mask 的张量
-                gt_risk_score_map_with_mask, # 同上
+            scale_pred, risk_pred, _, _ = model.forward_with_loss(
+                prev_batch, curr_batch, sensor_meta,
+                gt_scale_tensor, gt_risk_tensor,
                 attn_type=args.attn_type,
                 attn_splits_list=args.attn_splits_list,
                 corr_radius_list=args.corr_radius_list,
                 prop_radius_list=args.prop_radius_list,
-                num_reg_refine=args.num_reg_refine,
+                num_reg_refine=args.num_reg_refine
             )
-        
-        # 可视化 prediction_scale 和 gt_scale
-        gt_scale = gt_scale_map_with_mask[:,0,:,:]
-        gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]
-        gt_scale_np = gt_scale[:1].detach().squeeze(0).cpu().numpy()
-        gt_scale_valid_mask_np = gt_scale_valid_mask[:1].squeeze(0).cpu().detach().bool()
-        normalized_gt_scale = visual_scale_map_range_image(gt_scale_np, gt_scale_valid_mask_np)
 
-        scale_np = scale[0].detach().squeeze(0).cpu().numpy()
-        pred_valid_mask = scale_np > 0
-        normalized_pred_scale = visual_scale_map_range_image(scale_np, pred_valid_mask)
+        # Visualization
+        gt_scale_array = gt_scale_tensor[0,0].cpu().numpy()
+        gt_scale_mask_array = gt_scale_tensor[0,1].cpu().bool().numpy()
+        normalized_gt_scale_image = visual_scale_map_range_image(gt_scale_array, gt_scale_mask_array)
 
-        # 可视化 risk_score 和 gt_risk_score
-        gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
-        gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
-        normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np)
+        scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
+        scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
+        normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
 
-        risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
-        normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np)
+        gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
+        normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array)
 
-        # 保存可视化结果
-        plt.imsave(os.path.join(out_dir, f"pred_scale_{i}.png"), -normalized_pred_scale, cmap='seismic', vmin=-1, vmax=1)
-        plt.imsave(os.path.join(out_dir, f"gt_scale_{i}.png"), -normalized_gt_scale, cmap='seismic', vmin=-1, vmax=1)
-        plt.imsave(os.path.join(out_dir, f"pred_risk_{i}.png"), normalized_pred_risk_score, cmap='seismic', vmin=-1, vmax=1)
-        plt.imsave(os.path.join(out_dir, f"gt_risk_{i}.png"), normalized_gt_risk_score, cmap='seismic', vmin=-1, vmax=1)
+        risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
+        normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array)
 
-        # 释放当前循环中分配的 GPU 内存
-        del prev_surr_view_imgs_tensor, curr_surr_view_imgs_tensor, scale, risk_score
+        # save prediction as .npy files
+        # for collision map generation
+        if args.save_pred_npy:
+            os.makedirs(args.pred_npy_dir, exist_ok=True)
+            pred_data = {
+            "scale_pred": scale_prediction_array,
+            "risk_pred": risk_prediction_array
+            }
+            np.save(os.path.join(args.pred_npy_dir, f"pred_{idx}.npy"), pred_data)
+
+        # Save visuals
+        plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
+                   -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
+        plt.imsave(os.path.join(output_dir, f"gt_scale_{idx}.png"),
+                   -normalized_gt_scale_image, cmap='seismic', vmin=-1, vmax=1)
+        plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
+                   normalized_pred_risk_image, cmap='seismic', vmin=-1, vmax=1)
+        plt.imsave(os.path.join(output_dir, f"gt_risk_{idx}.png"),
+                   normalized_gt_risk_image, cmap='seismic', vmin=-1, vmax=1)
+
+        # Cleanup
+        del prev_batch, curr_batch, scale_pred, risk_pred
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
