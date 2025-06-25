@@ -147,6 +147,18 @@ def main():
         ]
 
     for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
+        # if test_entries[idx]['scene_indice'] != '3':
+        #     continue
+        # # Before processing images, verify that all required files exist; if any are missing, skip this sample.
+        # all_exist = True
+        # for ch in camera_channels:
+        #     prev_img_path = os.path.join('./Datasets/nuscenes', test_entries[idx]['prev_camera_data'][ch]['filename'])
+        #     curr_img_path = os.path.join('./Datasets/nuscenes', test_entries[idx]['curr_camera_data'][ch]['filename'])
+        #     if not (os.path.exists(prev_img_path) and os.path.exists(curr_img_path)):
+        #         all_exist = False
+        #         break
+        # if not all_exist:
+        #     continue
         # Load images
         prev_images = {}
         curr_images = {}
@@ -159,6 +171,12 @@ def main():
         # Apply augmentor for resize+crop
         augmented_prev = augmentor(prev_images)
         augmented_curr = augmentor(curr_images)
+        
+        # Prev images
+        concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
+        concat_prev = concat_prev.astype(np.uint8)
+        concat_prev_img = Image.fromarray(concat_prev)
+        concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
 
         # Convert to tensors and stack
         prev_tensors = [torch.from_numpy(augmented_prev[ch]).permute(2,0,1).float() for ch in camera_channels]
@@ -168,21 +186,25 @@ def main():
         curr_batch = torch.stack(curr_tensors, dim=0).unsqueeze(0).to(device)
         sensor_meta = test_entries[idx]['sensor_metas']
 
-        # Load ground-truth maps
-        gt_item = np.load(os.path.join(test_entries[idx]['gt_map_path'], 'range_image.npy'), allow_pickle=True).item()
-        gt_scale_map = torch.from_numpy(gt_item['scale']).float()
-        gt_risk_map = torch.from_numpy(gt_item['risk_score']).float()
+        if test_entries[idx]['gt_map_path'] is not None:
+            # Load ground-truth maps
+            gt_item = np.load(os.path.join(test_entries[idx]['gt_map_path'], 'range_image.npy'), allow_pickle=True).item()
+            gt_scale_map = torch.from_numpy(gt_item['scale']).float()
+            gt_risk_map = torch.from_numpy(gt_item['risk_score']).float()
 
-        # Build masked GT tensors
-        valid_mask = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
-        gt_scale_tensor = torch.cat([
-            gt_scale_map.unsqueeze(0),
-            valid_mask.unsqueeze(0).float()
-        ], dim=0).unsqueeze(0).to(device)
-        gt_risk_tensor = torch.cat([
-            gt_risk_map.unsqueeze(0),
-            valid_mask.unsqueeze(0).float()
-        ], dim=0).unsqueeze(0).to(device)
+            # Build masked GT tensors
+            valid_mask = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
+            gt_scale_tensor = torch.cat([
+                gt_scale_map.unsqueeze(0),
+                valid_mask.unsqueeze(0).float()
+            ], dim=0).unsqueeze(0).to(device)
+            gt_risk_tensor = torch.cat([
+                gt_risk_map.unsqueeze(0),
+                valid_mask.unsqueeze(0).float()
+            ], dim=0).unsqueeze(0).to(device)
+        else:
+            gt_scale_tensor = torch.zeros((1, 2, prev_batch.shape[2], prev_batch.shape[3])).to(device)
+            gt_risk_tensor = torch.zeros((1, 2, prev_batch.shape[2], prev_batch.shape[3])).to(device)
 
         # Inference
         with torch.no_grad():
@@ -234,6 +256,9 @@ def main():
         # Cleanup
         del prev_batch, curr_batch, scale_pred, risk_pred
         torch.cuda.empty_cache()
+
+        with open(os.path.join(output_dir, "processed_indices.txt"), "a") as f:
+            f.write(f"{idx}\n")
 
 if __name__ == "__main__":
     main()

@@ -23,6 +23,7 @@ from PIL import Image
 from .loss import get_loss, get_loss_multi, get_loss_nusc, get_loss_mix, get_loss_scale_map, get_loss_risk_score_map
 from .draw import disp2rgb_normalized, flow_uv_to_colors, flow_to_image, visual_scale_map_range_image, visual_risk_score_map_range_image
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
+from torch.utils.data._utils.collate import default_collate
 
 def is_main_process(parallel: bool) -> bool:
     if not parallel:
@@ -31,7 +32,7 @@ def is_main_process(parallel: bool) -> bool:
 
 class TTCTrainer(object):
     def __init__(self, model, dataset, optimizer, args, device, model_path = None, 
-                start_epoch=0, parallel=False, time_stamp=None, max_lr=1e-4, crop_size=[352,1152],
+                start_epoch=0, parallel=False, time_stamp=None, max_lr=1e-4, 
                 neptune_run=None):
         self.model = model
         self.parallel = parallel
@@ -39,12 +40,12 @@ class TTCTrainer(object):
         self.parallel = parallel
         self.train_sampler = None
         if not self.parallel:
-            self.train_loader = DataLoader(dataset, batch_size= args.batch_size, shuffle=True, 
+            self.train_loader = DataLoader(dataset, batch_size= args.batch_size, shuffle=True, collate_fn=self.my_collate_fn, \
                             num_workers=args.batch_size, drop_last=True, pin_memory=True)
         else:
             self.train_sampler = DistributedSampler(dataset)
             self.train_loader = DataLoader(dataset,batch_size=args.batch_size, \
-                                sampler=self.train_sampler, shuffle=False, pin_memory=True, num_workers=2)
+                                sampler=self.train_sampler, shuffle=False, collate_fn=self.my_collate_fn, pin_memory=True, num_workers=2)
 
         self.epoch = args.epoch
         # if optimizer is None:
@@ -113,9 +114,25 @@ class TTCTrainer(object):
         self.loss_sum_per_epoch = 0
         self.iters = 0
 
-        aug_params = {'crop_size': crop_size, 'min_scale': -0.2, 'max_scale': 0.4, 'do_flip': True}
-
         self.neptune_run = neptune_run
+
+    def my_collate_fn(self, batch):
+        """
+        自定义 collate_fn 以处理不同形状的输入数据
+        """
+        # 这里假设 batch 是一个列表，每个元素是一个元组 (prev_surr_view_imgs_tensor, curr_surr_view_imgs_tensor, ...)
+        # 使用 default_collate 来处理大部分数据
+        prev, curr, gt_s, gt_r, gt_d, metas, affines = zip(*batch)
+
+        return  (
+            default_collate(prev),
+            default_collate(curr),
+            default_collate(gt_s),
+            default_collate(gt_r),
+            default_collate(gt_d),
+            list(metas),    # keep original dicts
+            list(affines)
+            )
 
     def get_optimizer(self):
         params = list(self.model.named_parameters())
@@ -179,12 +196,14 @@ class TTCTrainer(object):
              gt_scale_map_with_mask,
              gt_risk_score_map_with_mask,
              gt_depth_map_with_mask,
-             sensor_meta) = data
+             sensor_meta,
+             affine) = data
             
             prev_surr_view_imgs_tensor = prev_surr_view_imgs_tensor.to(self.device)
             curr_surr_view_imgs_tensor = curr_surr_view_imgs_tensor.to(self.device)
             gt_scale_map_with_mask = gt_scale_map_with_mask.to(self.device)
             gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.to(self.device)
+            # affine = affine.to(self.device)
 
 
             # with torch.no_grad():
@@ -212,7 +231,8 @@ class TTCTrainer(object):
                     attn_splits_list=self.attn_splits_list,
                     corr_radius_list=self.corr_radius_list,
                     prop_radius_list=self.prop_radius_list,
-                    num_reg_refine=self.num_reg_refine
+                    num_reg_refine=self.num_reg_refine,
+                    affine=affine
                 )
             else:
                 scale, risk_score, loss_s, loss_r = self.model.forward_with_loss(
@@ -225,7 +245,8 @@ class TTCTrainer(object):
                     attn_splits_list=self.attn_splits_list,
                     corr_radius_list=self.corr_radius_list,
                     prop_radius_list=self.prop_radius_list,
-                    num_reg_refine=self.num_reg_refine
+                    num_reg_refine=self.num_reg_refine,
+                    affine=affine
                 )
 
             loss_last = None

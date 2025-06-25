@@ -591,12 +591,12 @@ class NuscRangeImageAugmentor:
         self.rotate_prob = rotate_prob  # 旋转概率
         self.rotate_angle = rotate_angle  # 旋转角度
 
+        self._affine = np.eye(3, dtype=np.float32)  # 初始化仿射变换矩阵
+
     def resize_and_crop(self, img):
         """将图像缩放并裁剪到指定大小"""
         w, h = img.size
         crop_h, crop_w = self.crop_size
-        # 同时利用h和w计算缩放比例
-        # resize = max(crop_h / h, crop_w / w)
         # 只利用w计算缩放比例，保证不裁剪w方向，因为相邻图像在w方向有重叠信息
         resize = crop_w / w
 
@@ -604,8 +604,9 @@ class NuscRangeImageAugmentor:
         # 图像h方向，保留中间部分
         # crop_h_start = (resize_h - crop_h) // 2
         # 图像h方向，保留底部（因为图像底部监督信息更稠密）
-        crop_h_start = 0
+        crop_h_start = resize_h - crop_h
         crop_w_start = (resize_w - crop_w) // 2
+        # 裁剪区域：left top right bottom
         crop = (crop_w_start, crop_h_start, crop_w_start + crop_w, crop_h_start + crop_h)
 
         if img.mode == 'RGB':
@@ -617,26 +618,17 @@ class NuscRangeImageAugmentor:
 
         img = img.crop(crop)
 
-        return img
+        # 更新仿射变换矩阵
+        M = np.eye(3, dtype=np.float32)
+        # 将缩放比例应用到仿射变换矩阵
+        M[:2, :2] = np.eye(2) * resize
+        # 将裁剪偏移量应用到仿射变换矩阵
+        M[0, 2] = -crop_w_start
+        M[1, 2] = -crop_h_start
+        # 更新仿射变换矩阵
+        affine = M @ self._affine  
 
-    # def resize_with_explicit_mapping(self, img, resize_dims, fill_value=np.nan):
-    #     # 将图像转换为 NumPy 数组
-    #     img_np = np.array(img)
-    #     # 提取有效数据的位置和值（非 NaN 的位置）
-    #     valid_coords = np.argwhere(~np.isnan(img_np))  # 获取有效数据的坐标 (y, x)
-    #     valid_values = img_np[~np.isnan(img_np)]  # 获取有效数据的值
-    #     # 计算缩放因子
-    #     resize_coef = max(resize_dims[0] / img_np.shape[0], resize_dims[1] / img_np.shape[1])
-    #     # 对有效坐标进行缩放
-    #     scaled_coords = (valid_coords * resize_coef).astype(int)
-    #     # 创建填充了 fill_value 的新图像
-    #     resized_img_np = np.full((resize_dims[0], resize_dims[1]), fill_value, dtype=np.float32)
-    #     # 将有效值填充到新的位置
-    #     for (y, x), value in zip(scaled_coords, valid_values):
-    #         if 0 <= y < resize_dims[0] and 0 <= x < resize_dims[1]:  # 检查边界
-    #             resized_img_np[y, x] = value
-    #     # 转换为 PIL 图像返回
-    #     return Image.fromarray(resized_img_np, mode='F')
+        return img, affine
 
     def resize_with_explicit_mapping(self, img, resize_dims, fill_value=np.nan):
         # 将图像转换为 NumPy 数组
@@ -741,7 +733,7 @@ class NuscRangeImageAugmentor:
             # plt.show()
 
             # 调用 resize_and_crop 处理
-            processed_img = self.resize_and_crop(img)
+            processed_img, affine = self.resize_and_crop(img)
 
             # # 可视化处理后的图像
             # plt.figure()
@@ -756,4 +748,4 @@ class NuscRangeImageAugmentor:
             if isinstance(surr_view_imgs[channel], Image.Image):
                 surr_view_imgs[channel] = np.array(surr_view_imgs[channel])
 
-        return surr_view_imgs
+        return surr_view_imgs, affine

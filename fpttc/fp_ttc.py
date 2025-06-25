@@ -11,10 +11,11 @@ from .scale_net.backbone import CNNEncoder
 from .scale_net.feature_net.feature_net import FeatureNet
 from .scale_net.flow_net import FlowNet
 from .scale_net.scale_net import ScaleNet
-
-from .range_image_encoder_new import RangeImageEncoder
+from .scale_net.multi_view_deformable_fusion import MultiViewDeformableFusion
+from .scale_net.utils.spherical import build_spherical_voxels, project_spherical_voxels_to_cameras
 
 import torch.distributed as dist
+import numpy as np
 
 def is_main_process() -> bool:
     """
@@ -52,6 +53,9 @@ class FpTTC(nn.Module):
         self.num_scales = num_scales
         self.is_trainning = train
 
+        self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                                'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+
         # 仅底层共享：CNNEncoder
         self.cnet = CNNEncoder(output_dim=feature_channels, num_output_scales=num_scales)
 
@@ -81,6 +85,20 @@ class FpTTC(nn.Module):
                                 upsample_factor=upsample_factor, num_head=4,
                                 scale_level=num_scales, reg_refine=reg_refine, head_type='risk')
         
+        self.R = 2
+        self.scale_fuser = MultiViewDeformableFusion(
+            num_layers=1,
+            input_dim=feature_channels,
+            d_model=feature_channels,
+            nhead=num_head,
+            per_level_channels=feature_channels*len(self.camera_channels),
+            num_scales=num_scales,
+            num_views=len(self.camera_channels),
+            R=self.R,
+            range_image_feat_shape=range_image_feat_shape
+        )
+
+        self.range_image_feat_shape = range_image_feat_shape
         # self.log_sigma_scale = nn.Parameter(torch.zeros(1))
         # self.log_sigma_risk = nn.Parameter(torch.zeros(1))
     
@@ -132,33 +150,93 @@ class FpTTC(nn.Module):
                 corr_radius_list=None,
                 prop_radius_list=None,
                 num_reg_refine=6,
-                testing=False):
+                testing=False,
+                affine=None):
         
         img0, img1 = normalize_img(img0, img1)
         # B, C, H, W = img0.shape
+        B, V, C, H, W = img0.shape
         # 提取多视角底层特征
         shared_prev, shared_curr = [], []
         for view in range(img0.size(1)):
             p, c = self.extract_feature(img0[:, view], img1[:, view], branch=None)
             shared_prev.append(p)
             shared_curr.append(c)
-        
-        # —— Scale 分支：先做分支归一化，再组多视角，再预测 Scale Map ——
+
+        # 假设 range_image_feat_shape = [(20,240),(40,480)]
+        uv_map, cam_idx_map, valid_mask = [], [], []
+        device = img0.device
+        for lvl, (H_sph, W_sph) in enumerate(self.range_image_feat_shape):
+            sph, xyz = build_spherical_voxels(H=H_sph, W=W_sph, R=self.R,
+                                            r_min=5.0, r_max=30.0,
+                                            fov_up_deg=8.0, fov_down_deg=-15.0)
+            # 对 batch 中每个样本都 project 一次
+            uv_list, camidx_list, valid_list = [], [], []
+            for meta in sensor_metas:
+                uv_np, cam_np, v_np = project_spherical_voxels_to_cameras(
+                    sensor_metas=meta, xyz=xyz,
+                    cam_channels=self.camera_channels, min_dist=1.0)
+                uv_list.append(uv_np); camidx_list.append(cam_np); valid_list.append(v_np)
+            # stack 并转 tensor
+            uv_map.append(torch.from_numpy(np.stack(uv_list,axis=0)).to(device))      # [B,H_sph,W_sph,R,2]
+            cam_idx_map.append(torch.from_numpy(np.stack(camidx_list,axis=0)).to(device))# [B,H_sph,W_sph,R]
+            valid_mask.append(torch.from_numpy(np.stack(valid_list,axis=0)).to(device)) # [B,H_sph,W_sph,R]
+
+        # 同质仿射矩阵
+        affine_batch = torch.stack([
+            # 如果是 NumPy array
+            torch.from_numpy(a) if isinstance(a, np.ndarray)
+            # 否则就直接当成 list 转
+            else torch.tensor(a, dtype=torch.float32)
+            for a in affine
+        ], dim=0).to(device)  # [B,3,3]
+
+         # 3) 分支归一化 + 多视角 channel 拼接
         prev_s_feats = [[self.cnet.final_norm_scale(f) for f in p] for p in shared_prev]
         curr_s_feats = [[self.cnet.final_norm_scale(f) for f in c] for c in shared_curr]
-        # 多视角拼接
-        feature0_lvls_s, feature1_lvls_s = [], []
+        # 每个 scale lvl 上，把 6 路视角的特征在 channel 维度上拼接
+        mv_feats_prev = []
+        mv_feats_curr = []
         for lvl in range(self.num_scales):
-            f0 = torch.cat([f[lvl] for f in prev_s_feats], dim=3)
-            f1 = torch.cat([f[lvl] for f in curr_s_feats], dim=3)
-            feature0_lvls_s.append(f0)
-            feature1_lvls_s.append(f1)
+            # p[lvl]: [B, C, H_lvl, W_lvl]
+            cat_prev = torch.cat([p[lvl] for p in prev_s_feats], dim=1)  # → [B, C*6, H_lvl, W_lvl]
+            cat_curr = torch.cat([c[lvl] for c in curr_s_feats], dim=1)
+            mv_feats_prev.append(cat_prev)
+            mv_feats_curr.append(cat_curr)
+
+        # 4) 调用可变形注意力 fusion
+        feature0_lvls = self.scale_fuser(
+            mv_feats=mv_feats_prev,
+            uv_map=uv_map, 
+            cam_idx_map=cam_idx_map,
+            valid_mask=valid_mask,
+            augmentor_affine=affine_batch
+        )  # [B, C, H_sph, W_sph]
+
+        feature1_lvls = self.scale_fuser(
+            mv_feats=mv_feats_curr,
+            uv_map=uv_map,
+            cam_idx_map=cam_idx_map,
+            valid_mask=valid_mask,
+            augmentor_affine=affine_batch
+        )
+
+        # # —— Scale 分支：先做分支归一化，再组多视角，再预测 Scale Map ——
+        # prev_s_feats = [[self.cnet.final_norm_scale(f) for f in p] for p in shared_prev]
+        # curr_s_feats = [[self.cnet.final_norm_scale(f) for f in c] for c in shared_curr]
+        # # 多视角拼接 - 简单横向拼接
+        # feature0_lvls_s, feature1_lvls_s = [], []
+        # for lvl in range(self.num_scales):
+        #     f0 = torch.cat([f[lvl] for f in prev_s_feats], dim=3)
+        #     f1 = torch.cat([f[lvl] for f in curr_s_feats], dim=3)
+        #     feature0_lvls_s.append(f0)
+        #     feature1_lvls_s.append(f1)
 
         # === Scale 分支 ===
         corr_s = None
         mlvl_s0, mlvl_s1 = [], []
         for lvl in range(self.num_scales):
-            f0, f1 = feature0_lvls_s[lvl], feature1_lvls_s[lvl]
+            f0, f1 = feature0_lvls[lvl], feature1_lvls[lvl]
             f0_s, f1_s = self.featnet_scale(f0, f1, lvl, attn_type, attn_splits_list, corr_s)
             mlvl_s0.append(f0_s); mlvl_s1.append(f1_s)
             corr_s, _ = self.corrnet_scale(f0_s, f1_s, lvl, corr_radius_list, prop_radius_list, num_reg_refine, False, corr_s)
@@ -171,23 +249,23 @@ class FpTTC(nn.Module):
 
         del prev_s_feats, curr_s_feats
         del corr_s, mlvl_s0, mlvl_s1
-        del feature0_lvls_s, feature1_lvls_s
+        # del feature0_lvls_s, feature1_lvls_s
 
-        # —— Risk 分支：先做分支归一化，再组多视角，再预测 Risk Map ——
-        prev_r_feats = [[self.cnet.final_norm_risk(f) for f in p] for p in shared_prev]
-        curr_r_feats = [[self.cnet.final_norm_risk(f) for f in c] for c in shared_curr]
-        # 多视角拼接
-        feature0_lvls_r, feature1_lvls_r = [], []
-        for lvl in range(self.num_scales):
-            f0 = torch.cat([p[lvl] for p in prev_r_feats], dim=3)
-            f1 = torch.cat([c[lvl] for c in curr_r_feats], dim=3)
-            feature0_lvls_r.append(f0); feature1_lvls_r.append(f1)
+        # # —— Risk 分支：先做分支归一化，再组多视角，再预测 Risk Map ——
+        # prev_r_feats = [[self.cnet.final_norm_risk(f) for f in p] for p in shared_prev]
+        # curr_r_feats = [[self.cnet.final_norm_risk(f) for f in c] for c in shared_curr]
+        # # 多视角拼接
+        # feature0_lvls_r, feature1_lvls_r = [], []
+        # for lvl in range(self.num_scales):
+        #     f0 = torch.cat([p[lvl] for p in prev_r_feats], dim=3)
+        #     f1 = torch.cat([c[lvl] for c in curr_r_feats], dim=3)
+        #     feature0_lvls_r.append(f0); feature1_lvls_r.append(f1)
 
         # === Risk 分支 ===
         corr_r = None
         mlvl_r0, mlvl_r1 = [], []
         for lvl in range(self.num_scales):
-            f0, f1 = feature0_lvls_r[lvl], feature1_lvls_r[lvl]
+            f0, f1 = feature0_lvls[lvl], feature1_lvls[lvl]
             f0_r, f1_r = self.featnet_risk(f0, f1, lvl, attn_type, attn_splits_list, corr_r)
             mlvl_r0.append(f0_r); mlvl_r1.append(f1_r)
             corr_r, _ = self.corrnet_risk(f0_r, f1_r, lvl, corr_radius_list, prop_radius_list, num_reg_refine, False, corr_r)
@@ -200,7 +278,7 @@ class FpTTC(nn.Module):
 
         del prev_r_feats, curr_r_feats
         del corr_r, mlvl_r0, mlvl_r1
-        del feature0_lvls_r, feature1_lvls_r
+        del feature0_lvls, feature1_lvls
 
         del shared_prev, shared_curr
 

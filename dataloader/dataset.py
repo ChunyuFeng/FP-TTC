@@ -15,6 +15,133 @@ from .utils import frame_utils
 import  cv2
 from .utils.augmentor import FlowAugmentor, SparseFlowAugmentorm, NuscAugmentor, NuscRangeImageAugmentor
 
+'''
+from pyquaternion import Quaternion
+import matplotlib.pyplot as plt
+from nuscenes.utils.geometry_utils import view_points
+
+def visualize_concat(warped_tensor, channel_names=None, horizontal=True, title=None):
+    """
+    将 6 路 warp 后的图像横向或纵向拼成一张大图进行展示。
+
+    参数：
+        warped_tensor: [6, 3, H, W] 的 torch.Tensor
+        channel_names: 可选，长度为 6 的列表，用于在拼接图上添加通道名（这里只做展示，不做子图布局）
+        horizontal:    True 表示 1×6 横向拼接，False 表示 6×1 纵向拼接
+        title:         可选总标题
+    """
+    imgs = warped_tensor.detach().cpu().numpy()  # [6,3,H,W]
+    if imgs.max() > 1.0:
+        imgs = imgs / 255.0
+
+    per = []
+    for idx in range(6):
+        img = imgs[idx].transpose(1, 2, 0)  # [H, W, 3]
+        per.append(img)
+
+    if horizontal:
+        big = np.concatenate(per, axis=1)  # 在宽度方向拼接
+    else:
+        big = np.concatenate(per, axis=0)  # 在高度方向拼接
+
+    plt.figure(figsize=(18, 6) if horizontal else (6, 18))
+    plt.imshow(big)
+    if title:
+        plt.title(title, fontsize=16)
+    plt.axis('off')
+    plt.show()
+
+def visualize_warped(warped_tensor, channel_names, title=None):
+    """
+    将 6 路 warp 后的环视图像可视化为 2×3 子图网格，检查它们在 Range‐view 平面上是否能无缝拼接。
+
+    参数：
+        warped_tensor: 形状 [6, 3, H, W] 的 torch.Tensor（float），值域应在 [0,1] 或 [0,255]。
+        channel_names: 长度为 6 的列表，例如 ['CAM_FRONT_LEFT', 'CAM_FRONT', ...]，用来在子图上标注通道名称。
+        title:          可选的总标题（字符串）。
+    """
+    # 检查输入形状
+    assert warped_tensor.ndim == 4 and warped_tensor.shape[0] == 6, \
+        "warped_tensor 必须是 [6,3,H,W]"
+
+    # 转到 CPU + NumPy 并归一化到 [0,1]
+    imgs = warped_tensor.detach().cpu().numpy()  # [6,3,H,W]
+    if imgs.max() > 1.0:
+        imgs = imgs / 255.0
+
+    # 准备 2×3 子图
+    fig, axes = plt.subplots(2, 3, figsize=(18, 8))
+    if title is not None:
+        fig.suptitle(title, fontsize=16)
+
+    for idx in range(6):
+        row = idx // 3
+        col = idx % 3
+        ax = axes[row, col]
+
+        img = imgs[idx]               # [3, H, W]
+        img = img.transpose(1, 2, 0)  # → [H, W, 3]
+
+        ax.imshow(img)
+        ax.set_title(channel_names[idx], fontsize=12)
+        ax.axis('off')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+def from_nusc_calib_to_RtK(sensor_meta):
+
+    camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                           'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+    
+    # LiDAR 2 Ego
+    R_l2e = Quaternion(sensor_meta['lidar']['calibrated_sensor']['rotation']).rotation_matrix
+    t_l2e = np.array(sensor_meta['lidar']['calibrated_sensor']['translation'])
+
+    # Ego 2 Global
+    R_e2g = Quaternion(sensor_meta['lidar']['ego_pose']['rotation']).rotation_matrix
+    t_e2g = np.array(sensor_meta['lidar']['ego_pose']['translation'])
+
+    # Lidar 2 Global
+    R_l2g = R_e2g.dot(R_l2e)
+    t_l2g = R_e2g.dot(t_l2e) + t_e2g
+
+    extri_intri = {}
+    for channel in camera_channels:
+        # Camera 2 Ego
+        R_c2e = Quaternion(sensor_meta['camera']['calibrated_sensor'][channel]['rotation']).rotation_matrix
+        t_c2e = np.array(sensor_meta['camera']['calibrated_sensor'][channel]['translation'])
+        # Ego 2 Global
+        R_e2g_cam = Quaternion(sensor_meta['camera']['ego_pose'][channel]['rotation']).rotation_matrix
+        t_e2g_cam = np.array(sensor_meta['camera']['ego_pose'][channel]['translation'])
+
+        # Camera 2 Global
+        R_c2g = R_e2g_cam.dot(R_c2e)
+        t_c2g = R_e2g_cam.dot(t_c2e) + t_e2g_cam
+
+        # Lidar 2 Camera
+        R = R_c2g.dot(R_l2g.T)
+        t = t_c2g - R.dot(t_l2g)
+        K = np.array(sensor_meta['camera']['calibrated_sensor'][channel]['camera_intrinsic'])
+        # # Camera 2 Ego
+        # R_g2e = Quaternion(sensor_meta['camera']['ego_pose'][channel]['rotation']).rotation_matrix.T
+        # t_g2e = -np.array(sensor_meta['camera']['ego_pose'][channel]['translation'])
+        # # Ego 2 Camera
+        # R_e2c = Quaternion(sensor_meta['camera']['calibrated_sensor'][channel]['rotation']).rotation_matrix
+        # t_e2c = np.array(sensor_meta['camera']['calibrated_sensor'][channel]['translation'])
+
+        # R = R_e2c @ R_g2e @ R_e2g @ R_l2e
+        # t = (R_e2c @ R_g2e @ (t_e2g + R_e2g @ t_l2e)) + t_e2c + R_e2c @ t_g2e
+        # K = np.array(sensor_meta['camera']['calibrated_sensor'][channel]['camera_intrinsic'])
+
+        extri_intri[channel] = {
+            'R': torch.from_numpy(R).float(),
+            't': torch.from_numpy(t).float(),
+            'K': torch.from_numpy(K).float(),
+        }
+    
+    return extri_intri
+'''
 
 def depth_read(filename):
     """ Read depth data from file, return as numpy array. """
@@ -618,6 +745,8 @@ class nuScenes_range_image(data.Dataset):
         self.augmentor = None
         if self.aug_params is not None:
             self.augmentor = NuscRangeImageAugmentor(**self.aug_params)
+        
+        self.afiine = np.eye(3, dtype=np.float32)  # 初始化为单位矩阵
 
         # pkl 文件中包含：
         # - surround view images pairs (nusc sample data format)
@@ -634,7 +763,7 @@ class nuScenes_range_image(data.Dataset):
 
         for i in range(len(self.data)):
             
-            range_image_path = os.path.join(self.data[i]['gt_map_path'], 'range_image.npy')
+            range_image_path = os.path.join(self.data[i]['gt_map_path'], 'range_image_curr.npy')
             if not osp.exists(range_image_path):
                 print(f"Range image file {range_image_path} does not exist.")
                 continue
@@ -643,12 +772,36 @@ class nuScenes_range_image(data.Dataset):
 
             self.image_list.append([self.data[i]['prev_camera_data'],
                                     self.data[i]['curr_camera_data']])
-            self.sensor_meta_list.append(self.data[i]['sensor_metas'])
+            self.sensor_meta_list.append(self.data[i]['sensor_metas_curr'])
             self.scale_map_list.append(range_image['scale'])
             self.risk_score_map_list.append(range_image['risk_score'])
             self.depth_map_list.append(range_image['depth'])
 
+        '''
+        # --- 1) 预定义 Range View 参数
+        self.H, self.W = self.scale_map_list[0].shape[:2]  # 获取图像的高和宽
+        fov_up, fov_down = 10.0, -30.0  # 上下视场角 
+        fov_up_rad   = fov_up   /180*np.pi
+        fov_down_rad = fov_down /180*np.pi
+        # 垂直角度从 up 到 down
+        self.theta_v = torch.linspace(fov_up_rad, -fov_down_rad, self.H)
+        # 水平 360°
+        tmp_theta_h = torch.linspace(-np.pi, np.pi, self.W+1)
+        self.theta_h = tmp_theta_h[:-1] 
 
+        # --- 2) 预先生成单位方向向量 d: [3,H,W] ---
+        vv, hh = torch.meshgrid(torch.arange(self.H),
+                                torch.arange(self.W),
+                                indexing='ij')
+        phi = self.theta_v[vv]     # [H,W]
+        psi = self.theta_h[hh]     # [H,W]
+        # x 轴指向右，y 轴指向前，z 轴指向上
+        x = torch.cos(phi)*torch.sin(psi)
+        y = torch.cos(phi)*torch.cos(psi)
+        z = torch.sin(phi)
+        self.d = torch.stack([x,y,z], dim=0)  # [3,H,W]
+        self.d = self.d.view(3, -1)  # [3, H*W]
+        '''
     def __len__(self):
         return len(self.image_list)
 
@@ -681,8 +834,8 @@ class nuScenes_range_image(data.Dataset):
 
         # 数据增强
         if self.augmentor is not None:
-            prev_surr_view_imgs = self.augmentor(prev_surr_view_imgs)
-            curr_surr_view_imgs = self.augmentor(curr_surr_view_imgs)
+            prev_surr_view_imgs, self.affine = self.augmentor(prev_surr_view_imgs)
+            curr_surr_view_imgs, _ = self.augmentor(curr_surr_view_imgs)
         
         # 转换为 Tensor
         for channel in camera_channels:
@@ -711,8 +864,139 @@ class nuScenes_range_image(data.Dataset):
                 gt_scale_map_with_mask, # model 的输入以及真值
                 gt_risk_score_map_with_mask, # model 的输入以及真值
                 gt_depth_map_with_mask, # model 的输入以及真值
-                sensor_meta)
+                sensor_meta,
+                self.affine)
 
+    '''
+    def __getitem__(self, index):
+
+        prev_surr_view_imgs = {}
+        curr_surr_view_imgs = {}
+
+        # 后续会按照这个顺序拼接，和 Range Image 对应 
+        camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                           'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+        
+        path_prefix = './Datasets/nuscenes/'
+        for channel in camera_channels:
+            prev_surr_view_imgs_path = os.path.join(path_prefix,
+                                                    self.image_list[index][0][channel]['filename'])
+            prev_surr_view_imgs[channel] = Image.open(prev_surr_view_imgs_path)
+
+            curr_surr_view_imgs_path = os.path.join(path_prefix,
+                                                    self.image_list[index][1][channel]['filename'])
+            curr_surr_view_imgs[channel] = Image.open(curr_surr_view_imgs_path)
+        
+        gt_scale_map = self.scale_map_list[index]
+        gt_risk_score_map = self.risk_score_map_list[index]
+        gt_depth_map = self.depth_map_list[index]
+
+        sensor_meta = self.sensor_meta_list[index]
+
+        # 转换为 Tensor
+        for channel in camera_channels:
+            prev_surr_view_imgs[channel] = torch.from_numpy(np.array(prev_surr_view_imgs[channel])).permute(2, 0, 1).float()
+            curr_surr_view_imgs[channel] = torch.from_numpy(np.array(curr_surr_view_imgs[channel])).permute(2, 0, 1).float()
+        
+        warped_prev = []
+        warped_curr = []
+        for channel in camera_channels:
+            # 1) 原始相机图像转 Tensor [3,H_cam,W_cam]
+            img_prev = prev_surr_view_imgs[channel]
+            img_curr = curr_surr_view_imgs[channel]
+
+            # 2) 从 sensor_meta 里获取投影信息
+            unit_range_view_vector = self.d.view(3, -1).T
+            # lidar 2 ego
+            rot_lidar_to_ego = Quaternion(sensor_meta['lidar']['calibrated_sensor']['rotation']).rotation_matrix
+            trans_lidar_to_ego = np.array(sensor_meta['lidar']['calibrated_sensor']['translation'])
+            unit_range_view_vector = unit_range_view_vector.T
+            unit_range_view_vector = np.dot(rot_lidar_to_ego, unit_range_view_vector).T
+            unit_range_view_vector += trans_lidar_to_ego
+
+            # ego 2 global
+            rot_ego_to_global = Quaternion(sensor_meta['lidar']['ego_pose']['rotation']).rotation_matrix
+            trans_ego_to_global = np.array(sensor_meta['lidar']['ego_pose']['translation'])
+            unit_range_view_vector = unit_range_view_vector.T
+            unit_range_view_vector = np.dot(rot_ego_to_global, unit_range_view_vector).T
+            unit_range_view_vector += trans_ego_to_global
+
+            # global 2 ego_camera
+            trans_global_to_ego_cam = -np.array(sensor_meta['camera']['ego_pose'][channel]['translation'])
+            rot_global_to_ego_cam = Quaternion(sensor_meta['camera']['ego_pose'][channel]['rotation']).rotation_matrix.T
+            unit_range_view_vector += trans_global_to_ego_cam
+            unit_range_view_vector = np.dot(rot_global_to_ego_cam, unit_range_view_vector.T).T
+
+            # ego_camera 2 camera
+            trans_ego_cam_to_camera = -np.array(sensor_meta['camera']['calibrated_sensor'][channel]['translation'])
+            rot_ego_cam_to_camera = Quaternion(sensor_meta['camera']['calibrated_sensor'][channel]['rotation']).rotation_matrix.T
+            unit_range_view_vector += trans_ego_cam_to_camera
+            unit_range_view_vector = np.dot(rot_ego_cam_to_camera, unit_range_view_vector.T).T
+
+            # camera 2 pixel
+            points_2d = view_points(unit_range_view_vector.T,
+                                    np.array(sensor_meta['camera']['calibrated_sensor'][channel]['camera_intrinsic']),
+                                    normalize=True)
+
+            points_2d = torch.from_numpy(points_2d).float()
+
+            u, v = points_2d[0], points_2d[1] # [H*W]
+            u_norm = 2*(u/(1600-1)) - 1  # 归一到 [-1,1]
+            v_norm = 2*(v/(900-1)) - 1
+            grid = torch.stack([u_norm, v_norm], dim=1)  # [H*W, 2]
+            grid = grid.view(1, self.H, self.W, 2)  # [1,H,W,2]
+
+            # 3) warp
+            warped_p = F.grid_sample(
+                img_prev.unsqueeze(0), grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True
+            )[0]  # [3,H,W]
+            warped_c = F.grid_sample(
+                img_curr.unsqueeze(0), grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True
+            )[0]
+
+            warped_prev.append(warped_p)
+            warped_curr.append(warped_c)
+
+        # 5) 最后再沿视角维度拼接成 [6,3,H,W]
+        prev_surr_view_imgs_tensor = torch.stack(warped_prev, dim=0)
+        curr_surr_view_imgs_tensor = torch.stack(warped_curr, dim=0)
+
+        # visualize_warped(prev_surr_view_imgs_tensor, channel_names=camera_channels)
+        visualize_concat(prev_surr_view_imgs_tensor, horizontal=True, title="Horizontally Concatenated Prev")
+
+        
+        # 数据增强
+        if self.augmentor is not None:
+            prev_surr_view_imgs = self.augmentor(prev_surr_view_imgs)
+            curr_surr_view_imgs = self.augmentor(curr_surr_view_imgs)
+
+        gt_scale_map = torch.from_numpy(gt_scale_map).float()
+        gt_risk_score_map = torch.from_numpy(gt_risk_score_map).float()
+        gt_depth_map = torch.from_numpy(gt_depth_map).float()
+
+        # scale 取 (0.3, 3.0) 之间的值
+        mask_scale = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
+        # risk score & depth 取相同的 mask
+        mask_risk_score = mask_scale
+        mask_depth = mask_scale
+        # 拼接gt_scale和mask
+        gt_scale_map_with_mask = torch.cat((gt_scale_map.unsqueeze(0), mask_scale.unsqueeze(0).float()), dim=0)
+        gt_risk_score_map_with_mask = torch.cat((gt_risk_score_map.unsqueeze(0), mask_risk_score.unsqueeze(0).float()), dim=0)
+        gt_depth_map_with_mask = torch.cat((gt_depth_map.unsqueeze(0), mask_depth.unsqueeze(0).float()), dim=0)
+
+        return (prev_surr_view_imgs_tensor,
+                curr_surr_view_imgs_tensor,
+                gt_scale_map_with_mask, # model 的输入以及真值
+                gt_risk_score_map_with_mask, # model 的输入以及真值
+                gt_depth_map_with_mask, # model 的输入以及真值
+                sensor_meta)
+    '''
     def __rmul__(self, v):
         self.image_list = v * self.image_list
         self.sensor_meta_list = v * self.sensor_meta_list
@@ -749,7 +1033,7 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
 
     elif args.stage == 'nuscenes_range_image':
         aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
-        train_info_file = 'nusc_trainval_infos_160_1920.pkl'
+        train_info_file = 'nusc_trainval_infos_160_1920_fov_8_15.pkl'
         train_info_path = './Datasets/nuscenes/2_trainval_test_infos'
 
         nuscenes = nuScenes_range_image(aug_params,

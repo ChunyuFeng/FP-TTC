@@ -3,13 +3,9 @@ import os
 import numpy as np
 import pickle
 from nuscenes.nuscenes import NuScenes
-# from tools.generate_ttc_nuscenes.utils.nusc_lidar_cam_match import (find_matching_camera_sweep_in_nusc,
-#                                                                        get_scale_map, find_matching_sf_sweep_in_lut)
 import matplotlib.pyplot as plt
 import argparse
-import matplotlib
-# from matplotlib.colors import ListedColormap, BoundaryNorm
-# matplotlib.use('TkAgg')
+from PIL import Image
 
 def compute_percentage_in_range(data_frame, t):
     """
@@ -113,7 +109,7 @@ def find_surround_view_images_for_same_frame(camera_data_dict, target_timestamp,
             return cam_data
     return None
 
-def range_projection(points, scales, risk_score, H=64, W=1024, fov_up=3.0, fov_down=-25.0):
+def range_projection(points, scales, risk_score, H=160, W=1920, fov_up=10.0, fov_down=-30.0):
     """
     将 3D 点云投影到 2D 球面范围图像。
 
@@ -122,10 +118,10 @@ def range_projection(points, scales, risk_score, H=64, W=1024, fov_up=3.0, fov_d
     - scales (np.ndarray): 尺度数据，形状为 [m,]，每个值表示对应点云处的 scale。
     - risk_score (np.ndarray): 风险系数，形状为 [m,]，每个值表示相邻帧的运动矢量指向原点的分量,
                                正值表示物体朝向原点运动，负值表示远离原点运动。
-    - H (int): 投影图像的高度（像素）。默认值为 64。
-    - W (int): 投影图像的宽度（像素）。默认值为 1024。
-    - fov_up (float): 向上的视场角（度）。默认值为 3.0。
-    - fov_down (float): 向下的视场角（度）。默认值为 -25.0。
+    - H (int): 投影图像的高度（像素）。默认值为 160。
+    - W (int): 投影图像的宽度（像素）。默认值为 1920。
+    - fov_up (float): 向上的视场角（度）。默认值为 8.0。
+    - fov_down (float): 向下的视场角（度）。默认值为 -15.0。
 
     返回:
     - proj_range (np.ndarray): 投影的深度图像，形状为 [H, W]。
@@ -234,6 +230,13 @@ def compute_radical_component(points_prev, points_curr):
 
 def main(args):
 
+    if args.trainval_test_split == 'trainval':
+        print("Creating TrainVal Info ...")
+    elif args.trainval_test_split == 'test':
+        print("Creating Test Info ...")
+    else:
+        raise ValueError("Invalid trainval_test_split value. Must be 'trainval' or 'test'.")
+
     ################################################ 创建场景流 LUT ################################################
     # folder name 包含了时间戳信息，读取所有的文件夹名称
     folder_names = [folder_name[:-4] if folder_name.endswith('.pcd') else folder_name
@@ -337,7 +340,7 @@ def main(args):
     lidar_data_matched_with_images = sorted(lidar_data_matched_with_images, key=lambda x: x['timestamp'])
 
     # 相邻两组数据进行组合，打包成可以直接用于训练的格式
-    trainval_infos = []
+    trainval_test_infos = []
     for i in tqdm(range(1, len(camera_lut)), desc="Combining camera and scene flow data"):
         # 取出连续两组数据
         previous_surround_view_data = camera_lut[i-1]
@@ -367,6 +370,9 @@ def main(args):
         current_sf_record = lidar_data_matched_with_images[i]
 
         scene_indice = current_sf_record['scene_indice']
+
+        # if scene_indice != '10':
+        #     continue
 
         # 读取 scene flow 数据
         if (not os.path.exists(os.path.join(args.scene_flow_path, current_sf_record['folder_name'], 'pc_prev.npy'))
@@ -400,11 +406,50 @@ def main(args):
             risk_score,
             H=args.image_size[0],
             W=args.image_size[1]*6,
-            fov_up=10.0, # nuscenes 使用的 LiDAR fov
-            fov_down=-30.0 
+            fov_up=args.fov[0], # nuscenes 使用的 LiDAR fov
+            fov_down=-args.fov[1]  # nuscenes 使用的 LiDAR fov
         )
 
-        range_image = {
+        proj_range_, proj_scale_, proj_risk_score_, proj_xyz_, proj_idx_, proj_mask_ = range_projection(
+            points_curr,
+            scales,
+            risk_score,
+            H=args.image_size[0],
+            W=args.image_size[1]*6,
+            fov_up=args.fov[0], # nuscenes 使用的 LiDAR fov
+            fov_down=-args.fov[1]  # nuscenes 使用的 LiDAR fov
+        )
+
+        # # [TODO] ONEBEV 的 stitch 函数，仍然有重叠，且没有与 range image 对齐，需要改进
+        # image_list = []
+        # cam_info_list = []
+        # camera_channel_stitch = [
+        #     'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_FRONT_LEFT',
+        #     'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_RIGHT'
+        # ]
+        # for camera_channel in camera_channel_stitch:
+        #     filename = current_surround_view_data[camera_channel]['filename']
+        #     image_path = os.path.join(nusc.dataroot, filename)
+        #     image_list.append(cv2.imread(image_path))
+
+        #     cs_record = nusc.get('calibrated_sensor', 
+        #                          current_surround_view_data[camera_channel]['calibrated_sensor_token'])
+            
+        #     cam_info_list.append({
+        #         "translation": 
+        #         cs_record['translation'],
+        #         "rotation":
+        #         cs_record['rotation'],
+        #         "camera_intrinsic":
+        #         cs_record['camera_intrinsic'],
+        #     })
+
+        # pano_image_rgb = stitch(
+        #     image_list,
+        #     cam_info_list
+        # )
+
+        range_image_prev = {
             'depth': proj_range,
             'scale': proj_scale,
             'risk_score': proj_risk_score,
@@ -413,18 +458,47 @@ def main(args):
             'mask': proj_mask
         }
 
+        range_image_curr = {
+            'depth': proj_range_,
+            'scale': proj_scale_,
+            'risk_score': proj_risk_score_,
+            'xyz': proj_xyz_,
+            'idx': proj_idx_,
+            'mask': proj_mask_
+        }
+
         range_image_save_path = os.path.join(args.gt_map_save_path,
-                                             f'range_image_all_frames_{args.image_size[0]}_{args.image_size[1]*6}',
+                                             f'range_image_all_frames_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}',
                                              current_sf_record['folder_name'])
         if not os.path.exists(range_image_save_path):
             os.makedirs(range_image_save_path)
         
         # 保存 range image 为 npy 文件
-        np.save(os.path.join(range_image_save_path, 'range_image.npy'), range_image)
+        np.save(os.path.join(range_image_save_path, 'range_image_prev.npy'), range_image_prev)
+        np.save(os.path.join(range_image_save_path, 'range_image_curr.npy'), range_image_curr)
 
         # 读取 LiDAR 和 Camera 对应的标定信息，作为 sensor_metas 传入网络
         camera_calib = {}
         camera_pose = {}
+        # prev 帧的标定信息
+        for camera_channel in camera_channels:
+            camera_data = previous_surround_view_data[camera_channel]
+            camera_calib[camera_channel] = nusc.get('calibrated_sensor', camera_data['calibrated_sensor_token'])
+            camera_pose[camera_channel] = nusc.get('ego_pose', camera_data['ego_pose_token'])
+        lidar_calib = nusc.get('calibrated_sensor', previous_sf_record['calibrated_sensor_token'])
+        lidar_pose = nusc.get('ego_pose', previous_sf_record['ego_pose_token'])
+        sensor_metas_prev = {
+            'lidar':{
+                'calibrated_sensor': lidar_calib,
+                'ego_pose': lidar_pose,
+            },
+            'camera':{
+                'calibrated_sensor': camera_calib,
+                'ego_pose': camera_pose,
+            }
+        }
+
+        # curr 帧的标定信息
         for camera_channel in camera_channels:
             camera_data = current_surround_view_data[camera_channel]
             camera_calib[camera_channel] = nusc.get('calibrated_sensor', camera_data['calibrated_sensor_token'])
@@ -432,7 +506,7 @@ def main(args):
 
         lidar_calib = nusc.get('calibrated_sensor', current_sf_record['calibrated_sensor_token'])
         lidar_pose = nusc.get('ego_pose', current_sf_record['ego_pose_token'])
-        sensor_metas = {
+        sensor_metas_curr = {
             'lidar':{
                 'calibrated_sensor': lidar_calib,
                 'ego_pose': lidar_pose,
@@ -448,13 +522,14 @@ def main(args):
             'curr_camera_data': current_surround_view_data,
             'prev_lidar_data': lidar_data_matched_with_images[i-1], 
             'curr_lidar_data': lidar_data_matched_with_images[i],
-            'sensor_metas': sensor_metas,
+            'sensor_metas_prev': sensor_metas_prev,
+            'sensor_metas_curr': sensor_metas_curr,
             'gt_map_path': range_image_save_path,
             'scene_flow_path': os.path.join(args.scene_flow_path, current_sf_record['folder_name']),
             'scene_indice': scene_indice
         }
         
-        trainval_infos.append(info)
+        trainval_test_infos.append(info)
 
         ###################################### 可视化 ######################################
         if args.risk_score_map_vis:
@@ -486,7 +561,7 @@ def main(args):
                     normalized_risk_score[neg_mask] = 0.0
             
             risk_score_vis_save_path = os.path.join(args.vis_dir, 'risk_score_map',
-                                                f"{args.image_size[0]}_{args.image_size[1]*6}")
+                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}")
             
             if not os.path.exists(risk_score_vis_save_path):
                 os.makedirs(risk_score_vis_save_path)
@@ -495,8 +570,7 @@ def main(args):
 
             plt.imsave(os.path.join(risk_score_vis_save_path, risk_score_vis_name),
                        normalized_risk_score, cmap='seismic', vmin=-1, vmax=1)
-
-                
+             
         if args.scale_map_vis:
             scale_display = np.copy(proj_scale)
 
@@ -541,7 +615,7 @@ def main(args):
             normalized_display[~valid_mask] = 0.0
             
             scale_map_vis_save_path = os.path.join(args.vis_dir, 'scale_map',
-                                                f"{args.image_size[0]}_{args.image_size[1]*6}")
+                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}")
             if not os.path.exists(scale_map_vis_save_path):
                 os.makedirs(scale_map_vis_save_path)
 
@@ -557,10 +631,11 @@ def main(args):
     
     # 对 camera_lut 和 lidar_data_matched_with_images 
     print(f"Succesfully created (Surround View Images Pair & Lidar Sample Data Pair & Scene Flow & Scale Map & Depth Map & Risk Score Map). \
-          Sorted by timestamp. {len(trainval_infos)} items in total.")
+          Sorted by timestamp. {len(trainval_test_infos)} items in total.")
 
-    with open(os.path.join(args.pkl_save_path, f"nusc_trainval_infos_{args.image_size[0]}_{args.image_size[1]*6}.pkl"), 'wb') as f:
-        pickle.dump(trainval_infos, f)
+    with open(os.path.join(args.pkl_save_path,
+                           f"nusc_{args.trainval_test_split}_infos_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}.pkl"),'wb') as f:
+        pickle.dump(trainval_test_infos, f)
     print(f"Saved nusc_trainval_infos.pkl to {args.pkl_save_path}")
 
 if __name__ == "__main__":
@@ -579,6 +654,10 @@ if __name__ == "__main__":
                        help='Path to save visualization outputs')
     parser.add_argument('--image_size', default=[160, 320], type=int, nargs='+',
                        help='image size for training')
+    parser.add_argument('--fov', default=[10, 20], type=int, nargs='+',
+                       help='LiDAR fov, [fov_up, fov_down], in degree')
+    parser.add_argument('--trainval_test_split', default='trainval', type=str,
+                       help='trainval and test split, can be trainval or test')
     # parser.add_argument('--save_gt', default=False, type=bool,
     #                    help='Flag to control whether to save ground truth map (including scale map, depth map and risk score map)')
     parser.add_argument('--scale_map_vis', action='store_true',
