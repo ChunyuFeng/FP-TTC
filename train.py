@@ -280,6 +280,9 @@ def main():
     if parallel:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
                         output_device=local_rank, find_unused_parameters=True)
+
+        base_model = model.module if hasattr(model, "module") else model
+
         # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
         #                 output_device=local_rank)
         if torch.distributed.get_rank()==0:
@@ -289,6 +292,7 @@ def main():
                     loss_txt = out_dir + '/0.txt'
                     file = open(loss_txt,'w')
                     file.close()
+        
         # else:
         #     torch.distributed.barrier()
     else:
@@ -334,12 +338,12 @@ def main():
             p.requires_grad = True
 
         # 拆分三档参数组
-        params_cnet   = list(model.cnet.parameters())
-        params_fusion = list(model.scale_fuser.parameters())
+        params_cnet   = list(base_model.cnet.parameters())
+        params_fusion = list(base_model.scale_fuser.parameters())
         # 中间层：除 cnet、fusion 以外的所有参数
         fusion_ids = {id(p) for p in params_fusion}
         cnet_ids   = {id(p) for p in params_cnet}
-        params_mid = [p for p in model.parameters()
+        params_mid = [p for p in base_model.parameters()
                       if id(p) not in fusion_ids and id(p) not in cnet_ids]
 
         optimizer = torch.optim.AdamW([

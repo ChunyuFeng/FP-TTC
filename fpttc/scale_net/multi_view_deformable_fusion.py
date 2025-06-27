@@ -1,193 +1,11 @@
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-# from torch.utils.checkpoint import checkpoint
-# from mmcv.cnn import xavier_init, constant_init
-# from ..modules.position import PositionEmbeddingSine
-# from .scale_encoder import TransformerBlock
-
-# class MultiViewDeformableFusion(nn.Module):
-#     def __init__(self,
-#                  num_layers: int,
-#                  input_dim: int,
-#                  d_model: int,
-#                  nhead: int,
-#                  per_level_channels: int,
-#                  num_scales: int,
-#                  num_views: int,
-#                  R: int,
-#                  range_image_feat_shape: list):
-#         """
-#         Args:
-#           num_layers:       DeformAttn 层数
-#           input_dim:        每个尺度原特征图通道数 C
-#           d_model:          attention 内维度
-#           nhead:            注意头数
-#           per_level_channels: 每个尺度拼接后的通道数 (C*num_views)
-#           num_scales:       特征尺度数
-#           num_views:        视角数量
-#           R:                沿射线方向采样点数
-#           range_image_feat_shape: list of (H_i,W_i) 球面栅格分辨率 per scale
-#         """
-#         super().__init__()
-#         self.d_model    = d_model
-#         self.nhead      = nhead
-#         self.num_scales = num_scales
-#         self.num_views  = num_views
-#         self.R          = R
-#         # 每个尺度对应的球面栅格分辨率
-#         self.range_image_feat_shape = range_image_feat_shape
-
-#         # 为每个尺度构造可学习 query embedding
-#         self.query_embeds = nn.ParameterList([
-#             nn.Parameter(torch.randn(1, d_model, H_i, W_i))
-#             for (H_i, W_i) in range_image_feat_shape
-#         ])
-#         # 位置编码
-#         self.pos_enc = PositionEmbeddingSine(num_pos_feats=d_model//2)
-
-#         # 注意 value 投影: concat across scales of per_level_channels
-#         self.value_proj = nn.Conv1d(per_level_channels, d_model, kernel_size=1)
-
-        
-#         # 1D 卷积：在 R 维度学习加权聚合
-#         self.ref_agg = nn.Conv1d(in_channels=2, out_channels=2, kernel_size=R, bias=False)
-
-#         # TransformerBlock layers
-#         self.layers = nn.ModuleList([
-#             TransformerBlock(
-#                 d_model=d_model,
-#                 num_head=nhead,
-#                 num_points=R,
-#                 num_level=num_scales
-#             ) for _ in range(num_layers)
-#         ])
-#         # 初始化
-#         for p in self.parameters():
-#             if p.dim()>1:
-#                 xavier_init(p, distribution='uniform')
-
-#     def forward(self,
-#                 mv_feats: list,
-#                 uv_map: torch.Tensor,
-#                 cam_idx_map: torch.Tensor,
-#                 valid_mask: torch.Tensor,
-#                 augmentor_affine: torch.Tensor):
-#         """
-#         mv_feats: List[num_scales] of [B, C*num_views, Hi, Wi]
-#         uv_map: [B, H0, W0, R, 2]
-#         augmentor_affine: [B,3,3]
-#         returns: List[fused_feats_i] each [B, d_model, H_i, W_i]
-#         """
-#         B = mv_feats[0].shape[0]
-#         # 1) 准备 value
-#         feat_flats = []
-#         spatial_shapes = []
-#         for lvl, feat in enumerate(mv_feats):
-#             _, C, Hi, Wi = feat.shape
-#             spatial_shapes.append((Hi, Wi))
-#             feat_flats.append(feat.flatten(2))  # [B, C, Hi*Wi]
-#         feat_cat = torch.cat(feat_flats, dim=2)   # [B, C_total, sum(Hi*Wi)]
-#         value = self.value_proj(feat_cat)         # [B, d_model, S]
-#         value = value.permute(0,2,1).unsqueeze(2).repeat(1,1,self.nhead,1)
-#         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=value.device)
-#         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-
-#         fused_feats = []
-#         # 2) 每尺度分别做可变形 attention
-#         for lvl in range(self.num_scales):
-#             if lvl == 0:
-#                 H_i, W_i = self.range_image_feat_shape[lvl]
-#                 # query
-#                 query = self.query_embeds[lvl].repeat(B,1,1,1)
-#                 query = query + self.pos_enc(query)
-#                 # reference points
-#                 ref = self.get_reference_points_per_scale(
-#                     uv_map, augmentor_affine, mv_feats, lvl, H_i, W_i
-#                 )  # [B, H_i*W_i, num_scales, R, 2]
-
-#                 # # R 维度学习加权聚合 → collapse to 1
-#                 # Bq, Nq, S, R, _ = ref_raw.shape
-#                 # ref_flat = ref_raw.view(Bq*Nq*S, R, 2).permute(0,2,1)  # [BqNqS, 2, R]
-#                 # agg = self.ref_agg(ref_flat)                           # [BqNqS, 2, 1]
-#                 # agg = agg.permute(0,2,1)                               # [BqNqS,1,2]
-#                 # reference_points = agg.view(Bq, Nq, S, 1, 2)           # [B, H_i*W_i, num_scales,1,2]
-
-#                 # flatten query
-#                 _, _, Hi, Wi = query.shape
-#                 query_flat = query.flatten(2).permute(0,2,1)  # [B, Hi*Wi, d_model]
-#                 # apply each TransformerBlock
-#                 for layer in self.layers:
-#                     query_flat = layer(
-#                         query_flat, value,
-#                         height=Hi, width=Wi,
-#                         query_location=ref,
-#                         spatial_shapes=spatial_shapes,
-#                         level_start_index=level_start_index
-#                     )
-#                 fused = query_flat.permute(0,2,1).view(B, self.d_model, Hi, Wi)
-#             else:
-#                 # 对于 high resolution 尺度，使用前一步的上采样
-#                 fused_0 = fused_feats[0]  # [B, d_model, H_0, W_0]
-#                 H_i, W_i = self.range_image_feat_shape[lvl]
-#                 # 上采样到当前尺度
-#                 fused = F.interpolate(
-#                     fused_0,
-#                     size=(H_i, W_i),
-#                     mode='bilinear',
-#                     align_corners=True
-#                 )
-#             fused_feats.append(fused)
-#         return fused_feats
-
-#     def get_reference_points_per_scale(self,
-#                                       uv_map: torch.Tensor,
-#                                       A: torch.Tensor,
-#                                       mv_feats: list,
-#                                       lvl: int,
-#                                       H_i: int,
-#                                       W_i: int):
-#         """
-#         计算指定 lvl 的特征对应的 reference points [B, H_i*W_i, num_scales, R, 2]
-#         """
-#         B, H0, W0, R, _ = uv_map[lvl].shape
-#         N0 = H0 * W0 * R
-#         # flatten uv
-#         uv_flat = uv_map[lvl].view(B, N0, 2)
-#         ones = uv_flat.new_ones((B, N0, 1))
-#         hom = torch.cat([uv_flat, ones], dim=-1)  # [B,N0,3]
-#         # 仿射，计算经过图像增强后的坐标
-#         hom_t = torch.matmul(hom, A.transpose(1,2))  # [B,N0,3]
-#         uv_t = hom_t[..., :2]  # [B,N0,2]
-#         # 下采样到 feat coords
-#         scale_h = H0 / H_i
-#         scale_w = W0 / W_i
-#         uv_lvl = uv_t.clone()
-#         uv_lvl[...,0] /= scale_w
-#         uv_lvl[...,1] /= scale_h
-#         # 归一化
-#         x_norm = (uv_lvl[...,0] / (W_i - 1)) * 2 - 1
-#         y_norm = (uv_lvl[...,1] / (H_i - 1)) * 2 - 1
-#         ref = torch.stack([x_norm, y_norm], dim=-1)  # [B,N0,2]
-#         # reshape为 [B,H0*W0,R,2]
-#         ref = ref.view(B, H0*W0, R, 2)
-#         # 选取基于 H_i,W_i 对应的前 H_i*W_i
-#         # 假设 H_i and W_i 刚好是 H0/k, W0/k, 那么每个 query 对应 R 连续
-#         # 这里简化：按行优先取前 H_i*W_i*R
-#         Nq = H_i * W_i * R
-#         ref_q = ref.view(B, H0*W0*R, 2)[:, :Nq, :]
-#         # reshape到 [B,H_i*W_i,R,2] -> [B,H_i*W_i,1,R,2] -> 扩 num_scales
-#         ref_q = ref_q.view(B, H_i*W_i, R, 2).unsqueeze(2)
-#         ref_q = ref_q.repeat(1,1,self.num_scales,1,1)
-#         return ref_q
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from mmcv.cnn import xavier_init, constant_init
 from ..modules.position import PositionEmbeddingSine
-from .scale_encoder import TransformerBlock
+import math
+from .utils.multi_scale_deformable_attn_function import MultiScaleDeformableAttnFunction_fp32
 
 class MultiViewDeformableFusion(nn.Module):
     def __init__(
@@ -380,49 +198,102 @@ class MultiViewDeformableFusion(nn.Module):
         ref_q = ref_pixel.unsqueeze(2).repeat(1, 1, self.num_scales, 1, 1)  # [B, Nq0, S, R, 2]
         return ref_q, cam_idx_q, valid_q
     
-    # def get_reference_points_per_scale(
-    #     self,
-    #     uv: torch.Tensor,            # [B, H0, W0, R, 2] 原始投影坐标
-    #     A: torch.Tensor,             # [B, 3, 3] 仿射增强矩阵
-    #     mv_feats: list,
-    #     lvl: int,
-    #     H_i: int,
-    #     W_i: int,
-    #     cam_idx: torch.Tensor,       # [B, H0, W0, R]
-    #     valid_mask: torch.Tensor     # [B, H0, W0, R]
-    # ):
-    #     B, H0, W0, R, _ = uv.shape
-    #     N0 = H0 * W0 * R
-    #     # (1) 仿射变换
-    #     uv_flat = uv.view(B, N0, 2)
-    #     ones = uv_flat.new_ones((B, N0, 1))
-    #     hom = torch.cat([uv_flat, ones], dim=-1)         # [B, N0, 3]
-    #     hom_t = torch.matmul(hom, A.transpose(1, 2))    # [B, N0, 3]
-    #     uv_t = hom_t[..., :2]                           # [B, N0, 2]
 
-    #     # (2) 下采样到 feature map 尺度
-    #     uv_lvl = uv_t.clone()
-    #     uv_lvl[..., 0] /= (W0 / W_i)
-    #     uv_lvl[..., 1] /= (H0 / H_i)
+class TransformerBlock(nn.Module):
+    """self attention + cross attention + FFN"""
 
-    #     # (3) 归一化到 [-1,1]
-    #     x_norm = (uv_lvl[..., 0] / (W_i - 1)) * 2 - 1
-    #     y_norm = (uv_lvl[..., 1] / (H_i - 1)) * 2 - 1
-    #     ref_flat = torch.stack([x_norm, y_norm], dim=-1)  # [B, N0, 2]
+    def __init__(self,
+                 d_model=128,
+                 num_head=1,
+                 num_points = 8,
+                 num_level=2,
+                 dropout=0.1
+                 ):
+        super(TransformerBlock, self).__init__()
 
-    #     # (4) Flatten cam_idx & valid_mask 并 mask 无效
-    #     cam_idx_flat = cam_idx.view(B, N0)               # [B, N0]
-    #     valid_flat = valid_mask.view(B, N0)              # [B, N0]
-    #     ref_flat[~valid_flat] = -2.0                     # 越界值 -> grid_sample 返回 0
+        self.d_model = d_model
+        self.num_points = num_points
+        self.num_level = num_level
+        self.num_head = num_head
 
-    #     # (5) 取前 Nq 并 reshape
-    #     Nq = H_i * W_i * R
-    #     ref_q_flat = ref_flat[:, :Nq, :]                 # [B, Nq, 2]
-    #     cam_idx_q = cam_idx_flat[:, :Nq]                 # [B, Nq]
-    #     valid_q = valid_flat[:, :Nq]                     # [B, Nq]
-    #     # 重塑为 [B, H_i*W_i, R, 2] -> [B, H_i*W_i, 1, R, 2] -> repeat scales
-    #     ref_q = ref_q_flat.view(B, H_i * W_i, R, 2)
-    #     ref_q = ref_q.unsqueeze(2).repeat(1, 1, self.num_scales, 1, 1)
-    #     return ref_q, cam_idx_q, valid_q
+        self.sampling_offsets = nn.Linear(d_model, num_head*num_level*num_points* 2)
+        self.attention_weights = nn.Linear(d_model, num_head*num_level*num_points)
+        self.value_proj = nn.Linear(d_model, d_model)
+        self.output_proj = nn.Linear(d_model*num_head, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        self.MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
+
+        self.init_weights()
 
 
+    def init_weights(self):
+        constant_init(self.sampling_offsets, 0.)
+        thetas = torch.arange(
+            self.num_head,
+            dtype=torch.float32) * (2.0 * math.pi / self.num_head)
+        grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
+        grid_init = (grid_init /
+                     grid_init.abs().max(-1, keepdim=True)[0]).view(
+            self.num_head, 1, 1,
+            2).repeat(1, self.num_level, self.num_points, 1)
+
+        for i in range(self.num_points):
+            grid_init[:, :, i, :] *= i + 1
+
+        self.sampling_offsets.bias.data = grid_init.view(-1)
+        constant_init(self.attention_weights, val=0., bias=0.)
+        xavier_init(self.value_proj, distribution='uniform', bias=0.)
+        xavier_init(self.output_proj, distribution='uniform', bias=0.)
+        self._is_init = True
+
+
+    def forward(self, query, value,
+                height=None,
+                width=None,
+                query_location=None,
+                spatial_shapes=None,
+                level_start_index=None,
+                ):
+        '''
+        query: [bs, hw, c]
+        value: [bs, num_value, c]
+        query_location: [bs, hw, num_level, 2]
+        spatial_shapes: [2, 2]
+        level_start_index: [2]
+        '''
+
+        bs, num_query, c = query.shape
+
+        sampling_offsets = self.sampling_offsets(query)\
+                .view(bs, num_query, self.num_head, self.num_level, self.num_points, 2)
+        attention_weights = self.attention_weights(query)\
+                .view(bs, num_query, self.num_head, self.num_level*self.num_points).softmax(-1)
+        attention_weights = attention_weights\
+                .view(bs, num_query, self.num_head, self.num_level, self.num_points)
+    
+        offset_normalizer = torch.stack(
+            [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+       
+        # 1) 在第 2 维（head 维）插入一个维度，然后 expand 到 num_head
+        reference_points = query_location.unsqueeze(2)   # [B, Q, 1, L, P, 2]
+        reference_points = reference_points.expand(
+            -1, -1, self.num_head, -1, -1, -1
+        )                                                 # [B, Q, H, L, P, 2]
+
+        # 2) 计算最终采样位置
+        sampling_locations = reference_points \
+            + sampling_offsets / offset_normalizer[None, None, :, None, None, :]
+        # sampling_locations = query_location[:, :, None, :, None, :] \
+        #     + sampling_offsets \
+        #     / offset_normalizer[None, :, None, :]
+
+        output = self.MultiScaleDeformableAttnFunction.apply(
+            value, spatial_shapes, level_start_index, sampling_locations,attention_weights)
+        #print(self.num_level, self.num_points)
+        #print(self.num_head, output.shape)
+        
+        # output: (bs, num_query, c)
+        output = self.output_proj(output)
+
+        return self.dropout(output)

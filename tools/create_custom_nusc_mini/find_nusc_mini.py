@@ -25,8 +25,7 @@ def main(args):
     if data is not None:
         data_length = len(data)
         for i in tqdm(range(data_length), desc="Processing data"):
-            if data[i]['scene_indice'] != "3":
-                continue
+
             prev_camera_data = data[i]['prev_camera_data']
             curr_camera_data = data[i]['curr_camera_data']
 

@@ -276,7 +276,6 @@ class FpTTC(nn.Module):
         corr_enc_r = corr_enc_r[:, 1:]
         risk_score = self.risknet(corr_enc_r, mlvl_r0, mlvl_r1, ini_risk)
 
-        del prev_r_feats, curr_r_feats
         del corr_r, mlvl_r0, mlvl_r1
         del feature0_lvls, feature1_lvls
 
