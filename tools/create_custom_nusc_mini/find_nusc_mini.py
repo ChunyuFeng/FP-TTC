@@ -25,6 +25,16 @@ def main(args):
     if data is not None:
         data_length = len(data)
         for i in tqdm(range(data_length), desc="Processing data"):
+            if i == 0:
+                scene_counts = {}
+            scene_indice = data[i].get('scene_indice')
+            scene_counts[scene_indice] = scene_counts.get(scene_indice, 0) + 1
+            if i == data_length - 1:
+                print("每个场景的样本数量:")
+                for scene, count in scene_counts.items():
+                    print(f"场景 {scene}: {count} 条样本")
+
+        for i in tqdm(range(data_length), desc="Processing data"):
 
             prev_camera_data = data[i]['prev_camera_data']
             curr_camera_data = data[i]['curr_camera_data']

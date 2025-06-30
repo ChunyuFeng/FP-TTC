@@ -11,11 +11,12 @@ import torch.distributed as dist
 import dataloader.dataset as datasets
 from fpttc.fp_ttc import FpTTC
 from utils.trainer import TTCTrainer
+from utils.dist import is_main_process
 
 import neptune
 
 time_stamp = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
-out_dir = "./log/%s_selfcon_ttc"%(time_stamp)
+out_dir = "./log/%s_surround_ttc"%(time_stamp)
 
 parser = argparse.ArgumentParser()
 
@@ -75,7 +76,7 @@ parser.add_argument('--num_transformer_layers', default=6, type=int)
 parser.add_argument('--reg_refine', action='store_true',
                     help='optional task-specific local regression refinement')
 parser.add_argument('--parallel', action='store_true',
-                    help='optional task-specific local regression refinement')
+                    help='use distributed data parallel for training')
 parser.add_argument('--load_opt', action='store_true',
                     help='optional task-specific local regression refinement')
 
@@ -90,6 +91,8 @@ parser.add_argument('--prop_radius_list', default=[-1], type=int, nargs='+',
                     help='self-attention radius for propagation, -1 indicates global attention')
 parser.add_argument('--num_reg_refine', default=1, type=int,
                     help='number of additional local regression refinement')
+parser.add_argument('--radial_sampling_num', default=8, type=int,
+                    help='number of radial sampling points for spherical coordinates')
 
 # loss
 parser.add_argument('--gamma', default=0.9, type=float,
@@ -144,14 +147,6 @@ parser.add_argument('--freeze_cnet', action='store_true',
 parser.add_argument('--fine_tune_cnet', action='store_true',
                     help='fine tune cnet')
 
-
-parser.add_argument('--finetune', action='store_true',
-                    help='run two-stage fine-tuning')
-parser.add_argument('--ft_epoch_s1', type=int, default=50,
-                    help='stage1 epochs (freeze cnet)')
-parser.add_argument('--ft_epoch_s2', type=int, default=150,
-                    help='stage2 epochs (unfreeze cnet)')
-
 # neptune
 parser.add_argument('--neptune', action='store_true',
                     help='use neptune for logging')
@@ -178,18 +173,18 @@ def main():
     else:
         run = None
 
-    model = FpTTC(num_scales=args.num_scales,
-                  feature_channels=args.feature_channels,
-                  upsample_factor=args.upsample_factor,
-                  num_head=args.num_head,
-                  ffn_dim_expansion=args.ffn_dim_expansion,
-                  num_transformer_layers=args.num_transformer_layers,
-                  range_image_feat_shape=[(20, 240), (40, 480)],
-                  reg_refine=args.reg_refine,
-                  load_cnet=args.load_cnet,
-                  pretrained_cnet_path=args.load_cnet_path,
-                  freeze_cnet=args.freeze_cnet,
-                  train=True).cuda()
+    model = FpTTC(num_scales             = args.num_scales,
+                  feature_channels       = args.feature_channels,
+                  upsample_factor        = args.upsample_factor,
+                  num_head               = args.num_head,
+                  ffn_dim_expansion      = args.ffn_dim_expansion,
+                  num_transformer_layers = args.num_transformer_layers,
+                  reg_refine             = args.reg_refine,
+                  radial_sampling        = args.radial_sampling_num,
+                  load_cnet              = args.load_cnet,
+                  pretrained_cnet_path   = args.load_cnet_path,
+                  freeze_cnet            = args.freeze_cnet,
+                  train                  = True).cuda()
     
     max_lr = args.lr
     ini_lr = max_lr / 25
@@ -262,7 +257,6 @@ def main():
             epoch = checkpoint.get('epoch', 0)
             optimizer.load_state_dict(checkpoint['optimizer'])
 
-        # 先挑出 state_dict
         if 'model' in checkpoint:
             sd = checkpoint['model']
         elif 'net' in checkpoint:
@@ -272,16 +266,13 @@ def main():
         else:
             sd = checkpoint
 
-        # 加载时用 strict=False，跳过缺失的 scale_fuser 权重
         model.load_state_dict(sd, strict=False)
-        if is_main_process(parallel):
-            print("[WARN] Resuming with strict=False, missing keys (scale_fuser) ignored.")
+        if is_main_process():
+            print("[WARN] Resuming with strict=False, missing keys ignored.")
     
     if parallel:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
                         output_device=local_rank, find_unused_parameters=True)
-
-        base_model = model.module if hasattr(model, "module") else model
 
         # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
         #                 output_device=local_rank)
@@ -292,15 +283,9 @@ def main():
                     loss_txt = out_dir + '/0.txt'
                     file = open(loss_txt,'w')
                     file.close()
-        
-        # else:
-        #     torch.distributed.barrier()
+
     else:
         if not os.path.isdir(out_dir):
-            # os.mkdir(out_dir)
-            # loss_txt = out_dir + '/0.txt'
-            # file = open(loss_txt,'w')
-            # file.close()
             os.makedirs(out_dir)  # 创建多层目录
             loss_txt = os.path.join(out_dir, '0.txt')  # 构建文件路径
             with open(loss_txt, 'w') as file:
@@ -308,178 +293,26 @@ def main():
 
     
     start = time.time()
-    if is_main_process(args.parallel):
+    if is_main_process():
         print('Start Loading ...')
     dataset = datasets.fetch_dataloader(args)
-    if is_main_process(args.parallel):
+    if is_main_process():
         print('Done ', time.time()-start)
-    if is_main_process(args.parallel):
-        print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr'])
+        print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr'])        
 
-    # trainer = TTCTrainer(model=model, dataset=dataset, optimizer=optimizer, args=args, 
-    #                     start_epoch=epoch, device=device, model_path=args.resume, 
-    #                     parallel=parallel, time_stamp=time_stamp, max_lr=max_lr,
-    #                     neptune_run=run)
+    trainer = TTCTrainer(model       = model,
+                         dataset     = dataset,
+                         optimizer   = optimizer, 
+                         args        = args, 
+                         start_epoch = epoch,
+                         device      = device, 
+                         model_path  = args.resume, 
+                         parallel    = parallel,
+                         time_stamp  = time_stamp, 
+                         max_lr      = max_lr,
+                         neptune_run = run)
     
-    # trainer.train()
-
-    trainer = TTCTrainer(model=model, dataset=dataset,
-                        optimizer=optimizer, args=args, start_epoch=epoch,
-                        device=device, model_path=args.resume, parallel=parallel,
-                        time_stamp=time_stamp, max_lr=max_lr,
-                        neptune_run=run)
-    
-    if args.finetune:
-        base_lr = args.lr
-        steps_per_epoch = len(dataset)
-
-        # 全网可训练（不再 freeze）
-        for p in model.parameters():
-            p.requires_grad = True
-
-        # 拆分三档参数组
-        params_cnet   = list(base_model.cnet.parameters())
-        params_fusion = list(base_model.scale_fuser.parameters())
-        # 中间层：除 cnet、fusion 以外的所有参数
-        fusion_ids = {id(p) for p in params_fusion}
-        cnet_ids   = {id(p) for p in params_cnet}
-        params_mid = [p for p in base_model.parameters()
-                      if id(p) not in fusion_ids and id(p) not in cnet_ids]
-
-        optimizer = torch.optim.AdamW([
-            {'params': params_cnet,
-             'max_lr': base_lr * 0.1,
-             'initial_lr': (base_lr*0.1)/25,
-             'min_lr': (base_lr*0.1)/1e4},
-            {'params': params_mid,
-             'max_lr': base_lr * 0.5,
-             'initial_lr': (base_lr*0.5)/25,
-             'min_lr': (base_lr*0.5)/1e4},
-            {'params': params_fusion,
-             'max_lr': base_lr,
-             'initial_lr': base_lr/25,
-             'min_lr': base_lr/1e4},
-        ], lr=base_lr * 0.1, weight_decay=args.weight_decay)
-
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=[base_lr*0.1, base_lr*0.5, base_lr],
-            epochs=args.ft_epoch_s2,
-            steps_per_epoch=steps_per_epoch,
-            pct_start=0.05,
-            cycle_momentum=False,
-            anneal_strategy='cos',
-            last_epoch=-1,
-        )
-
-        trainer.optimizer     = optimizer
-        trainer.lr_scheduler3 = scheduler
-        for ep in range(args.ft_epoch_s2):
-            if is_main_process(parallel):
-                print(f"[Fine-tune] Epoch {ep+1}/{args.ft_epoch_s2}")
-            trainer.train_epoch(ep)
-    else:
-        trainer.train()
-
-'''
-    # if args.finetune:
-    #     base_lr = args.lr  # e.g. 4e-4
-    #     steps_per_epoch = len(dataset)  # 或 len(train_loader)
-
-    #     # —— Stage 1：冻结 cnet，仅 train 老模块 + 新模块 —— 
-    #     for name, p in model.named_parameters():
-    #         if name.startswith("cnet"):
-    #             p.requires_grad = False
-
-    #     # 参数分组：老模块 vs 新模块
-    #     params_fusion = list(model.scale_fuser.parameters())
-    #     params_old = [p for n,p in model.named_parameters()
-    #                   if p.requires_grad and all(not n.startswith("cnet")) 
-    #                   and p not in params_fusion]
-
-    #     optimizer1 = torch.optim.AdamW([
-    #         {'params': params_old,
-    #          'max_lr': base_lr * 0.5,
-    #          'initial_lr': (base_lr*0.5)/25,
-    #          'min_lr': (base_lr*0.5)/1e4},
-    #         {'params': params_fusion,
-    #          'max_lr': base_lr,
-    #          'initial_lr': base_lr/25,
-    #          'min_lr': base_lr/1e4}
-    #     ], lr=base_lr * 0.5, weight_decay=args.weight_decay)
-
-    #     scheduler1 = torch.optim.lr_scheduler.OneCycleLR(
-    #         optimizer1,
-    #         max_lr=[base_lr*0.5, base_lr],
-    #         epochs=args.ft_epoch_s1,
-    #         steps_per_epoch=steps_per_epoch,
-    #         pct_start=0.05,
-    #         cycle_momentum=False,
-    #         anneal_strategy='cos',
-    #         last_epoch=-1,
-    #     )
-
-    #     trainer.optimizer = optimizer1
-    #     trainer.lr_scheduler3 = scheduler1
-    #     for ep in range(args.ft_epoch_s1):
-    #         if is_main_process(parallel):
-    #             print(f"[Fine-tune Stage1] Epoch {ep+1}/{args.ft_epoch_s1}")
-    #         trainer.train_epoch(ep)
-
-    #     # —— Stage 2：解冻 cnet，三组参数分档 LR —— 
-    #     for p in model.cnet.parameters():
-    #         p.requires_grad = True
-
-    #     params_cnet   = list(model.cnet.parameters())
-    #     params_mid    = params_old
-    #     params_fusion = list(model.scale_fuser.parameters())
-
-    #     optimizer2 = torch.optim.AdamW([
-    #         {'params': params_cnet,
-    #          'max_lr': base_lr * 0.1,
-    #          'initial_lr': (base_lr*0.1)/25,
-    #          'min_lr': (base_lr*0.1)/1e4},
-    #         {'params': params_mid,
-    #          'max_lr': base_lr * 0.5,
-    #          'initial_lr': (base_lr*0.5)/25,
-    #          'min_lr': (base_lr*0.5)/1e4},
-    #         {'params': params_fusion,
-    #          'max_lr': base_lr,
-    #          'initial_lr': base_lr/25,
-    #          'min_lr': base_lr/1e4},
-    #     ], lr=base_lr * 0.1, weight_decay=args.weight_decay)
-
-    #     scheduler2 = torch.optim.lr_scheduler.OneCycleLR(
-    #         optimizer2,
-    #         max_lr=[base_lr*0.1, base_lr*0.5, base_lr],
-    #         epochs=args.ft_epoch_s2,
-    #         steps_per_epoch=steps_per_epoch,
-    #         pct_start=0.05,
-    #         cycle_momentum=False,
-    #         anneal_strategy='cos',
-    #         last_epoch=-1,
-    #     )
-
-    #     trainer.optimizer = optimizer2
-    #     trainer.lr_scheduler3 = scheduler2
-    #     for ep in range(args.ft_epoch_s2):
-    #         idx = args.ft_epoch_s1 + ep
-    #         if is_main_process(parallel):
-    #             print(f"[Fine-tune Stage2] Epoch {idx+1}/{args.ft_epoch_s1+args.ft_epoch_s2}")
-    #         trainer.train_epoch(idx)
-    # else:
-    #     trainer.train()
-'''
-
-def is_main_process(parallel: bool) -> bool:
-    """
-    返回 True 当且仅当：
-      - 没有并行模式，或
-      - 并行模式下当前进程 rank == 0
-    """
-    if not parallel:
-        return True
-    return dist.get_rank() == 0
+    trainer.train()
 
 if __name__ == "__main__":
     main()

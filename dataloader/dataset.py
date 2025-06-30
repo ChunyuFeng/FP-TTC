@@ -9,12 +9,15 @@ import math
 import random
 from glob import glob
 import os.path as osp
+import re
+from tqdm import tqdm
 
 from .utils.rectangle_noise import retangle
 from .utils import frame_utils
 import  cv2
 from .utils.augmentor import FlowAugmentor, SparseFlowAugmentorm, NuscAugmentor, NuscRangeImageAugmentor
 
+from fpttc.scale_net.utils.spherical import build_spherical_voxels, project_voxel_to_camera
 '''
 from pyquaternion import Quaternion
 import matplotlib.pyplot as plt
@@ -154,7 +157,7 @@ def depth_read(filename):
     return depth
 
 def readPFM(file):
-    import re
+    
     file = open(file, 'rb')
 
     color = None
@@ -746,7 +749,8 @@ class nuScenes_range_image(data.Dataset):
         if self.aug_params is not None:
             self.augmentor = NuscRangeImageAugmentor(**self.aug_params)
         
-        self.afiine = np.eye(3, dtype=np.float32)  # 初始化为单位矩阵
+        self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                                'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
 
         # pkl 文件中包含：
         # - surround view images pairs (nusc sample data format)
@@ -761,8 +765,14 @@ class nuScenes_range_image(data.Dataset):
         # TODO: 目前 depth map 是将碰撞点反投影回图像平面时使用的，仅在可视化时使用
         self.depth_map_list = []
 
-        for i in range(len(self.data)):
-            
+        # 在加载数据集时离线构建 spherical voxel grid
+        # 并且提前计算好每一帧的 voxel 对应的 uv 坐标
+        # 因为Nuscenes的点云到图像投影关系考虑了不同传感器采样时自车的位姿，所以每一帧的外参都不同
+        self.idx_uv_prev_list = []
+        self.idx_uv_curr_list = [] 
+
+        for i in tqdm(range(len(self.data)-1170), desc='Loading nuScenes Range Image Dataset'):
+
             range_image_path = os.path.join(self.data[i]['gt_map_path'], 'range_image_curr.npy')
             if not osp.exists(range_image_path):
                 print(f"Range image file {range_image_path} does not exist.")
@@ -772,36 +782,49 @@ class nuScenes_range_image(data.Dataset):
 
             self.image_list.append([self.data[i]['prev_camera_data'],
                                     self.data[i]['curr_camera_data']])
-            self.sensor_meta_list.append(self.data[i]['sensor_metas_curr'])
+            self.data[i]['sensor_metas_prev']['frame'] = 'prev'
+            self.data[i]['sensor_metas_curr']['frame'] = 'curr'
+            self.sensor_meta_list.append([self.data[i]['sensor_metas_prev'],
+                                          self.data[i]['sensor_metas_curr']])
             self.scale_map_list.append(range_image['scale'])
             self.risk_score_map_list.append(range_image['risk_score'])
             self.depth_map_list.append(range_image['depth'])
 
-        '''
-        # --- 1) 预定义 Range View 参数
-        self.H, self.W = self.scale_map_list[0].shape[:2]  # 获取图像的高和宽
-        fov_up, fov_down = 10.0, -30.0  # 上下视场角 
-        fov_up_rad   = fov_up   /180*np.pi
-        fov_down_rad = fov_down /180*np.pi
-        # 垂直角度从 up 到 down
-        self.theta_v = torch.linspace(fov_up_rad, -fov_down_rad, self.H)
-        # 水平 360°
-        tmp_theta_h = torch.linspace(-np.pi, np.pi, self.W+1)
-        self.theta_h = tmp_theta_h[:-1] 
+            # 多视角融合时，使用的特征图尺寸为真值图尺寸的 1/4
+            H_sph, W_sph = self.scale_map_list[-1].shape
+            H_sph //= 4 
+            W_sph //= 4
+            R = 16 # 径向采样 16 个点
 
-        # --- 2) 预先生成单位方向向量 d: [3,H,W] ---
-        vv, hh = torch.meshgrid(torch.arange(self.H),
-                                torch.arange(self.W),
-                                indexing='ij')
-        phi = self.theta_v[vv]     # [H,W]
-        psi = self.theta_h[hh]     # [H,W]
-        # x 轴指向右，y 轴指向前，z 轴指向上
-        x = torch.cos(phi)*torch.sin(psi)
-        y = torch.cos(phi)*torch.cos(psi)
-        z = torch.sin(phi)
-        self.d = torch.stack([x,y,z], dim=0)  # [3,H,W]
-        self.d = self.d.view(3, -1)  # [3, H*W]
-        '''
+            # 构建 spherical voxel，获取每个 voxel 的 3D 笛卡尔坐标
+            _, xyz = build_spherical_voxels(
+                H=H_sph, W=W_sph, R=R,
+                r_min=5.0, r_max=50.0,
+                fov_up_deg=8.0, fov_down_deg=-15.0,
+            )
+
+            camera_channels = self.camera_channels
+            raw_img_size = (self.data[i]['prev_camera_data']['CAM_FRONT']['height'],
+                            self.data[i]['prev_camera_data']['CAM_FRONT']['width'])
+            idx_uv_prev_raw = project_voxel_to_camera(
+                xyz=xyz,
+                sensor_metas=self.data[i]['sensor_metas_prev'],
+                camera_channels=camera_channels,
+                raw_img_size=raw_img_size,
+                min_dist=1.0
+            )
+
+            idx_uv_curr_raw = project_voxel_to_camera(
+                xyz=xyz,
+                sensor_metas=self.data[i]['sensor_metas_curr'],
+                camera_channels=camera_channels,
+                raw_img_size=raw_img_size,
+                min_dist=1.0
+            )
+
+            self.idx_uv_prev_list.append(idx_uv_prev_raw)
+            self.idx_uv_curr_list.append(idx_uv_curr_raw)
+
     def __len__(self):
         return len(self.image_list)
 
@@ -813,8 +836,7 @@ class nuScenes_range_image(data.Dataset):
         # camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
         #                    'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
         # 后续会按照这个顺序拼接，和 Range Image 对应 
-        camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-                           'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+        camera_channels = self.camera_channels
         
         path_prefix = './Datasets/nuscenes/'
         for channel in camera_channels:
@@ -829,13 +851,23 @@ class nuScenes_range_image(data.Dataset):
         gt_scale_map = self.scale_map_list[index]
         gt_risk_score_map = self.risk_score_map_list[index]
         gt_depth_map = self.depth_map_list[index]
-
         sensor_meta = self.sensor_meta_list[index]
+        idx_uv_prev_raw = self.idx_uv_prev_list[index]
+        idx_uv_curr_raw = self.idx_uv_curr_list[index]
 
-        # 数据增强
-        if self.augmentor is not None:
-            prev_surr_view_imgs, self.affine = self.augmentor(prev_surr_view_imgs)
-            curr_surr_view_imgs, _ = self.augmentor(curr_surr_view_imgs)
+
+        # 获取数据增强的 affine 参数
+        orig_size = next(iter(prev_surr_view_imgs.values())).size  # (W, H)
+        affine_params = self.augmentor.sample_params(orig_size)
+        # 将 affine 参数应用到图像上，实现数据增强
+        prev_surr_view_imgs, _ = self.augmentor(prev_surr_view_imgs, affine_params)
+        curr_surr_view_imgs, _ = self.augmentor(curr_surr_view_imgs, affine_params)
+        # 获取 affine 矩阵
+        affine_matrix = self.augmentor.get_affine_matrix(affine_params)
+        # # 数据增强
+        # if self.augmentor is not None:
+        #     prev_surr_view_imgs, self.affine = self.augmentor(prev_surr_view_imgs)
+        #     curr_surr_view_imgs, _ = self.augmentor(curr_surr_view_imgs)
         
         # 转换为 Tensor
         for channel in camera_channels:
@@ -848,6 +880,10 @@ class nuScenes_range_image(data.Dataset):
         gt_scale_map = torch.from_numpy(gt_scale_map).float()
         gt_risk_score_map = torch.from_numpy(gt_risk_score_map).float()
         gt_depth_map = torch.from_numpy(gt_depth_map).float()
+
+        affine_matrix = torch.from_numpy(affine_matrix)
+        idx_uv_prev_raw = torch.from_numpy(idx_uv_prev_raw) 
+        idx_uv_curr_raw = torch.from_numpy(idx_uv_curr_raw) 
 
         # scale 取 (0.3, 3.0) 之间的值
         mask_scale = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
@@ -864,8 +900,9 @@ class nuScenes_range_image(data.Dataset):
                 gt_scale_map_with_mask, # model 的输入以及真值
                 gt_risk_score_map_with_mask, # model 的输入以及真值
                 gt_depth_map_with_mask, # model 的输入以及真值
-                sensor_meta,
-                self.affine)
+                affine_matrix,
+                idx_uv_prev_raw,
+                idx_uv_curr_raw)
 
     '''
     def __getitem__(self, index):

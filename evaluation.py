@@ -163,7 +163,7 @@ def main():
     time_stamp = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
 
     model_loaded.eval()
-    out_dir = "./output/%s_selfcon_ttc"%(time_stamp)
+    out_dir = "./output/%s_surround_ttc"%(time_stamp)
     if not os.path.isdir(out_dir):
         os.mkdir(out_dir)
 

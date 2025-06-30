@@ -10,6 +10,11 @@ from PIL import Image
 import cv2
 import glob
 
+from dataloader.utils.augmentor import NuscRangeImageAugmentor
+
+augmentor = NuscRangeImageAugmentor(crop_size=(160, 320),
+                                    do_flip=False,
+                                    rotate=False)
 
 def create_video_from_images(save_path, fps=10):
     # 拼接所有保存的图像
@@ -160,7 +165,7 @@ def morphological_closing(rgb_range, kernel_size=5):
     closed = cv2.morphologyEx(rgb_range, cv2.MORPH_CLOSE, kernel)
     return closed
 
-def project_to_rgb_range_image(proj_xyz,
+def project_to_rgb_range_image0(proj_xyz,
                                proj_mask,
                                sensor_metas,
                                camera_data,
@@ -250,6 +255,128 @@ def project_to_rgb_range_image(proj_xyz,
     rgb_range = fill_holes_with_closing(rgb_range, hole_value=255, kernel_size=3, inpaint_radius=3)
     rgb_range = fill_line_holes(rgb_range, hole_value=255,
                                 horiz_length=31, vert_length=31, inpaint_radius=3)
+
+    return rgb_range
+
+    
+def make_homog(R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """构造 4×4 齐次变换矩阵"""
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3]  = t
+    return T
+
+def build_lidar_to_camera_projection(
+    sensor_metas: dict,
+    cam_cs: dict,
+    cam_pose: dict
+):
+    """
+    构造 LiDAR(S) -> Camera(C) 的投影矩阵 P（3x4）以及合并变换的 R_tot 和 t_tot。
+    """
+    # 1) LiDAR → Ego
+    lidar_cs   = sensor_metas['lidar']['calibrated_sensor']
+    lidar_pose = sensor_metas['lidar']['ego_pose']
+    R_s2e = Quaternion(lidar_cs['rotation']).rotation_matrix
+    t_s2e = np.array(lidar_cs['translation'])
+    T_s2e = make_homog(R_s2e, t_s2e)
+
+    # 2) Ego → Global
+    R_e2g = Quaternion(lidar_pose['rotation']).rotation_matrix
+    t_e2g = np.array(lidar_pose['translation'])
+    T_e2g = make_homog(R_e2g, t_e2g)
+
+    # 3) Global → Ego_Cam (取逆)
+    R_e2g_cam = Quaternion(cam_pose['rotation']).rotation_matrix
+    t_e2g_cam = np.array(cam_pose['translation'])
+    T_g2ecam  = np.linalg.inv(make_homog(R_e2g_cam, t_e2g_cam))
+
+    # 4) Ego_Cam → Cam_Sensor (取逆)
+    R_c2e = Quaternion(cam_cs['rotation']).rotation_matrix
+    t_c2e = np.array(cam_cs['translation'])
+    T_ecam2c = np.linalg.inv(make_homog(R_c2e, t_c2e))
+
+    # 5) 合并到 LiDAR → Cam_Sensor
+    T_s2c = T_ecam2c @ T_g2ecam @ T_e2g @ T_s2e
+
+    # 6) 拆出 R_tot, t_tot
+    R_tot = T_s2c[:3, :3]
+    t_tot = T_s2c[:3,  3]
+
+    # 7) 加上内参，得到 P = K [R|t]
+    K = np.array(cam_cs['camera_intrinsic'])
+    P = K @ T_s2c[:3, :]
+
+    return P, R_tot, t_tot
+
+
+def project_to_rgb_range_image(proj_xyz,
+                               proj_mask,
+                               sensor_metas,
+                               camera_data,
+                               min_dist=1.0):  
+    H, W = proj_mask.shape
+    mask_flat = proj_mask.reshape(-1).astype(bool)
+    idxs_flat = np.nonzero(mask_flat)[0]
+    ys = idxs_flat // W
+    xs = idxs_flat %  W
+    pts_lidar = proj_xyz[ys, xs]          # (N,3)
+
+    rgb_range = np.ones((H, W, 3), dtype=np.uint8) * 255
+
+    prev_images = {}
+    for channel, cam_info in camera_data.items():
+        # 预加载相机图像
+        im = Image.open(os.path.join('./Datasets/nuscenes', cam_info['filename']))
+        prev_images[channel] = im
+
+    # 预处理图像
+    prev_images_aug, affine_matrices = augmentor(prev_images)
+
+    for channel, cam_info in camera_data.items():
+        # 加载图像
+        # im = Image.open(os.path.join('./Datasets/nuscenes', cam_info['filename']))
+        # im_arr = np.array(im)
+        im_arr = prev_images_aug[channel]  # 预处理后的图像
+        h_cam, w_cam = im_arr.shape[:2]
+
+        # 相机外参
+        cam_cs   = sensor_metas['camera']['calibrated_sensor'][channel]
+        cam_pose = sensor_metas['camera']['ego_pose'][channel]
+
+        # 构造投影矩阵与合并变换
+        P, R_tot, t_tot = build_lidar_to_camera_projection(sensor_metas, cam_cs, cam_pose)
+
+        # 用 R_tot, t_tot 计算每个点在相机坐标系下的深度
+        pts_cam = (R_tot @ pts_lidar.T) + t_tot[:, None]  # shape=(3,N)
+        depths  = pts_cam[2, :]
+
+        P = affine_matrices @ P  # 应用预处理的仿射变换
+
+        # # 一次性投影到像素平面
+        # uv = view_points(pts_lidar.T, P, normalize=True)  # shape=(3,N)
+        # u = uv[0].astype(np.int32)
+        # v = uv[1].astype(np.int32)
+        # 手动投影：齐次坐标
+        N = pts_lidar.shape[0]
+        pts_h = np.concatenate([pts_lidar, np.ones((N, 1))], axis=1).T  # 4×N
+        uvw = (P @ pts_h)  # 3×N
+        u = (uvw[0] / uvw[2]).astype(np.int32)
+        v = (uvw[1] / uvw[2]).astype(np.int32)
+
+        # 过滤
+        valid = (depths > min_dist) & (u >= 0) & (u < w_cam) & (v >= 0) & (v < h_cam)
+        sel = np.nonzero(valid)[0]
+
+        # 写色
+        ys_sel = ys[sel]
+        xs_sel = xs[sel]
+        rgb_range[ys_sel, xs_sel] = im_arr[v[sel], u[sel]]
+
+    # 填洞
+    rgb_range = fill_holes_with_closing(rgb_range, hole_value=255, kernel_size=3, inpaint_radius=3)
+    rgb_range = fill_line_holes       (rgb_range, hole_value=255,
+                                       horiz_length=31, vert_length=31, inpaint_radius=3)
 
     return rgb_range
 

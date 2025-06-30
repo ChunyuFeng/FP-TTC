@@ -584,168 +584,288 @@ class NuscAugmentor:
 
 class NuscRangeImageAugmentor:
     def __init__(self, crop_size, do_flip=False, rotate=False, rotate_prob=0.1, rotate_angle=90):
-        # 增强参数
-        self.crop_size = crop_size  # 裁剪后图像的大小
-        self.do_flip = do_flip  # 是否进行翻转
-        self.rotate = rotate  # 是否进行旋转
-        self.rotate_prob = rotate_prob  # 旋转概率
-        self.rotate_angle = rotate_angle  # 旋转角度
+        self.crop_size = crop_size
+        self.do_flip = do_flip
+        self.rotate = rotate
+        self.rotate_prob = rotate_prob
+        self.rotate_angle = rotate_angle
 
-        self._affine = np.eye(3, dtype=np.float32)  # 初始化仿射变换矩阵
-
-    def resize_and_crop(self, img):
-        """将图像缩放并裁剪到指定大小"""
-        w, h = img.size
+    def sample_params(self, img_size):
+        # 统一采样一次 resize, crop, flip, rotate 参数
+        w, h = img_size
         crop_h, crop_w = self.crop_size
-        # 只利用w计算缩放比例，保证不裁剪w方向，因为相邻图像在w方向有重叠信息
-        resize = crop_w / w
+        # 缩放使宽度匹配
+        scale = crop_w / w
+        resize_w, resize_h = int(w * scale), int(h * scale)
+        # 裁剪偏移：宽度居中，高度底部对齐
+        crop_x = (resize_w - crop_w) // 2
+        crop_y = resize_h - crop_h
+        # 随机翻转
+        flip_h = self.do_flip and np.random.rand() < 0.5
+        flip_v = self.do_flip and np.random.rand() < 0.1
+        # 随机旋转
+        rotate_flag = self.rotate and np.random.rand() < self.rotate_prob
+        angle = self.rotate_angle if rotate_flag else 0
+        return {
+            'scale': scale,
+            'resize': (resize_w, resize_h),
+            'crop': (crop_x, crop_y),
+            'flip_h': flip_h,
+            'flip_v': flip_v,
+            'rotate': rotate_flag,
+            'angle': angle
+        }
 
-        resize_h, resize_w = int(h * resize), int(w * resize)
-        # 图像h方向，保留中间部分
-        # crop_h_start = (resize_h - crop_h) // 2
-        # 图像h方向，保留底部（因为图像底部监督信息更稠密）
-        crop_h_start = resize_h - crop_h
-        crop_w_start = (resize_w - crop_w) // 2
-        # 裁剪区域：left top right bottom
-        crop = (crop_w_start, crop_h_start, crop_w_start + crop_w, crop_h_start + crop_h)
-
+    def apply_affine(self, img, params):
+        # 1) resize
         if img.mode == 'RGB':
-            img = img.resize((resize_w, resize_h), Image.BILINEAR)
+            img = img.resize(params['resize'], Image.BILINEAR)
         elif img.mode == 'F':
-            img = self.resize_with_explicit_mapping(img, (resize_h, resize_w))
+            # 注意 PIL 中 size 为 (width, height)
+            img = self.resize_with_explicit_mapping(
+                img, (params['resize'][1], params['resize'][0]))
         else:
             raise ValueError(f'Unsupported image mode: {img.mode}')
-
-        img = img.crop(crop)
-
-        # 更新仿射变换矩阵
-        M = np.eye(3, dtype=np.float32)
-        # 将缩放比例应用到仿射变换矩阵
-        M[:2, :2] = np.eye(2) * resize
-        # 将裁剪偏移量应用到仿射变换矩阵
-        M[0, 2] = -crop_w_start
-        M[1, 2] = -crop_h_start
-        # 更新仿射变换矩阵
-        affine = M @ self._affine  
-
-        return img, affine
-
-    def resize_with_explicit_mapping(self, img, resize_dims, fill_value=np.nan):
-        # 将图像转换为 NumPy 数组
-        img_np = np.array(img)
-        # 提取有效数据的位置和值（非 NaN 的位置）
-        valid_coords = np.argwhere(~np.isnan(img_np))  # 获取有效数据的坐标 (y, x)
-        valid_values = img_np[~np.isnan(img_np)]  # 获取有效数据的值
-        # 计算缩放因子
-        resize_coef_h = resize_dims[0] / img_np.shape[0]
-        resize_coef_w = resize_dims[1] / img_np.shape[1]
-        # 对有效坐标进行缩放
-        scaled_coords = np.zeros_like(valid_coords)
-        scaled_coords[:, 0] = (valid_coords[:, 0] * resize_coef_h).astype(int)  # 缩放高度
-        scaled_coords[:, 1] = (valid_coords[:, 1] * resize_coef_w).astype(int)  # 缩放宽度
-        # scaled_coords = (valid_coords * resize_coef).astype(int)
-        # 创建填充了 fill_value 的新图像
-        resized_img_np = np.full((resize_dims[0], resize_dims[1]), fill_value, dtype=np.float32)
-        # 将有效值填充到新的位置
-        for (y, x), value in zip(scaled_coords, valid_values):
-            if 0 <= y < resize_dims[0] and 0 <= x < resize_dims[1]:  # 检查边界
-                resized_img_np[y, x] = value
-        # 转换为 PIL 图像返回
-        return Image.fromarray(resized_img_np, mode='F')
-
-
-    def center_crop(self, img):
-        """从图像中心裁剪到指定大小"""
-        ht, wd = img.shape[:2]
+        # 2) crop
+        x, y = params['crop']
         crop_h, crop_w = self.crop_size
-
-        # 计算中心裁剪的起始坐标
-        center_y, center_x = ht // 2, wd // 2
-        start_y = max(0, center_y - crop_h // 2)
-        start_x = max(0, center_x - crop_w // 2)
-
-        # 裁剪图像
-        img_cropped = img[start_y:start_y + crop_h, start_x:start_x + crop_w]
-
-        # 如果裁剪区域小于目标大小，用填充补齐
-        if img_cropped.shape[0] < crop_h or img_cropped.shape[1] < crop_w:
-            pad_h = crop_h - img_cropped.shape[0]
-            pad_w = crop_w - img_cropped.shape[1]
-            img_cropped = cv2.copyMakeBorder(img_cropped, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
-
-        return img_cropped
-
-    def flip_transform(self, img):
-        """图像翻转"""
-        if self.do_flip:
-            if np.random.rand() < 0.5:  # 水平翻转
-                img = img[:, ::-1]
-            if np.random.rand() < 0.1:  # 垂直翻转
-                img = img[::-1, :]
+        img = img.crop((x, y, x + crop_w, y + crop_h))
+        # 3) flip
+        if params['flip_h']:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        if params['flip_v']:
+            img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        # 4) rotate
+        if params['rotate']:
+            img = img.rotate(params['angle'], resample=Image.BICUBIC, expand=False)
+            # 确保大小一致
+            img = img.crop((0, 0, crop_w, crop_h))
         return img
-
-    # 以10%的概率进行旋转，固定旋转角度为90度
-    def rotate_transform(self, img, probability=0.1, angle=90):
-        """图像旋转"""
-        # if self.rotate and random.random() < probability:  # 指定旋转概率
-        if img.mode == 'RGB':
-            img = img.rotate(angle, resample=Image.BICUBIC, expand=True)
-            img = img.resize((640, 320), Image.BILINEAR)
-
-        elif img.mode == 'F':
-            img_np = np.array(img)
-            mask = ~np.isnan(img_np)
-            img_pil = Image.fromarray(np.nan_to_num(img, nan=0.0))  # 将 NaN 替换为 0
-            mask_pil = Image.fromarray(mask.astype(np.uint8) * 255)  # 掩膜转换为二值图像
-            rotated_img = img_pil.rotate(angle, resample=Image.BICUBIC, expand=True)
-            rotated_mask = mask_pil.rotate(angle, resample=Image.NEAREST, expand=True)
-            rotated_img_array = np.array(rotated_img)
-            rotated_mask_array = np.array(rotated_mask) > 0
-            rotated_img_array[~rotated_mask_array] = np.nan
-            img = Image.fromarray(rotated_img_array)
-            img = self.resize_with_explicit_mapping(img, (320, 640))
-        else:
-            raise ValueError(f'Unsupported image mode: {img.mode}')
-        return img
-
-    # def __call__(self, surr_view_imgs):
-
-    #     for channel, img in surr_view_imgs.items():
-    #         surr_view_imgs[channel] = self.resize_and_crop(img)
-    #         if isinstance(surr_view_imgs[channel], Image.Image):
-    #             surr_view_imgs[channel] = np.array(surr_view_imgs[channel])
-
-    #     return surr_view_imgs
-
     
 
+    def get_affine_matrix(self, params):
+        """
+        根据 sample_params 返回的 params 字典和 self.crop_size，
+        构造一个 3×3 的齐次仿射矩阵 M，使得：
+            p_new = M @ p_old
+        其中 p_old, p_new 均为 (x, y, 1) 的齐次坐标。
+        """
+        crop_h, crop_w = self.crop_size
 
-    def __call__(self, surr_view_imgs):
+        # 1) 缩放矩阵 S
+        #    x, y 均按相同 scale 缩放
+        scale = params['scale']
+        S = np.array([
+            [scale,     0, 0],
+            [    0, scale, 0],
+            [    0,     0, 1],
+        ], dtype=np.float32)
 
+        # 2) 裁剪平移矩阵 T_crop
+        cx, cy = params['crop']
+        T_crop = np.array([
+            [1, 0, -cx],
+            [0, 1, -cy],
+            [0, 0,   1],
+        ], dtype=np.float32)
+
+        ################### 以下变换还未验证是否正确 ###################
+        # 3) 翻转矩阵
+        F_h = np.eye(3, dtype=np.float32)
+        if params['flip_h']:
+            # 水平翻转：x -> (crop_w - 1) - x
+            F_h = np.array([
+                [-1,  0, crop_w-1],
+                [ 0,  1,       0],
+                [ 0,  0,       1],
+            ], dtype=np.float32)
+        F_v = np.eye(3, dtype=np.float32)
+        if params['flip_v']:
+            # 垂直翻转：y -> (crop_h - 1) - y
+            F_v = np.array([
+                [1,   0,        0],
+                [0,  -1, crop_h-1],
+                [0,   0,        1],
+            ], dtype=np.float32)
+
+        # 4) 旋转矩阵 R（绕左上角点旋转；如果要绕中心旋转，需要再加 translate）
+        R = np.eye(3, dtype=np.float32)
+        if params['rotate']:
+            θ = np.deg2rad(params['angle'])
+            cosθ, sinθ = np.cos(θ), np.sin(θ)
+            # 围绕左上角 (0,0) 旋转
+            R = np.array([
+                [ cosθ, -sinθ, 0],
+                [ sinθ,  cosθ, 0],
+                [    0,     0, 1],
+            ], dtype=np.float32)
+
+        # 最终矩阵：  M = R @ F_v @ F_h @ T_crop @ S
+        M = R @ F_v @ F_h @ T_crop @ S
+        return M
+
+
+    def __call__(self, surr_view_imgs, params=None):
+        # params=None 时自动 sampling
+        first_img = next(iter(surr_view_imgs.values()))
+        if params is None:
+            params = self.sample_params(first_img.size)
+        # 批量应用同一个 params
         for channel, img in surr_view_imgs.items():
-            # # 可视化处理前的图像
-            # plt.figure()
-            # if isinstance(img, Image.Image):
-            #     plt.imshow(img)
-            # else:
-            #     plt.imshow(np.array(img))
-            # plt.title(f'Before resize_and_crop - {channel}')
-            # plt.show()
+            processed = self.apply_affine(img, params)
+            surr_view_imgs[channel] = np.array(processed)
+        return surr_view_imgs, params
 
-            # 调用 resize_and_crop 处理
-            processed_img, affine = self.resize_and_crop(img)
 
-            # # 可视化处理后的图像
-            # plt.figure()
-            # if isinstance(processed_img, Image.Image):
-            #     plt.imshow(processed_img)
-            # else:
-            #     plt.imshow(np.array(processed_img))
-            # plt.title(f'After resize_and_crop - {channel}')
-            # plt.show()
+# class NuscRangeImageAugmentor:
+#     def __init__(self, crop_size, do_flip=False, rotate=False, rotate_prob=0.1, rotate_angle=90):
+#         # 增强参数
+#         self.crop_size = crop_size  # 裁剪后图像的大小
+#         self.do_flip = do_flip  # 是否进行翻转
+#         self.rotate = rotate  # 是否进行旋转
+#         self.rotate_prob = rotate_prob  # 旋转概率
+#         self.rotate_angle = rotate_angle  # 旋转角度
 
-            surr_view_imgs[channel] = processed_img
-            if isinstance(surr_view_imgs[channel], Image.Image):
-                surr_view_imgs[channel] = np.array(surr_view_imgs[channel])
+#         self._affine = np.eye(3, dtype=np.float32)  # 初始化仿射变换矩阵
 
-        return surr_view_imgs, affine
+#     def resize_and_crop(self, img):
+#         w, h = img.size
+#         crop_h, crop_w = self.crop_size
+#         # 只利用w计算缩放比例，保证不裁剪w方向，因为相邻图像在w方向有重叠信息
+#         resize = crop_w / w
+
+#         resize_h, resize_w = int(h * resize), int(w * resize)
+#         # 图像h方向，保留中间部分
+#         # crop_h_start = (resize_h - crop_h) // 2
+#         # 图像h方向，保留底部（因为图像底部监督信息更稠密）
+#         crop_h_start = resize_h - crop_h
+#         crop_w_start = (resize_w - crop_w) // 2
+#         # 裁剪区域：left top right bottom
+#         crop = (crop_w_start, crop_h_start, crop_w_start + crop_w, crop_h_start + crop_h)
+
+#         if img.mode == 'RGB':
+#             img = img.resize((resize_w, resize_h), Image.BILINEAR)
+#         elif img.mode == 'F':
+#             img = self.resize_with_explicit_mapping(img, (resize_h, resize_w))
+#         else:
+#             raise ValueError(f'Unsupported image mode: {img.mode}')
+
+#         img = img.crop(crop)
+
+#         # 更新仿射变换矩阵
+#         M = np.eye(3, dtype=np.float32)
+#         # 将缩放比例应用到仿射变换矩阵
+#         M[:2, :2] = np.eye(2) * resize
+#         # 将裁剪偏移量应用到仿射变换矩阵
+#         M[0, 2] = -crop_w_start
+#         M[1, 2] = -crop_h_start
+#         # 更新仿射变换矩阵
+#         affine = M @ self._affine  
+
+#         return img, affine
+
+#     def resize_with_explicit_mapping(self, img, resize_dims, fill_value=np.nan):
+#         # 将图像转换为 NumPy 数组
+#         img_np = np.array(img)
+#         # 提取有效数据的位置和值（非 NaN 的位置）
+#         valid_coords = np.argwhere(~np.isnan(img_np))  # 获取有效数据的坐标 (y, x)
+#         valid_values = img_np[~np.isnan(img_np)]  # 获取有效数据的值
+#         # 计算缩放因子
+#         resize_coef_h = resize_dims[0] / img_np.shape[0]
+#         resize_coef_w = resize_dims[1] / img_np.shape[1]
+#         # 对有效坐标进行缩放
+#         scaled_coords = np.zeros_like(valid_coords)
+#         scaled_coords[:, 0] = (valid_coords[:, 0] * resize_coef_h).astype(int)  # 缩放高度
+#         scaled_coords[:, 1] = (valid_coords[:, 1] * resize_coef_w).astype(int)  # 缩放宽度
+#         # scaled_coords = (valid_coords * resize_coef).astype(int)
+#         # 创建填充了 fill_value 的新图像
+#         resized_img_np = np.full((resize_dims[0], resize_dims[1]), fill_value, dtype=np.float32)
+#         # 将有效值填充到新的位置
+#         for (y, x), value in zip(scaled_coords, valid_values):
+#             if 0 <= y < resize_dims[0] and 0 <= x < resize_dims[1]:  # 检查边界
+#                 resized_img_np[y, x] = value
+#         # 转换为 PIL 图像返回
+#         return Image.fromarray(resized_img_np, mode='F')
+
+
+#     def center_crop(self, img):
+#         ht, wd = img.shape[:2]
+#         crop_h, crop_w = self.crop_size
+
+#         # 计算中心裁剪的起始坐标
+#         center_y, center_x = ht // 2, wd // 2
+#         start_y = max(0, center_y - crop_h // 2)
+#         start_x = max(0, center_x - crop_w // 2)
+
+#         # 裁剪图像
+#         img_cropped = img[start_y:start_y + crop_h, start_x:start_x + crop_w]
+
+#         # 如果裁剪区域小于目标大小，用填充补齐
+#         if img_cropped.shape[0] < crop_h or img_cropped.shape[1] < crop_w:
+#             pad_h = crop_h - img_cropped.shape[0]
+#             pad_w = crop_w - img_cropped.shape[1]
+#             img_cropped = cv2.copyMakeBorder(img_cropped, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
+
+#         return img_cropped
+
+#     def flip_transform(self, img):
+#         if self.do_flip:
+#             if np.random.rand() < 0.5:  # 水平翻转
+#                 img = img[:, ::-1]
+#             if np.random.rand() < 0.1:  # 垂直翻转
+#                 img = img[::-1, :]
+#         return img
+
+#     # 以10%的概率进行旋转，固定旋转角度为90度
+#     def rotate_transform(self, img, probability=0.1, angle=90):
+#         # if self.rotate and random.random() < probability:  # 指定旋转概率
+#         if img.mode == 'RGB':
+#             img = img.rotate(angle, resample=Image.BICUBIC, expand=True)
+#             img = img.resize((640, 320), Image.BILINEAR)
+
+#         elif img.mode == 'F':
+#             img_np = np.array(img)
+#             mask = ~np.isnan(img_np)
+#             img_pil = Image.fromarray(np.nan_to_num(img, nan=0.0))  # 将 NaN 替换为 0
+#             mask_pil = Image.fromarray(mask.astype(np.uint8) * 255)  # 掩膜转换为二值图像
+#             rotated_img = img_pil.rotate(angle, resample=Image.BICUBIC, expand=True)
+#             rotated_mask = mask_pil.rotate(angle, resample=Image.NEAREST, expand=True)
+#             rotated_img_array = np.array(rotated_img)
+#             rotated_mask_array = np.array(rotated_mask) > 0
+#             rotated_img_array[~rotated_mask_array] = np.nan
+#             img = Image.fromarray(rotated_img_array)
+#             img = self.resize_with_explicit_mapping(img, (320, 640))
+#         else:
+#             raise ValueError(f'Unsupported image mode: {img.mode}')
+#         return img
+    
+#     def __call__(self, surr_view_imgs):
+
+#         for channel, img in surr_view_imgs.items():
+#             # # 可视化处理前的图像
+#             # plt.figure()
+#             # if isinstance(img, Image.Image):
+#             #     plt.imshow(img)
+#             # else:
+#             #     plt.imshow(np.array(img))
+#             # plt.title(f'Before resize_and_crop - {channel}')
+#             # plt.show()
+
+#             # 调用 resize_and_crop 处理
+#             processed_img, affine = self.resize_and_crop(img)
+
+#             # # 可视化处理后的图像
+#             # plt.figure()
+#             # if isinstance(processed_img, Image.Image):
+#             #     plt.imshow(processed_img)
+#             # else:
+#             #     plt.imshow(np.array(processed_img))
+#             # plt.title(f'After resize_and_crop - {channel}')
+#             # plt.show()
+
+#             surr_view_imgs[channel] = processed_img
+#             if isinstance(surr_view_imgs[channel], Image.Image):
+#                 surr_view_imgs[channel] = np.array(surr_view_imgs[channel])
+
+#         return surr_view_imgs, affine
+
