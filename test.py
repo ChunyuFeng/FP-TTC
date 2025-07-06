@@ -17,7 +17,9 @@ from dataloader.utils.augmentor import NuscRangeImageAugmentor
 import pickle
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-
+from fpttc.scale_net.utils.spherical import build_spherical_voxels, project_voxel_to_camera
+from tools.cyberrock.sjtu_test_info import undistort_image, intersect_rois
+from PIL import ImageDraw
 parser = argparse.ArgumentParser()
 
 # Dataset & evaluation parameters
@@ -70,6 +72,8 @@ parser.add_argument('--pred_bwd_flow', action='store_true')
 parser.add_argument('--fwd_bwd_check', action='store_true')
 parser.add_argument('--save_video', action='store_true')
 parser.add_argument('--concat_flow_img', action='store_true')
+parser.add_argument('--radial_sampling_num', default=8, type=int,
+                    help='number of radial sampling points for spherical coordinates')
 
 # Distributed & misc
 parser.add_argument('--local_rank', default=0, type=int)
@@ -78,6 +82,10 @@ parser.add_argument('--launcher', default='none', type=str, choices=['none', 'py
 parser.add_argument('--gpu_ids', default=0, type=int, nargs='+')
 parser.add_argument('--count_time', action='store_true')
 parser.add_argument('--debug', action='store_true')
+
+# sjtu dataset test
+parser.add_argument('--sjtu_test', action='store_true',
+                    help='Run test on SJTU dataset with specific parameters')
 
 # path
 parser.add_argument('--save_pred_npy', action='store_true',
@@ -98,17 +106,72 @@ resize_height, resize_width = args.image_size  # height, width from CLI
 augmentor = NuscRangeImageAugmentor(crop_size=(resize_height, resize_width),
                                    do_flip=False,
                                    rotate=False)
+# 读取旧外参
+# front -> pandar:
+front_to_lidar = np.array([[-0.9994, 0.0268, 0.0243, -0.0992],
+    [-0.0242, 0.0019, -0.9997, -0.1998],
+    [-0.0269, -0.9996, -0.0012, -0.1768],
+    [0, 0, 0, 1.0000]])
+
+# front right -> pandar:
+front_right_to_lidar = np.array([[-0.5601, -0.0367, -0.8277, -0.5154],
+    [0.8285, -0.0176, -0.5598, -0.1677],
+    [0.0060, -0.9991, 0.0402, -0.1925],
+    [0, 0, 0, 1.0000]])
+
+# back right-> pandar:
+back_right_to_lidar = np.array([[ 0.4354, -0.0227, -0.9000, -0.5385],
+    [0.9000, -0.0128, 0.4358, 0.0845],
+    [-0.0214, -0.9996, 0.0148, -0.1781],
+    [0, 0, 0, 1.0000]])
+
+# back -> pandar:
+back_to_lidar = np.array([[1.0000, 0.0029, 0.0009, -0.0471],
+    [-0.0009, -0.0053, 1.0000, 1.1084],
+    [0.0029, -1.0000, -0.0052, -0.2528],
+    [0, 0, 0, 1.0000]])
+
+#back left -> pandar:
+back_left_to_lidar = np.array([[0.5358, -0.0117, 0.8443, 0.5212],
+    [-0.8444, -0.0029, 0.5358, 0.1203],
+    [-0.0039, -0.9999, -0.0114, -0.1698],
+    [0, 0, 0, 1.0000]])
+
+# front left -> pandar:
+front_left_to_lidar = np.array([[-0.4716, -0.0228, 0.8816, 0.5734],
+    [-0.8810, -0.0301, -0.4721, -0.1123],
+    [0.0372, -0.9993, -0.0059, -0.1826],
+    [0, 0, 0, 1.0000]])
+
+# 旧外参字典
+old_extrinsics = {
+    'CAM_FRONT':         front_to_lidar,
+    'CAM_FRONT_RIGHT':   front_right_to_lidar,
+    'CAM_BACK_RIGHT':    back_right_to_lidar,
+    'CAM_BACK':          back_to_lidar,
+    'CAM_BACK_LEFT':     back_left_to_lidar,
+    'CAM_FRONT_LEFT':    front_left_to_lidar,
+}
+old_extrinsics_ = {}
+for ch, extr in old_extrinsics.items():
+    R = extr[:3, :3]
+    t = extr[:3, 3]
+    R_inv = R.T
+    t_inv = -R_inv @ t
+    extr_ = np.hstack([R_inv, t_inv.reshape(3, 1)])  # 3x4
+    old_extrinsics_[ch] = extr_
 
 def main():
     # Load model
-    model = FpTTC(num_scales=args.num_scales,
-                  feature_channels=args.feature_channels,
-                  upsample_factor=args.upsample_factor,
-                  num_head=args.num_head,
-                  ffn_dim_expansion=args.ffn_dim_expansion,
-                  num_transformer_layers=args.num_transformer_layers,
-                  reg_refine=args.reg_refine,
-                  train=False).to(device)
+    model = FpTTC(num_scales             = args.num_scales,
+                  feature_channels       = args.feature_channels,
+                  upsample_factor        = args.upsample_factor,
+                  num_head               = args.num_head,
+                  ffn_dim_expansion      = args.ffn_dim_expansion,
+                  num_transformer_layers = args.num_transformer_layers,
+                  reg_refine             = args.reg_refine,
+                  radial_sampling        = args.radial_sampling_num,
+                  train                  = False).cuda()
 
     # Optionally resume checkpoint
     if args.resume:
@@ -147,118 +210,381 @@ def main():
         ]
 
     for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
-        # if test_entries[idx]['scene_indice'] != '3':
-        #     continue
-        # # Before processing images, verify that all required files exist; if any are missing, skip this sample.
-        # all_exist = True
-        # for ch in camera_channels:
-        #     prev_img_path = os.path.join('./Datasets/nuscenes', test_entries[idx]['prev_camera_data'][ch]['filename'])
-        #     curr_img_path = os.path.join('./Datasets/nuscenes', test_entries[idx]['curr_camera_data'][ch]['filename'])
-        #     if not (os.path.exists(prev_img_path) and os.path.exists(curr_img_path)):
-        #         all_exist = False
-        #         break
-        # if not all_exist:
-        #     continue
-        # Load images
-        prev_images = {}
-        curr_images = {}
-        for ch in camera_channels:
-            prev_path = os.path.join('./Datasets/nuscenes', test_entries[idx]['prev_camera_data'][ch]['filename'])
-            curr_path = os.path.join('./Datasets/nuscenes', test_entries[idx]['curr_camera_data'][ch]['filename'])
-            prev_images[ch] = Image.open(prev_path)
-            curr_images[ch] = Image.open(curr_path)
+        if args.sjtu_test:
+            # Load images
+            prev_images_undistorted = {}
+            curr_images_undistorted = {}
+            # K_undist_prev = {}
+            # K_undist_curr = {}
+            # roi_undist_prev = {}
+            # roi_undist_curr = {}
+            for ch in camera_channels:
+                prev_path = test_entries[idx]['prev_camera_data'][ch]['filename']
+                prev_images_undistorted[ch] = cv2.imread(prev_path, cv2.IMREAD_COLOR)
+                prev_images_undistorted[ch], K_prev, roi_prev = undistort_image(prev_images_undistorted[ch], 
+                                                                                test_entries[idx]['sensor_metas_prev'][ch]['K'],
+                                                                                test_entries[idx]['sensor_metas_prev'][ch]['dist'])
+                prev_images_undistorted[ch] = Image.fromarray(cv2.cvtColor(prev_images_undistorted[ch], cv2.COLOR_BGR2RGB))
+                # K_undist_prev[ch] = K_prev
+                # roi_undist_prev[ch] = roi_prev
+                test_entries[idx]['sensor_metas_prev'][ch]['K_undist'] = K_prev
+                test_entries[idx]['sensor_metas_prev'][ch]['old_ext'] = old_extrinsics_[ch]
 
-        # Apply augmentor for resize+crop
-        augmented_prev = augmentor(prev_images)
-        augmented_curr = augmentor(curr_images)
+                curr_path = test_entries[idx]['curr_camera_data'][ch]['filename']
+                curr_images_undistorted[ch] = cv2.imread(curr_path, cv2.IMREAD_COLOR)
+                curr_images_undistorted[ch], K_curr, roi_curr = undistort_image(curr_images_undistorted[ch],
+                                                                                test_entries[idx]['sensor_metas_curr'][ch]['K'],
+                                                                                test_entries[idx]['sensor_metas_curr'][ch]['dist'])
+                test_entries[idx]['sensor_metas_curr'][ch]['K_undist'] = K_curr
+                test_entries[idx]['sensor_metas_curr'][ch]['old_ext'] = old_extrinsics_[ch]
+                curr_images_undistorted[ch] = Image.fromarray(cv2.cvtColor(curr_images_undistorted[ch], cv2.COLOR_BGR2RGB))
+                # K_undist_curr[ch] = K_curr
+                # roi_undist_curr[ch] = roi_curr
+
+            # concat_prev = np.concatenate([prev_images_undistorted[ch] for ch in camera_channels], axis=1)
+            # concat_prev = concat_prev.astype(np.uint8)
+            # concat_prev_img = Image.fromarray(concat_prev)
+            # concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
+
+            # # Apply ROI crop to the undistorted curr image and adjust intrinsics
+            # # use min ROI to ensure all images are cropped to the same size
+            # # 1. Find the minimum ROI between every camera channel
+            # channel_roi = {}
+            # for ch in camera_channels:
+            #     roi_i = intersect_rois(roi_undist_prev[ch], roi_undist_curr[ch])
+            #     channel_roi[ch] = roi_i
+            #     if roi_i is None:
+            #         print(f"[WARN]: No intersection found for channel {ch} at index {idx}. ")
+            
+            # # 2. Find the minimum ROI across all channels
+            # global_roi = None
+            # has_none = any(v is None for v in channel_roi.values())
+            # if has_none:
+            #     print("[WARN]: No global ROI found yet, using full image size as roi.")
+            #     global_roi = (0, 0, prev_images_undistorted[camera_channels[0]].shape[1], prev_images_undistorted[camera_channels[0]].shape[0])
+            # else:
+            #     for ch in camera_channels:
+            #         if global_roi is None:
+            #             global_roi = channel_roi[ch]
+            #         else:
+            #             global_roi = intersect_rois(global_roi, channel_roi[ch])
+
+            # # 3. Crop images to the global ROI
+            # x, y, w, h = global_roi
+            # for ch in camera_channels:
+            #     prev_images_undistorted[ch] = prev_images_undistorted[ch][y:y+h, x:x+w]
+            #     K_undist_prev[ch][0, 2] -= x
+            #     K_undist_prev[ch][1, 2] -= y
+            #     # replace the original K matrix with the adjusted one
+            #     test_entries[idx]['sensor_metas_prev'][ch]['K_undist'] = K_undist_prev[ch]
+
+            #     curr_images_undistorted[ch] = curr_images_undistorted[ch][y:y+h, x:x+w]
+            #     K_undist_curr[ch][0, 2] -= x
+            #     K_undist_curr[ch][1, 2] -= y
+            #     # replace the original K matrix with the adjusted one
+            #     test_entries[idx]['sensor_metas_curr'][ch]['K_undist'] = K_undist_curr[ch]
+
+            #     prev_images_undistorted[ch] = Image.fromarray(cv2.cvtColor(prev_images_undistorted[ch], cv2.COLOR_BGR2RGB))
+            #     curr_images_undistorted[ch] = Image.fromarray(cv2.cvtColor(curr_images_undistorted[ch], cv2.COLOR_BGR2RGB))
+
+            # concat_prev = np.concatenate([prev_images_undistorted[ch] for ch in camera_channels], axis=1)
+            # concat_prev = concat_prev.astype(np.uint8)
+            # concat_prev_img = Image.fromarray(concat_prev)
+            # concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
+
+            # augment images
+            orig_size = next(iter(prev_images_undistorted.values())).size  # (W, H)
+            affine_params = augmentor.sample_params(orig_size)
+            augmented_prev, _ = augmentor(prev_images_undistorted.copy(), affine_params)
+            augmented_curr, _ = augmentor(curr_images_undistorted.copy(), affine_params)
+            affine_matrix = augmentor.get_affine_matrix(affine_params)
+            
+            # visualize RGB images
+            concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
+            concat_prev = concat_prev.astype(np.uint8)
+            concat_prev_img = Image.fromarray(concat_prev)
+            concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
+
+            # Convert to tensors and stack
+            prev_tensors = [torch.from_numpy(augmented_prev[ch]).permute(2,0,1).float() for ch in camera_channels]
+            curr_tensors = [torch.from_numpy(augmented_curr[ch]).permute(2,0,1).float() for ch in camera_channels]
+
+            prev_batch = torch.stack(prev_tensors, dim=0).unsqueeze(0).to(device)
+            curr_batch = torch.stack(curr_tensors, dim=0).unsqueeze(0).to(device)
+            affine_matrix = torch.from_numpy(affine_matrix).unsqueeze(0).to(device)
+
+            # Build spherical coordinates
+            # Get UV indices for previous and current images
+            H_sph, W_sph = prev_batch.shape[-2:]
+            H_sph, W_sph = H_sph // 4, W_sph // 4 
+            W_sph = W_sph * 6  # 6 cameras concatenated horizontally
+            R = args.radial_sampling_num
+            # xyz 按照 nuScenes 的坐标系定义构建：x向右，y向前，z向上
+            # 需要修改成SJTU的坐标系定义        ：x向左，y向后，z向上
+            # sjtu: 25° up, -25° down
+            _, xyz = build_spherical_voxels(
+                    H=H_sph, W=W_sph, R=R,
+                    r_min=5.0, r_max=50.0,
+                    fov_up_deg=15.0, fov_down_deg=-15.0,
+                )
+            X, Y, Z = xyz[...,0], xyz[...,1], xyz[...,2]
+            X_new = -X
+            Y_new = -Y
+            Z_new =  Z
+            xyz = np.stack([X_new, Y_new, Z_new], axis=-1)
+
+            raw_img_size = (orig_size[1], orig_size[0])  # (H, W)
+            idx_uv_prev_raw = project_voxel_to_camera(
+                    xyz=xyz,
+                    sensor_metas=test_entries[idx]['sensor_metas_prev'],
+                    camera_channels=camera_channels,
+                    raw_img_size=raw_img_size,
+                    min_dist=1.0,
+                    sjtu=args.sjtu_test
+                )
+            idx_uv_curr_raw = project_voxel_to_camera(
+                    xyz=xyz,
+                    sensor_metas=test_entries[idx]['sensor_metas_curr'],
+                    camera_channels=camera_channels,
+                    raw_img_size=raw_img_size,
+                    min_dist=1.0,
+                    sjtu=args.sjtu_test
+                )
+            
+
+            # # 将 idx_uv_prev_raw 的类型转为 int 以便索引
+            # cam_idx_map = idx_uv_prev_raw[...,0].astype(int)
+            # u_map       = idx_uv_prev_raw[...,1]
+            # v_map       = idx_uv_prev_raw[...,2]
+
+            # for cam_idx, ch in enumerate(camera_channels):
+            #     # 1) 复制一份图，用于绘制
+            #     img = prev_images_undistorted[ch].copy()
+            #     draw = ImageDraw.Draw(img)
+
+            #     # 2) 找到所有属于本通道的投影点
+            #     mask = (cam_idx_map == cam_idx)
+            #     us   = u_map[mask].astype(int)
+            #     vs   = v_map[mask].astype(int)
+
+            #     # 3) 在图上画点
+            #     #    点太多可先随机采样，比如最多画 5000 个
+            #     # N = us.shape[0]
+            #     # if N > 5000:
+            #     #     idxs = np.random.choice(N, size=5000, replace=False)
+            #     #     us = us[idxs]
+            #     #     vs = vs[idxs]
+
+            #     for u, v in zip(us, vs):
+            #         # 如果超出图像边界就跳过
+            #         if not (0 <= u < img.width and 0 <= v < img.height):
+            #             continue
+            #         # 小圆圈半径
+            #         r = 2
+            #         # 红色填充
+            #         draw.ellipse((u-r, v-r, u+r, v+r), fill=(255,0,0))
+
+            #     # 4) 保存或显示
+            #     img.save(f'sjtu_proj_{ch}.png')
+
+            idx_uv_curr_raw = torch.from_numpy(idx_uv_curr_raw).unsqueeze(0).to(device)
+            idx_uv_prev_raw = torch.from_numpy(idx_uv_prev_raw).unsqueeze(0).to(device)
+
+            # Inference
+            with torch.no_grad():
+                scale_pred, risk_pred    = model.forward(
+                        img_prev         = prev_batch,
+                        img_curr         = curr_batch,
+                        affine_matrix    = affine_matrix,
+                        idx_uv_prev      = idx_uv_prev_raw,
+                        idx_uv_curr      = idx_uv_curr_raw,
+                        attn_type        = args.attn_type,
+                        attn_splits_list = args.attn_splits_list,
+                        corr_radius_list = args.corr_radius_list,
+                        prop_radius_list = args.prop_radius_list,
+                        num_reg_refine   = args.num_reg_refine,
+                        testing          = False
+                    )
+                
+            # Visualization
+            scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
+            scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
+            normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
+
+            risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
+            normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array)
+
+            # save prediction as .npy files
+            # for collision map generation
+            if args.save_pred_npy:
+                # 添加以时间戳命名的子目录
+                pred_npy_subdir = os.path.join(args.pred_npy_dir, f"pred_npy_{time_stamp}")
+                os.makedirs(pred_npy_subdir, exist_ok=True)
+                pred_data = {
+                    "scale_pred": scale_prediction_array,
+                    "risk_pred": risk_prediction_array
+                }
+                np.save(os.path.join(pred_npy_subdir, f"pred_{idx}.npy"), pred_data)
+
+            # Save visuals
+            plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
+                    -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
+            plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
+                    normalized_pred_risk_image, cmap='seismic', vmin=-1, vmax=1)
+
+            # Cleanup
+            del prev_batch, curr_batch, scale_pred, risk_pred
+            torch.cuda.empty_cache()
         
-        # Prev images
-        concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
-        concat_prev = concat_prev.astype(np.uint8)
-        concat_prev_img = Image.fromarray(concat_prev)
-        concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
+        # test on nuScenes dataset
+        else: 
+            # Load images
+            prev_images = {}
+            curr_images = {}
+            for ch in camera_channels:
+                prev_path = os.path.join('./Datasets/nuscenes', test_entries[idx]['prev_camera_data'][ch]['filename'])
+                curr_path = os.path.join('./Datasets/nuscenes', test_entries[idx]['curr_camera_data'][ch]['filename'])
+                prev_images[ch] = Image.open(prev_path)
+                curr_images[ch] = Image.open(curr_path)
 
-        # Convert to tensors and stack
-        prev_tensors = [torch.from_numpy(augmented_prev[ch]).permute(2,0,1).float() for ch in camera_channels]
-        curr_tensors = [torch.from_numpy(augmented_curr[ch]).permute(2,0,1).float() for ch in camera_channels]
+            # augment images
+            orig_size = next(iter(prev_images.values())).size  # (W, H)
+            affine_params = augmentor.sample_params(orig_size)
+            augmented_prev, _ = augmentor(prev_images, affine_params)
+            augmented_curr, _ = augmentor(curr_images, affine_params)
+            affine_matrix = augmentor.get_affine_matrix(affine_params)
+            
+            # visualize RGB images
+            concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
+            concat_prev = concat_prev.astype(np.uint8)
+            concat_prev_img = Image.fromarray(concat_prev)
+            concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
 
-        prev_batch = torch.stack(prev_tensors, dim=0).unsqueeze(0).to(device)
-        curr_batch = torch.stack(curr_tensors, dim=0).unsqueeze(0).to(device)
-        sensor_meta = test_entries[idx]['sensor_metas']
+            # Convert to tensors and stack
+            prev_tensors = [torch.from_numpy(augmented_prev[ch]).permute(2,0,1).float() for ch in camera_channels]
+            curr_tensors = [torch.from_numpy(augmented_curr[ch]).permute(2,0,1).float() for ch in camera_channels]
 
-        if test_entries[idx]['gt_map_path'] is not None:
-            # Load ground-truth maps
-            gt_item = np.load(os.path.join(test_entries[idx]['gt_map_path'], 'range_image.npy'), allow_pickle=True).item()
-            gt_scale_map = torch.from_numpy(gt_item['scale']).float()
-            gt_risk_map = torch.from_numpy(gt_item['risk_score']).float()
+            prev_batch = torch.stack(prev_tensors, dim=0).unsqueeze(0).to(device)
+            curr_batch = torch.stack(curr_tensors, dim=0).unsqueeze(0).to(device)
+            affine_matrix = torch.from_numpy(affine_matrix).unsqueeze(0).to(device)
 
-            # Build masked GT tensors
-            valid_mask = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
-            gt_scale_tensor = torch.cat([
-                gt_scale_map.unsqueeze(0),
-                valid_mask.unsqueeze(0).float()
-            ], dim=0).unsqueeze(0).to(device)
-            gt_risk_tensor = torch.cat([
-                gt_risk_map.unsqueeze(0),
-                valid_mask.unsqueeze(0).float()
-            ], dim=0).unsqueeze(0).to(device)
-        else:
-            gt_scale_tensor = torch.zeros((1, 2, prev_batch.shape[2], prev_batch.shape[3])).to(device)
-            gt_risk_tensor = torch.zeros((1, 2, prev_batch.shape[2], prev_batch.shape[3])).to(device)
+            # Build spherical coordinates
+            # Get UV indices for previous and current images
+            H_sph, W_sph = prev_batch.shape[-2:]
+            H_sph, W_sph = H_sph // 4, W_sph // 4 
+            W_sph = W_sph * 6  # 6 cameras concatenated horizontally
+            R = args.radial_sampling_num
+            _, xyz = build_spherical_voxels(
+                    H=H_sph, W=W_sph, R=R,
+                    r_min=5.0, r_max=50.0,
+                    fov_up_deg=8.0, fov_down_deg=-15.0,
+                )
 
-        # Inference
-        with torch.no_grad():
-            scale_pred, risk_pred, _, _ = model.forward_with_loss(
-                prev_batch, curr_batch, sensor_meta,
-                gt_scale_tensor, gt_risk_tensor,
-                attn_type=args.attn_type,
-                attn_splits_list=args.attn_splits_list,
-                corr_radius_list=args.corr_radius_list,
-                prop_radius_list=args.prop_radius_list,
-                num_reg_refine=args.num_reg_refine
-            )
+            raw_img_size = (orig_size[1], orig_size[0])  # (H, W)
+            idx_uv_prev_raw = project_voxel_to_camera(
+                    xyz=xyz,
+                    sensor_metas=test_entries[idx]['sensor_metas_prev'],
+                    camera_channels=camera_channels,
+                    raw_img_size=raw_img_size,
+                    min_dist=1.0
+                )
+            idx_uv_curr_raw = project_voxel_to_camera(
+                    xyz=xyz,
+                    sensor_metas=test_entries[idx]['sensor_metas_curr'],
+                    camera_channels=camera_channels,
+                    raw_img_size=raw_img_size,
+                    min_dist=1.0
+                )
+            
+            
+            idx_uv_curr_raw = torch.from_numpy(idx_uv_curr_raw).unsqueeze(0).to(device)
+            idx_uv_prev_raw = torch.from_numpy(idx_uv_prev_raw).unsqueeze(0).to(device)
 
-        # Visualization
-        gt_scale_array = gt_scale_tensor[0,0].cpu().numpy()
-        gt_scale_mask_array = gt_scale_tensor[0,1].cpu().bool().numpy()
-        normalized_gt_scale_image = visual_scale_map_range_image(gt_scale_array, gt_scale_mask_array)
+            if test_entries[idx]['gt_map_path'] is not None:
+                # Load ground-truth maps
+                gt_item = np.load(os.path.join(test_entries[idx]['gt_map_path'], 'range_image.npy'), allow_pickle=True).item()
+                gt_scale_map = torch.from_numpy(gt_item['scale']).float()
+                gt_risk_map = torch.from_numpy(gt_item['risk_score']).float()
 
-        scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
-        scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
-        normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
+                # Build masked GT tensors
+                valid_mask = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
+                gt_scale_tensor = torch.cat([
+                    gt_scale_map.unsqueeze(0),
+                    valid_mask.unsqueeze(0).float()
+                ], dim=0).unsqueeze(0).to(device)
+                gt_risk_tensor = torch.cat([
+                    gt_risk_map.unsqueeze(0),
+                    valid_mask.unsqueeze(0).float()
+                ], dim=0).unsqueeze(0).to(device)
+            else:
+                gt_scale_tensor = torch.zeros((1, 2, prev_batch.shape[2], prev_batch.shape[3])).to(device)
+                gt_risk_tensor = torch.zeros((1, 2, prev_batch.shape[2], prev_batch.shape[3])).to(device)
 
-        gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
-        normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array)
+            # Inference
+            with torch.no_grad():
+                scale_pred, risk_pred    = model.forward(
+                        img_prev         = prev_batch,
+                        img_curr         = curr_batch,
+                        affine_matrix    = affine_matrix,
+                        idx_uv_prev      = idx_uv_prev_raw,
+                        idx_uv_curr      = idx_uv_curr_raw,
+                        attn_type        = args.attn_type,
+                        attn_splits_list = args.attn_splits_list,
+                        corr_radius_list = args.corr_radius_list,
+                        prop_radius_list = args.prop_radius_list,
+                        num_reg_refine   = args.num_reg_refine,
+                        testing          = False
+                    )
+            # total_params = sum(p.numel() for p in model.parameters())
+            # # 可训练参数量
+            # trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-        risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
-        normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array)
+            # print(f"Total params:      {total_params:,}")
+            # print(f"Trainable params:  {trainable_params:,}")
 
-        # save prediction as .npy files
-        # for collision map generation
-        if args.save_pred_npy:
-            os.makedirs(args.pred_npy_dir, exist_ok=True)
-            pred_data = {
-            "scale_pred": scale_prediction_array,
-            "risk_pred": risk_prediction_array
-            }
-            np.save(os.path.join(args.pred_npy_dir, f"pred_{idx}.npy"), pred_data)
+            # Visualization
+            gt_scale_array = gt_scale_tensor[0,0].cpu().numpy()
+            gt_scale_mask_array = gt_scale_tensor[0,1].cpu().bool().numpy()
+            normalized_gt_scale_image = visual_scale_map_range_image(gt_scale_array, gt_scale_mask_array)
 
-        # Save visuals
-        plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
-                   -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
-        plt.imsave(os.path.join(output_dir, f"gt_scale_{idx}.png"),
-                   -normalized_gt_scale_image, cmap='seismic', vmin=-1, vmax=1)
-        plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
-                   normalized_pred_risk_image, cmap='seismic', vmin=-1, vmax=1)
-        plt.imsave(os.path.join(output_dir, f"gt_risk_{idx}.png"),
-                   normalized_gt_risk_image, cmap='seismic', vmin=-1, vmax=1)
+            scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
+            scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
+            normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
 
-        # Cleanup
-        del prev_batch, curr_batch, scale_pred, risk_pred
-        torch.cuda.empty_cache()
+            gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
+            normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array)
 
-        with open(os.path.join(output_dir, "processed_indices.txt"), "a") as f:
-            f.write(f"{idx}\n")
+            risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
+            normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array)
+
+            # save prediction as .npy files
+            # for collision map generation
+            if args.save_pred_npy:
+                # 添加以时间戳命名的子目录
+                pred_npy_subdir = os.path.join(args.pred_npy_dir, f"pred_npy_{time_stamp}")
+                os.makedirs(pred_npy_subdir, exist_ok=True)
+                pred_data = {
+                    "scale_pred": scale_prediction_array,
+                    "risk_pred": risk_prediction_array
+                }
+                np.save(os.path.join(pred_npy_subdir, f"pred_{idx}.npy"), pred_data)
+
+            # Save visuals
+            plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
+                    -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
+            plt.imsave(os.path.join(output_dir, f"gt_scale_{idx}.png"),
+                    -normalized_gt_scale_image, cmap='seismic', vmin=-1, vmax=1)
+            plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
+                    normalized_pred_risk_image, cmap='seismic', vmin=-1, vmax=1)
+            plt.imsave(os.path.join(output_dir, f"gt_risk_{idx}.png"),
+                    normalized_gt_risk_image, cmap='seismic', vmin=-1, vmax=1)
+
+            # Cleanup
+            del prev_batch, curr_batch, scale_pred, risk_pred
+            torch.cuda.empty_cache()
+
+            with open(os.path.join(output_dir, "processed_indices.txt"), "a") as f:
+                f.write(f"{idx}\n")
 
 if __name__ == "__main__":
     main()

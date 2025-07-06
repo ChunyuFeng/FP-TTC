@@ -12,7 +12,7 @@ topic_map = {
     '/multi/camera/wide_len6/compressed': 'CAM_FRONT_LEFT',
 }
 
-bag_path     = './Datasets/cyberrock/rosbag/wide_len1-6_16-48.bag'
+bag_path     = './Datasets/cyberrock/rosbag/wide_len1-6_6-50.bag'
 output_root  = './Datasets/cyberrock/sweeps'
 
 # 检查 bag 文件是否存在

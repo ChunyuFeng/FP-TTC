@@ -11,6 +11,7 @@ from glob import glob
 import os.path as osp
 import re
 from tqdm import tqdm
+from PIL import ImageDraw
 
 from .utils.rectangle_noise import retangle
 from .utils import frame_utils
@@ -771,7 +772,10 @@ class nuScenes_range_image(data.Dataset):
         self.idx_uv_prev_list = []
         self.idx_uv_curr_list = [] 
 
-        for i in tqdm(range(len(self.data)-1170), desc='Loading nuScenes Range Image Dataset'):
+        for i in tqdm(range(len(self.data) - 1170), desc='Loading nuScenes Range Image Dataset'):
+
+            if self.data[i]['scene_indice'] == '10':
+                continue
 
             range_image_path = os.path.join(self.data[i]['gt_map_path'], 'range_image_curr.npy')
             if not osp.exists(range_image_path):
@@ -800,6 +804,7 @@ class nuScenes_range_image(data.Dataset):
             _, xyz = build_spherical_voxels(
                 H=H_sph, W=W_sph, R=R,
                 r_min=5.0, r_max=50.0,
+                # fov_up_deg=22.0, fov_down_deg=-17.0,
                 fov_up_deg=8.0, fov_down_deg=-15.0,
             )
 
@@ -854,6 +859,43 @@ class nuScenes_range_image(data.Dataset):
         sensor_meta = self.sensor_meta_list[index]
         idx_uv_prev_raw = self.idx_uv_prev_list[index]
         idx_uv_curr_raw = self.idx_uv_curr_list[index]
+
+        # H_sph, W_sph, R, _ = idx_uv_prev_raw.shape
+
+        # # 将 idx_uv_prev_raw 的类型转为 int 以便索引
+        # cam_idx_map = idx_uv_prev_raw[...,0].astype(int)
+        # u_map       = idx_uv_prev_raw[...,1]
+        # v_map       = idx_uv_prev_raw[...,2]
+
+        # for cam_idx, ch in enumerate(camera_channels):
+        #     # 1) 复制一份图，用于绘制
+        #     img = prev_surr_view_imgs[ch].copy()
+        #     draw = ImageDraw.Draw(img)
+
+        #     # 2) 找到所有属于本通道的投影点
+        #     mask = (cam_idx_map == cam_idx)
+        #     us   = u_map[mask].astype(int)
+        #     vs   = v_map[mask].astype(int)
+
+        #     # 3) 在图上画点
+        #     #    点太多可先随机采样，比如最多画 5000 个
+        #     # N = us.shape[0]
+        #     # if N > 5000:
+        #     #     idxs = np.random.choice(N, size=5000, replace=False)
+        #     #     us = us[idxs]
+        #     #     vs = vs[idxs]
+
+        #     for u, v in zip(us, vs):
+        #         # 如果超出图像边界就跳过
+        #         if not (0 <= u < img.width and 0 <= v < img.height):
+        #             continue
+        #         # 小圆圈半径
+        #         r = 2
+        #         # 红色填充
+        #         draw.ellipse((u-r, v-r, u+r, v+r), fill=(255,0,0))
+
+        #     # 4) 保存或显示
+        #     img.save(f'proj_{ch}.png')
 
 
         # 获取数据增强的 affine 参数

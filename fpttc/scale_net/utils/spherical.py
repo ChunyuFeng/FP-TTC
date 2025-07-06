@@ -8,6 +8,60 @@ import argparse
 from pyquaternion import Quaternion
 import time
 
+import numpy as np
+from math import atan2, sqrt
+from pyquaternion import Quaternion
+
+def pixel_to_elevation_angles(R_s2c, K, image_size):
+    """
+    计算图像顶部 (v=0) 与底部 (v=H-1) 对应的激光雷达仰角（°）。
+
+    参数:
+      R_s2c       : (3, 3) 雷达系到相机系的旋转矩阵
+      K           : (3, 3) 相机内参矩阵
+      image_size  : (H, W) 原始图像高宽
+
+    返回:
+      theta_top_deg, theta_bottom_deg （单位：度）
+    """
+    
+
+    # 2) 反求相机->LiDAR 的旋转（忽略平移）
+    R_c2s = R_s2c.T   # 相机系到雷达系的旋转矩阵
+
+    # 3) 提取内参
+    fx, fy = K[0,0], K[1,1]
+    cx, cy = K[0,2], K[1,2]
+    H, W = image_size
+
+    def elevation(u, v):
+        # 相机系归一化射线
+        dc = np.array([(u - cx)/fx, (v - cy)/fy, 1.0], dtype=float)
+        # 转到雷达系（只旋转，不加平移）
+        dl = R_c2s.dot(dc)
+        # 计算仰角：上正，下负
+        return atan2(dl[2], sqrt(dl[0]**2 + dl[1]**2))
+
+    # 4) 选取图像中心列像素点
+    u_center = cx
+
+    theta_top    = elevation(u_center, 0)
+    theta_bottom = elevation(u_center, H-1)
+
+    # 转成度
+    theta_top_deg    = np.degrees(theta_top)
+    theta_bottom_deg = np.degrees(theta_bottom)
+    return theta_top_deg, theta_bottom_deg
+
+# 示例调用
+# 假设你已经有了 sensor_meta、cam_cs、cam_pose：
+# cam = 'CAM_FRONT'
+# cam_cs   = sensor_meta['camera']['calibrated_sensor'][cam]
+# cam_pose = sensor_meta['camera']['ego_pose'][cam]
+# H, W = cam_cs['height'], cam_cs['width']
+# top_deg, bot_deg = pixel_to_elevation_angles(sensor_meta, cam_cs, cam_pose, (H, W))
+# print("上边缘仰角:", top_deg, "°；下边缘仰角:", bot_deg, "°")
+
 def make_homog(R: np.ndarray, t: np.ndarray):
     """构造 4×4 齐次变换矩阵"""
     T = np.eye(4, dtype=np.float64)
@@ -54,7 +108,7 @@ def build_lidar_to_camera_projection(
     # 6) 加内参得到 P
     K = np.array(cam_cs['camera_intrinsic'])
     P = K @ T_s2c[:3, :]
-    return P, R_tot, t_tot
+    return P, K, R_tot, t_tot
 
 
 def project_voxel_to_camera(
@@ -62,9 +116,8 @@ def project_voxel_to_camera(
     sensor_metas,
     camera_channels,
     raw_img_size,
-    # img_size,
-    # affine,
-    min_dist):
+    min_dist,
+    sjtu=False):
     """
     对一批 LiDAR 体素点 (H,W,R,3) 进行投影，输出 (H,W,R,3) 数组，其中每个 voxel 对应的三个值为:
       [cam_idx, u, v]，若无效则均为 -1。
@@ -72,7 +125,6 @@ def project_voxel_to_camera(
     :param xyz: shape=(H, W, R, 3)
     :param sensor_metas: length B batch 的 sensor_meta
     :param raw_img_size: 原始图像大小 (H, W)
-    :param img_size: 预处理后的图像大小 (H, W)
     :param camera_channels: 相机顺序列表
     :param affine: optional，仿射变换矩阵，表示输入图像在预处理时经过的变换
     :param min_dist: 投影深度阈值
@@ -89,18 +141,26 @@ def project_voxel_to_camera(
 
     for cam_idx, cam in enumerate(camera_channels):
         # h_cam, w_cam = img_size[:2]
-
-        cam_cs = sensor_metas['camera']['calibrated_sensor'][cam]
-        cam_pose = sensor_metas['camera']['ego_pose'][cam]
-        P, R_tot, t_tot = build_lidar_to_camera_projection(sensor_metas, cam_cs, cam_pose)
-
-        # # 应用仿射
-        # if affine:
-        #     P = affine[bs] @ P
-        #     h_cam, w_cam = img_size[:2]
-        # else:
-        #     h_cam, w_cam = raw_img_size[:2]
-
+        if sjtu:
+            # SJTU 数据集的相机元数据结构
+            # R_tot, t_tot = sensor_metas[cam]['R'], sensor_metas[cam]['t']
+            K_undist = sensor_metas[cam]['K_undist']
+            # RT = np.hstack([R_tot, t_tot.reshape(3, 1)])  # (3, 4)
+            RT = sensor_metas[cam]['old_ext']
+            R_tot = RT[:3, :3]  # (3, 3)
+            t_tot = RT[:3, 3]  # (3,)
+            P = K_undist.dot(RT)
+            # top_deg, bot_deg = pixel_to_elevation_angles(R_tot, K_undist, raw_img_size)
+            # print(f"Camera {cam} top: {top_deg:.2f}°, bottom: {bot_deg:.2f}°")
+            # t_tot = t_tot.reshape(3, 1)  # (3, 1)
+            # P = K_undist @ RT
+        else:
+            # NuScenes 数据集的相机元数据结构
+            cam_cs = sensor_metas['camera']['calibrated_sensor'][cam]
+            cam_pose = sensor_metas['camera']['ego_pose'][cam]
+            P, K, R_tot, t_tot = build_lidar_to_camera_projection(sensor_metas, cam_cs, cam_pose)
+            # top_deg, bot_deg = pixel_to_elevation_angles(R_tot, K, raw_img_size)
+            # print(f"Camera {cam} top: {top_deg:.2f}°, bottom: {bot_deg:.2f}°")
         # 计算深度
         pts_cam = R_tot @ coords.T + t_tot[:, None]
         depths = pts_cam[2, :]
@@ -129,7 +189,8 @@ def project_voxel_to_camera(
 
 def build_spherical_voxels(H, W, R,
                            r_min=5.0, r_max=50.0,
-                           fov_up_deg=8.0, fov_down_deg=-15.0):
+                           fov_up_deg=8.0, fov_down_deg=-15.0,
+                           sjtu=False):
     """
     在球坐标系下构建不均匀体素：
       H 为垂直方向（pitch）的切分数

@@ -595,7 +595,10 @@ class NuscRangeImageAugmentor:
         w, h = img_size
         crop_h, crop_w = self.crop_size
         # 缩放使宽度匹配
-        scale = crop_w / w
+        scale_h = crop_h / h
+        scale_w = crop_w / w
+        scale = max(scale_h, scale_w)
+        # scale = crop_w / w
         resize_w, resize_h = int(w * scale), int(h * scale)
         # 裁剪偏移：宽度居中，高度底部对齐
         crop_x = (resize_w - crop_w) // 2
