@@ -371,8 +371,8 @@ def main(args):
 
         scene_indice = current_sf_record['scene_indice']
 
-        # if scene_indice != '10':
-        #     continue
+        if scene_indice not in ['11', '12', '13', '14', '15']:
+            continue
 
         # 读取 scene flow 数据
         if (not os.path.exists(os.path.join(args.scene_flow_path, current_sf_record['folder_name'], 'pc_prev.npy'))
@@ -634,7 +634,7 @@ def main(args):
           Sorted by timestamp. {len(trainval_test_infos)} items in total.")
 
     with open(os.path.join(args.pkl_save_path,
-                           f"nusc_{args.trainval_test_split}_infos_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}.pkl"),'wb') as f:
+                           f"nusc_{args.trainval_test_split}_infos_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_.pkl"),'wb') as f:
         pickle.dump(trainval_test_infos, f)
     print(f"Saved nusc_trainval_infos.pkl to {args.pkl_save_path}")
 

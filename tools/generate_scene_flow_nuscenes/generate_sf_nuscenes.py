@@ -18,6 +18,83 @@ from mmcv.ops.points_in_boxes import (points_in_boxes_all, points_in_boxes_cpu,
 from scipy.spatial.transform import Rotation
 from tqdm import trange
 
+import open3d.visualization.gui as gui
+from open3d.visualization import O3DVisualizer
+
+def load_pcd_from_file(pcd_file_path):
+
+    pcd = o3d.io.read_point_cloud(pcd_file_path)
+    points = np.asarray(pcd.points, dtype=np.float32)  # (N,3)
+
+    # rotate from (x->right, y->up, z->back) to (x->right, y->front, z->up)
+    R = Rotation.from_euler('x', 90, degrees=True).as_matrix()  # (3,3)
+    points_rotated = points @ R.T
+    # (x->right, y->back, z->up)
+    points_rotated[:, 1] = -points_rotated[:, 1]
+    # normalize the points to [0,1]³
+    mins = points_rotated.min(axis=0)  # (3,)
+    maxs = points_rotated.max(axis=0)  # (3,)
+    extents = maxs - mins             # (3,)
+    points_norm = (points_rotated - mins) / extents
+
+    # move the origin of the points to the center of the bounding box
+    box_center = (0.5, 0.5, 0)
+    points_norm -= box_center  # 将点云坐标转换到以aabb中心为原点的坐标系
+
+    return points_norm
+
+
+
+def visualize_prev_frame(filtered_prev_object_points_list,
+                         filtered_prev_object_boxes_list):
+    # 1. 准备几何体列表
+    vis_geoms = []
+    for idx, (pts, box) in enumerate(zip(filtered_prev_object_points_list,
+                                         filtered_prev_object_boxes_list)):
+        # 1.1 点云
+        pcd_obj = o3d.geometry.PointCloud()
+        pcd_obj.points = o3d.utility.Vector3dVector(pts[:, :3])
+        pcd_obj.paint_uniform_color(np.random.uniform(0, 1, size=3))
+        vis_geoms.append((f"pcd_{idx}", pcd_obj))
+
+        # 1.2 线框
+        corners = box.corners().T
+        lines = [
+            [0,1],[1,2],[2,3],[3,0],
+            [4,5],[5,6],[6,7],[7,4],
+            [0,4],[1,5],[2,6],[3,7]
+        ]
+        colors = [[1,0,0] for _ in lines]
+        line_set = o3d.geometry.LineSet(
+            points=o3d.utility.Vector3dVector(corners),
+            lines=o3d.utility.Vector2iVector(lines)
+        )
+        line_set.colors = o3d.utility.Vector3dVector(colors)
+        vis_geoms.append((f"bbox_{idx}", line_set))
+
+    # 2. 初始化 GUI
+    gui.Application.instance.initialize()
+
+    # 3. 创建 CPU GUI 可视化窗口
+    vis = O3DVisualizer("SceneFlow 上一帧预览", 1024, 768)
+    vis.show_settings = True
+
+    # 4. 添加所有几何体（注意传入 name, geometry）
+    for name, geom in vis_geoms:
+        vis.add_geometry(name, geom)
+
+    # 5. 在每个 bbox 顶面中心加文字
+    for idx, box in enumerate(filtered_prev_object_boxes_list):
+        corners = box.corners().T
+        top_center = corners[4:8].mean(axis=0)
+        top_center[2] += 0.1
+        vis.add_3d_label(top_center, box.name)
+
+    # 6. 把窗口注册到 Application 并运行
+    gui.Application.instance.add_window(vis)
+    gui.Application.instance.run()
+
+
 def run_poisson(pcd, depth, n_threads, min_density=None):
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
         pcd, depth=depth, n_threads=8
@@ -208,7 +285,8 @@ def main(nusc, val_list, indice, args):
                 "is_key_frame": lidar_data['is_key_frame'],
                 "gt_bbox_3d": gt_bbox_3d,
                 # "converted_object_category": converted_object_category,
-                "pc_file_name": pc_file_name.split('/')[-1]}
+                "pc_file_name": pc_file_name.split('/')[-1],
+                "object_category": object_category}
         ################## record semantic information into the dict if it's a key frame  ########################
         # if lidar_data['is_key_frame']:
         #     pc_with_semantic = pc_with_semantic[points_mask]
@@ -242,10 +320,66 @@ def main(nusc, val_list, indice, args):
                     # object_semantic.append(dict['converted_object_category'][i])
                 else:
                     continue
+    # ################################### load 3d model ######################################
+    # car_points_norm = load_pcd_from_file("Datasets/nuscenes/0_scene_flow/object_3d_model/car.pcd")
+    # bus_points_norm = load_pcd_from_file("Datasets/nuscenes/0_scene_flow/object_3d_model/bus.pcd")
+    # human_points_norm = load_pcd_from_file("Datasets/nuscenes/0_scene_flow/object_3d_model/human.pcd")
+    # trafficcone_points_norm = load_pcd_from_file("Datasets/nuscenes/0_scene_flow/object_3d_model/trafficcone.pcd")
+    # truck_points_norm = load_pcd_from_file("Datasets/nuscenes/0_scene_flow/object_3d_model/truck.pcd")
+
+    # token2category = {}
+    # token2bbox = {}
+    # for frame in dict_list:
+    #     for token, category, gt_bbox_3d in zip(frame['object_tokens'], frame['object_category'], frame['gt_bbox_3d']):
+    #         if token not in token2category:
+    #             token2category[token] = category
+    #             token2bbox[token] = gt_bbox_3d
+    # ############################################################################################
 
     # convert the absolute coordinates of the object point cloud to the coordinates relative to the bbox
     object_points_dict = {}  
     for query_object_token in object_token_zoo:
+
+        # ########################### using 3D model points for some categories ##########################
+        # # replace the car points with the 3D model car points
+        # if token2category.get(query_object_token) == 'vehicle.car':
+        #     # load the w-l-h of the bounding box
+        #     wlh = token2bbox[query_object_token][3:6]
+        #     object_points_dict[query_object_token] = car_points_norm.copy()
+        #     # scale the car points to the bounding box size
+        #     object_points_dict[query_object_token] *= wlh / np.array([1.0, 1.0, 1.0])
+        #     continue
+        # # replace the truck points with the 3D model truck points
+        # if token2category.get(query_object_token) == 'vehicle.truck':
+        #     # load the w-l-h of the bounding box
+        #     wlh = token2bbox[query_object_token][3:6]
+        #     object_points_dict[query_object_token] = truck_points_norm.copy()
+        #     # scale the truck points to the bounding box size
+        #     object_points_dict[query_object_token] *= wlh / np.array([1.0, 1.0, 1.0])
+        #     continue
+        # # replace the human points with the 3D model human points
+        # if token2category.get(query_object_token) == 'human.pedestrian.construction_worker':
+        #     # load the w-l-h of the bounding box
+        #     wlh = token2bbox[query_object_token][3:6]
+        #     object_points_dict[query_object_token] = human_points_norm.copy()
+        #     # scale the human points to the bounding box size
+        #     object_points_dict[query_object_token] *= wlh / np.array([1.0, 1.0, 1.0])
+        #     continue
+        # if token2category.get(query_object_token) == 'vehicle.bus.rigid':
+        #     # load the w-l-h of the bounding box
+        #     wlh = token2bbox[query_object_token][3:6]
+        #     object_points_dict[query_object_token] = bus_points_norm.copy()
+        #     # scale the bus points to the bounding box size
+        #     object_points_dict[query_object_token] *= wlh / np.array([1.0, 1.0, 1.0])
+        #     continue
+        # if token2category.get(query_object_token) == 'movable_object.trafficcone':
+        #     # load the w-l-h of the bounding box
+        #     wlh = token2bbox[query_object_token][3:6]
+        #     object_points_dict[query_object_token] = trafficcone_points_norm.copy()
+        #     # scale the traffic cone points to the bounding box size
+        #     object_points_dict[query_object_token] *= wlh / np.array([1.0, 1.0, 1.0])
+        #     continue
+        # ############################################################################################
         object_points_dict[query_object_token] = []
         for dict in dict_list:
             for i, object_token in enumerate(dict['object_tokens']):
@@ -267,28 +401,7 @@ def main(nusc, val_list, indice, args):
         point_cloud = object_points_dict[key]
         object_points_xyz.append(point_cloud[:,:3])
 
-    # # 对点云进行下采样
-    # object_points_xyz = []
-    # for key in object_points_dict.keys():
-    #     point_cloud = object_points_dict[key]
-    #     pcd = o3d.geometry.PointCloud()
-    #     pcd.points = o3d.utility.Vector3dVector(point_cloud)
-    #     voxel_size = 0.1
-    #     pcd_down = pcd.voxel_down_sample(voxel_size=voxel_size)
-    #     point_cloud = np.asarray(pcd_down.points)
-    #     object_points_xyz.append(point_cloud[:, :3])
-
-    # # 2*N+1 frames in total. N has to be equal or larger than 1.
-    # N = 15
-
     for i in trange(1, len(dict_list), desc="Processing frames"):
-        # if i <= N-1:
-        #     i += 1
-        #     continue
-
-        # if i >= len(dict_list)-N:
-        #     print('finish scene!')
-        #     break
 
         prev_dict = dict_list[i-1]
         curr_dict = dict_list[i]
@@ -325,11 +438,11 @@ def main(nusc, val_list, indice, args):
         curr_point_cloud = curr_lidar_pc.points.T[:, :3]
 
         ################## load bboxes of previous frame ##############
-        lidar_path, boxes, _ = nusc.get_sample_data(prev_dict['lidar_token'])
-        locs = np.array([b.center for b in boxes]).reshape(-1, 3)
-        dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
+        lidar_path, prev_boxes, _ = nusc.get_sample_data(prev_dict['lidar_token'])
+        locs = np.array([b.center for b in prev_boxes]).reshape(-1, 3)
+        dims = np.array([b.wlh for b in prev_boxes]).reshape(-1, 3)
         rots = np.array([b.orientation.yaw_pitch_roll[0]
-                         for b in boxes]).reshape(-1, 1)
+                         for b in prev_boxes]).reshape(-1, 1)
         gt_bbox_3d = np.concatenate([locs, dims, rots], axis=1).astype(np.float32)
         gt_bbox_3d[:, 6] += np.pi / 2.
         gt_bbox_3d[:, 2] -= dims[:, 2] / 2.
@@ -350,11 +463,11 @@ def main(nusc, val_list, indice, args):
                     prev_object_points_list.append(points)
 
         ################## load bboxes of current frame ##############
-        lidar_path, boxes, _ = nusc.get_sample_data(curr_dict['lidar_token'])
-        locs = np.array([b.center for b in boxes]).reshape(-1, 3)
-        dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
+        lidar_path, curr_boxes, _ = nusc.get_sample_data(curr_dict['lidar_token'])
+        locs = np.array([b.center for b in curr_boxes]).reshape(-1, 3)
+        dims = np.array([b.wlh for b in curr_boxes]).reshape(-1, 3)
         rots = np.array([b.orientation.yaw_pitch_roll[0]
-                         for b in boxes]).reshape(-1, 1)
+                         for b in curr_boxes]).reshape(-1, 1)
         gt_bbox_3d = np.concatenate([locs, dims, rots], axis=1).astype(np.float32)
         gt_bbox_3d[:, 6] += np.pi / 2.
         gt_bbox_3d[:, 2] -= dims[:, 2] / 2.
@@ -382,17 +495,25 @@ def main(nusc, val_list, indice, args):
         prev_obj_mask = [token in intersection_object_tokens for token in prev_dict['object_tokens']]
         curr_obj_mask = [token in intersection_object_tokens for token in curr_dict['object_tokens']]
 
-        # Filter current object points based on the mask
+        # Filter prev object points based on the mask
         filtered_prev_object_points_list = []
+        filtered_prev_object_boxes_list = []
         for j, prev_object_point in enumerate(prev_object_points_list):
             if prev_obj_mask[j]:
                 filtered_prev_object_points_list.append(prev_object_point)
+                filtered_prev_object_boxes_list.append(prev_boxes[j])
 
-        # Filter next object points based on the mask
+        # Filter curr object points based on the mask
         filtered_curr_object_points_list = []
+        filtered_curr_object_boxes_list = []
         for j, curr_object_point in enumerate(curr_object_points_list):
             if curr_obj_mask[j]:
                 filtered_curr_object_points_list.append(curr_object_point)
+                filtered_curr_object_boxes_list.append(curr_boxes[j])
+        
+        # visualize_prev_frame(filtered_prev_object_points_list,
+        #                             filtered_prev_object_boxes_list)
+        
 
         ################## concatenate static scene segments and object points  ########################
         try:

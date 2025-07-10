@@ -13,7 +13,6 @@ from tqdm import tqdm
 from nuscenes.utils.data_classes import LidarPointCloud
 from nuscenes.utils.geometry_utils import view_points
 from pyquaternion import Quaternion
-from mmdet3d.core.bbox import box_np_ops
 from mmcv.ops.points_in_boxes import (points_in_boxes_all, points_in_boxes_cpu,
                                       points_in_boxes_part)
 from scipy.spatial.transform import Rotation
@@ -21,7 +20,8 @@ from scipy.spatial.transform import Rotation
 import open3d
 import open3d as o3d
 from copy import deepcopy
-
+import numpy as np
+import mayavi.mlab as mlab
 
 def run_poisson(pcd, depth, n_threads, min_density=None):
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
@@ -105,6 +105,7 @@ def nn_correspondance(verts1, verts2):
 
 
 
+
 def lidar_to_world_to_lidar(pc,lidar_calibrated_sensor,lidar_ego_pose,
     cam_calibrated_sensor,
     cam_ego_pose):
@@ -124,6 +125,59 @@ def lidar_to_world_to_lidar(pc,lidar_calibrated_sensor,lidar_ego_pose,
 
     return pc
 
+def visualize_semantic_voxels(fov_voxels, voxel_size, pc_range):
+    """
+    fov_voxels: [N,4] 数组，列依次是 x, y, z, semantic_label
+    """
+    colors = np.array([
+        [0,   0,   0, 255],
+        [255,120,  50,255],
+        [255,192,203,255],
+        [255,255,  0,255],
+        [0,  150,245,255],
+        [0,  255,255,255],
+        [200,180,  0,255],
+        [255,  0,  0,255],
+        [255,240,150,255],
+        [135, 60,  0,255],
+        [160, 32,240,255],
+        [255,  0,255,255],
+        [139,137,137,255],
+        [75,   0, 75,255],
+        [150,240, 80,255],
+        [230,230,250,255],
+        [0,  175,  0,255],
+        [0,  255,127,255],
+        [255, 99, 71,255],
+        [0,  191,255,255],
+    ], dtype=np.uint8)
+    
+    # 只保 semantic>0 的点
+    sel = fov_voxels[:,3] > 0
+    pts = fov_voxels[sel,:]
+    x,y,z,labels = pts[:,0], pts[:,1], pts[:,2], pts[:,3]
+
+    fig = mlab.figure(bgcolor=(1,1,1), size=(1024,768))
+
+    # 这里用 labels 作为 scalar，让 points3d 按 label 来调 LUT
+    pts3d = mlab.points3d(
+        x, y, z, labels,
+        mode="cube",
+        scale_factor=1.0,
+        vmin=0,
+        vmax=colors.shape[0]-1,
+        figure=fig
+    )
+    # 按向量大小缩放 glyph（cube 大小固定）
+    pts3d.glyph.scale_mode = "scale_by_vector"
+
+    # 把默认的 colormap 换成我们自己的 RGBA table
+    lut = pts3d.module_manager.scalar_lut_manager.lut
+    lut.number_of_colors = colors.shape[0]
+    lut.table = colors
+
+    mlab.show()
+
 
 def main(nusc, val_list, indice, nuscenesyaml, args, config):
 
@@ -137,16 +191,16 @@ def main(nusc, val_list, indice, nuscenesyaml, args, config):
     my_scene = nusc.scene[indice]
     sensor = 'LIDAR_TOP'
 
-    # if args.split == 'train':
-    #     if my_scene['token'] in val_list:
-    #         return
-    # elif args.split == 'val':
-    #     if my_scene['token'] not in val_list:
-    #         return
-    # elif args.split == 'all':
-    #     pass
-    # else:
-    #     raise NotImplementedError
+    if args.split == 'train':
+        if my_scene['token'] in val_list:
+            return
+    elif args.split == 'val':
+        if my_scene['token'] not in val_list:
+            return
+    elif args.split == 'all':
+        pass
+    else:
+        raise NotImplementedError
 
 
     # load the first sample to start
@@ -308,22 +362,16 @@ def main(nusc, val_list, indice, nuscenesyaml, args, config):
     # print('object finish')
 
 
-    previous_object_tokens = []
-    previous_save_path = None
-    previous_mask = None
-    mask1 = []
-    mask2 = []
     i = 0
     while int(i) < 10000:  # Assuming the sequence does not have more than 10000 frames
-        if i >= (len(dict_list)-1):
+        if i >= len(dict_list):
             print('finish scene!')
             return
         dict = dict_list[i]
-
-        # is_key_frame = dict['is_key_frame']
-        # if not is_key_frame: # only use key frame as GT
-        #     i = i + 1
-        #     continue
+        is_key_frame = dict['is_key_frame']
+        if not is_key_frame: # only use key frame as GT
+            i = i + 1
+            continue
 
         ################## convert the static scene to the target coordinate system ##############
         lidar_calibrated_sensor = dict['lidar_calibrated_sensor']
@@ -341,7 +389,6 @@ def main(nusc, val_list, indice, nuscenesyaml, args, config):
         point_cloud = lidar_pc_i.points.T[:,:3]
         point_cloud_with_semantic = lidar_pc_i_semantic.points.T
 
-
         ################## load bbox of target frame ##############
         lidar_path, boxes, _ = nusc.get_sample_data(dict['lidar_token'])
         locs = np.array([b.center for b in boxes]).reshape(-1, 3)
@@ -356,7 +403,6 @@ def main(nusc, val_list, indice, nuscenesyaml, args, config):
         rots = gt_bbox_3d[:,6:7]
         locs = gt_bbox_3d[:,0:3]
 
-
         ################## bbox placement ##############
         object_points_list = []
         object_semantic_list = []
@@ -367,99 +413,101 @@ def main(nusc, val_list, indice, nuscenesyaml, args, config):
                     Rot = Rotation.from_euler('z', rots[j], degrees=False)
                     rotated_object_points = Rot.apply(points)
                     points = rotated_object_points + locs[j]
-                    # if points.shape[0] >= 5:
-                    #     points_in_boxes = points_in_boxes_cpu(torch.from_numpy(points[:, :3][np.newaxis, :, :]),
-                    #                                           torch.from_numpy(gt_bbox_3d[j:j+1][np.newaxis, :]))
-                    #     points = points[points_in_boxes[0,:,0].bool()]
-                    object_points_list.append(points)
+                    if points.shape[0] >= 5:
+                        points_in_boxes = points_in_boxes_cpu(torch.from_numpy(points[:, :3][np.newaxis, :, :]),
+                                                              torch.from_numpy(gt_bbox_3d[j:j+1][np.newaxis, :]))
+                        points = points[points_in_boxes[0,:,0].bool()]
 
+                    object_points_list.append(points)
                     semantics = np.ones_like(points[:,0:1]) * object_semantic[k]
                     object_semantic_list.append(np.concatenate([points[:, :3], semantics], axis=1))
 
-        # previous_object_tokens = dict['object_tokens']
-
-        next_dict = dict_list[i+1]
-        intersection_object_tokens = list(set(dict['object_tokens']) & set(next_dict['object_tokens']))
-        mask1 = np.isin(dict['object_tokens'], intersection_object_tokens)
-
-        filtered_object_points_list1 = []
-        filtered_object_points_list2 = []
-
-        if len(mask1) == len(object_points_list):
-            for j, object_points_ in enumerate(object_points_list):
-                if mask1[j]:
-                    filtered_object_points_list1.append(object_points_)
-        else:
-            filtered_object_points_list1 = object_points_list
-            print('length of mask1 is not equal to object_points_list')
-
-        # visualize static point cloud
-        point_cloud_static_vis = o3d.geometry.PointCloud()
-        point_cloud_static_vis.points = o3d.utility.Vector3dVector(point_cloud)
-        o3d.visualization.draw_geometries([point_cloud_static_vis])
-
         try: # avoid concatenate an empty array
-            temp = np.concatenate(filtered_object_points_list1)
+            temp = np.concatenate(object_points_list)
             scene_points = np.concatenate([point_cloud, temp])
         except:
             scene_points = point_cloud
-
-        # visualize dynamic point cloud
-        point_cloud_dynamic_vis = o3d.geometry.PointCloud()
-        point_cloud_dynamic_vis.points = o3d.utility.Vector3dVector(temp)
-        o3d.visualization.draw_geometries([point_cloud_dynamic_vis])
-
-        # visualize the combined point cloud
-        point_cloud_vis = o3d.geometry.PointCloud()
-        point_cloud_vis.points = o3d.utility.Vector3dVector(scene_points)
-        o3d.visualization.draw_geometries([point_cloud_vis])
-
-        if len(mask2) == len(object_points_list):
-            for j, object_points_ in enumerate(object_points_list):
-                if mask2[j]:
-                    filtered_object_points_list2.append(object_points_)
-        else:
-            filtered_object_points_list2 = object_points_list
-            print('length of mask2 is not equal to object_points_list')
-
-        # filtered_object_points_list2 = [object_points_list[j] for j in range(len(object_points_list)) if mask2[j]]
-
         try:
-            sf_temp = np.concatenate(filtered_object_points_list2)
-            sf_scene_points = np.concatenate([point_cloud, sf_temp])
+            temp = np.concatenate(object_semantic_list)
+            scene_semantic_points = np.concatenate([point_cloud_with_semantic, temp])
         except:
-            sf_scene_points = point_cloud
-
-
-        mask2 = np.isin(next_dict['object_tokens'], intersection_object_tokens)
-
+            scene_semantic_points = point_cloud_with_semantic
 
         ################## remain points with a spatial range ##############
         mask = (np.abs(scene_points[:, 0]) < 50.0) & (np.abs(scene_points[:, 1]) < 50.0) \
                & (scene_points[:, 2] > -5.0) & (scene_points[:, 2] < 3.0)
         scene_points = scene_points[mask]
-        if previous_mask is not None:
-            sf_scene_points = sf_scene_points[previous_mask]
-        previous_mask = mask
+
+        ################## get mesh via Possion Surface Reconstruction ##############
+        point_cloud_original = o3d.geometry.PointCloud()
+        with_normal2 = o3d.geometry.PointCloud()
+        point_cloud_original.points = o3d.utility.Vector3dVector(scene_points[:, :3])
+        with_normal = preprocess(point_cloud_original, config)
+        with_normal2.points = with_normal.points
+        with_normal2.normals = with_normal.normals
+        mesh, _ = create_mesh_from_map(None, config['depth'], config['n_threads'],
+                                       config['min_density'], with_normal2)
+        scene_points = np.asarray(mesh.vertices, dtype=float)
+
+        ################## remain points with a spatial range ##############
+        mask = (np.abs(scene_points[:, 0]) < 50.0) & (np.abs(scene_points[:, 1]) < 50.0) \
+               & (scene_points[:, 2] > -5.0) & (scene_points[:, 2] < 3.0)
+        scene_points = scene_points[mask]
+
+        ################## convert points to voxels ##############
+        pcd_np = scene_points
+        pcd_np[:, 0] = (pcd_np[:, 0] - pc_range[0]) / voxel_size
+        pcd_np[:, 1] = (pcd_np[:, 1] - pc_range[1]) / voxel_size
+        pcd_np[:, 2] = (pcd_np[:, 2] - pc_range[2]) / voxel_size
+        pcd_np = np.floor(pcd_np).astype(int)
+        voxel = np.zeros(occ_size)
+        voxel[pcd_np[:, 0], pcd_np[:, 1], pcd_np[:, 2]] = 1
+
+        ################## convert voxel coordinates to LiDAR system  ##############
+        gt_ = voxel
+        x = np.linspace(0, gt_.shape[0] - 1, gt_.shape[0])
+        y = np.linspace(0, gt_.shape[1] - 1, gt_.shape[1])
+        z = np.linspace(0, gt_.shape[2] - 1, gt_.shape[2])
+        X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+        vv = np.stack([X, Y, Z], axis=-1)
+        fov_voxels = vv[gt_ > 0]
+        fov_voxels[:, :3] = (fov_voxels[:, :3] + 0.5) * voxel_size
+        fov_voxels[:, 0] += pc_range[0]
+        fov_voxels[:, 1] += pc_range[1]
+        fov_voxels[:, 2] += pc_range[2]
+
+        ################## get semantics of sparse points  ##############
+        mask = (np.abs(scene_semantic_points[:, 0]) < 50.0) & (np.abs(scene_semantic_points[:, 1]) < 50.0) \
+               & (scene_semantic_points[:, 2] > -5.0) & (scene_semantic_points[:, 2] < 3.0)
+        scene_semantic_points = scene_semantic_points[mask]
+
+        ################## Nearest Neighbor to assign semantics ##############
+        dense_voxels = fov_voxels
+        sparse_voxels_semantic = scene_semantic_points
+
+        x = torch.from_numpy(dense_voxels).cuda().unsqueeze(0).float()
+        y = torch.from_numpy(sparse_voxels_semantic[:,:3]).cuda().unsqueeze(0).float()
+        d1, d2, idx1, idx2 = chamfer.forward(x,y)
+        indices = idx1[0].cpu().numpy()
 
 
-        ################# save the dense points ##################
+        dense_semantic = sparse_voxels_semantic[:, 3][np.array(indices)]
+        dense_voxels_with_semantic = np.concatenate([fov_voxels, dense_semantic[:, np.newaxis]], axis=1)
 
-        pc_file_name_folder = dict['pc_file_name'].replace('.pcd.bin','')
+        # to voxel coordinate
+        pcd_np = dense_voxels_with_semantic
+        pcd_np[:, 0] = (pcd_np[:, 0] - pc_range[0]) / voxel_size
+        pcd_np[:, 1] = (pcd_np[:, 1] - pc_range[1]) / voxel_size
+        pcd_np[:, 2] = (pcd_np[:, 2] - pc_range[2]) / voxel_size
+        dense_voxels_with_semantic = np.floor(pcd_np).astype(int)
 
-        dirs = os.path.join(save_path, 'dense_points/', pc_file_name_folder)
+        dirs = os.path.join(save_path, 'dense_voxels_with_semantic/')
         if not os.path.exists(dirs):
             os.makedirs(dirs)
+        np.save(os.path.join(dirs, dict['pc_file_name'] + '.npy'), dense_voxels_with_semantic)
 
-
-        np.save(os.path.join(dirs, 'pc1.npy'), scene_points)
-
-        if previous_save_path is not None:
-            np.save(os.path.join(previous_save_path, 'pc3.npy'), sf_scene_points)
-
-        previous_save_path = dirs
-
-        print(i)
+        fov_voxels = np.load(os.path.join(save_path, 'dense_voxels_with_semantic', dict['pc_file_name'] + '.npy'))
+        visualize_semantic_voxels(fov_voxels, voxel_size, pc_range)
 
         i = i + 1
         continue
@@ -476,14 +524,14 @@ if __name__ == '__main__':
     parse = ArgumentParser()
 
     parse.add_argument('--dataset', type=str, default='nuscenes')
-    parse.add_argument('--config_path', type=str, default='./tools/generate_sceneflow_nuscenes/config.yaml')
-    parse.add_argument('--split', type=str, default='val')
-    parse.add_argument('--save_path', type=str, default='./output')
+    parse.add_argument('--config_path', type=str, default='config.yaml')
+    parse.add_argument('--split', type=str, default='train')
+    parse.add_argument('--save_path', type=str, default='./Datasets/GT_occupancy/')
     parse.add_argument('--start', type=int, default=0)
-    parse.add_argument('--end', type=int, default=2)
-    parse.add_argument('--dataroot', type=str, default='./data/nuscenes/')
-    parse.add_argument('--nusc_val_list', type=str, default='./tools/generate_sceneflow_nuscenes/nuscenes_scene_flow_list.txt')
-    parse.add_argument('--label_mapping', type=str, default='./tools/generate_sceneflow_nuscenes/nuscenes.yaml')
+    parse.add_argument('--end', type=int, default=850)
+    parse.add_argument('--dataroot', type=str, default='./Datasets/nuscenes/')
+    parse.add_argument('--nusc_val_list', type=str, default='./nuscenes_val_list.txt')
+    parse.add_argument('--label_mapping', type=str, default='nuscenes.yaml')
     args=parse.parse_args()
 
 
