@@ -266,9 +266,24 @@ def main():
         else:
             sd = checkpoint
 
-        model.load_state_dict(sd, strict=False)
+        # 2) 载入并接收加载报告
+        load_info = model.load_state_dict(sd, strict=False)
+
+        # 3) 打印一下各类 key
         if is_main_process():
-            print("[WARN] Resuming with strict=False, missing keys ignored.")
+            # 成功匹配到的 keys = 原来 sd 里所有 keys，扣掉 “unexpected_keys”
+            loaded_keys = set(sd.keys()) - set(load_info.unexpected_keys)
+            print(f"[INFO] Loaded ({len(loaded_keys)}) keys:")
+            for k in sorted(loaded_keys):
+                print(f"    {k}")
+
+            print(f"[WARN] Missing ({len(load_info.missing_keys)}) keys (not found in checkpoint):")
+            for k in load_info.missing_keys:
+                print(f"    {k}")
+
+            print(f"[WARN] Unexpected ({len(load_info.unexpected_keys)}) keys (not used by model):")
+            for k in load_info.unexpected_keys:
+                print(f"    {k}")
     
     if parallel:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \

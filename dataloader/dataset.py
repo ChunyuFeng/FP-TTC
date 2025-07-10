@@ -769,10 +769,10 @@ class nuScenes_range_image(data.Dataset):
         # 在加载数据集时离线构建 spherical voxel grid
         # 并且提前计算好每一帧的 voxel 对应的 uv 坐标
         # 因为Nuscenes的点云到图像投影关系考虑了不同传感器采样时自车的位姿，所以每一帧的外参都不同
-        self.idx_uv_prev_list = []
-        self.idx_uv_curr_list = [] 
+        # self.idx_uv_prev_list = []
+        # self.idx_uv_curr_list = [] 
 
-        for i in tqdm(range(len(self.data) - 1170), desc='Loading nuScenes Range Image Dataset'):
+        for i in tqdm(range(len(self.data)-1170), desc='Loading nuScenes Range Image Dataset'):
 
             if self.data[i]['scene_indice'] == '10':
                 continue
@@ -794,41 +794,41 @@ class nuScenes_range_image(data.Dataset):
             self.risk_score_map_list.append(range_image['risk_score'])
             self.depth_map_list.append(range_image['depth'])
 
-            # 多视角融合时，使用的特征图尺寸为真值图尺寸的 1/4
-            H_sph, W_sph = self.scale_map_list[-1].shape
-            H_sph //= 4 
-            W_sph //= 4
-            R = 16 # 径向采样 16 个点
+            # # 多视角融合时，使用的特征图尺寸为真值图尺寸的 1/4
+            # H_sph, W_sph = self.scale_map_list[-1].shape
+            # H_sph //= 4 
+            # W_sph //= 4
+            # R = 16 # 径向采样 16 个点
 
-            # 构建 spherical voxel，获取每个 voxel 的 3D 笛卡尔坐标
-            _, xyz = build_spherical_voxels(
-                H=H_sph, W=W_sph, R=R,
-                r_min=5.0, r_max=50.0,
-                # fov_up_deg=22.0, fov_down_deg=-17.0,
-                fov_up_deg=8.0, fov_down_deg=-15.0,
-            )
+            # # 构建 spherical voxel，获取每个 voxel 的 3D 笛卡尔坐标
+            # _, xyz = build_spherical_voxels(
+            #     H=H_sph, W=W_sph, R=R,
+            #     r_min=5.0, r_max=50.0,
+            #     # fov_up_deg=22.0, fov_down_deg=-17.0,
+            #     fov_up_deg=8.0, fov_down_deg=-15.0,
+            # )
 
-            camera_channels = self.camera_channels
-            raw_img_size = (self.data[i]['prev_camera_data']['CAM_FRONT']['height'],
-                            self.data[i]['prev_camera_data']['CAM_FRONT']['width'])
-            idx_uv_prev_raw = project_voxel_to_camera(
-                xyz=xyz,
-                sensor_metas=self.data[i]['sensor_metas_prev'],
-                camera_channels=camera_channels,
-                raw_img_size=raw_img_size,
-                min_dist=1.0
-            )
+            # camera_channels = self.camera_channels
+            # raw_img_size = (self.data[i]['prev_camera_data']['CAM_FRONT']['height'],
+            #                 self.data[i]['prev_camera_data']['CAM_FRONT']['width'])
+            # idx_uv_prev_raw = project_voxel_to_camera(
+            #     xyz=xyz,
+            #     sensor_metas=self.data[i]['sensor_metas_prev'],
+            #     camera_channels=camera_channels,
+            #     raw_img_size=raw_img_size,
+            #     min_dist=1.0
+            # )
 
-            idx_uv_curr_raw = project_voxel_to_camera(
-                xyz=xyz,
-                sensor_metas=self.data[i]['sensor_metas_curr'],
-                camera_channels=camera_channels,
-                raw_img_size=raw_img_size,
-                min_dist=1.0
-            )
+            # idx_uv_curr_raw = project_voxel_to_camera(
+            #     xyz=xyz,
+            #     sensor_metas=self.data[i]['sensor_metas_curr'],
+            #     camera_channels=camera_channels,
+            #     raw_img_size=raw_img_size,
+            #     min_dist=1.0
+            # )
 
-            self.idx_uv_prev_list.append(idx_uv_prev_raw)
-            self.idx_uv_curr_list.append(idx_uv_curr_raw)
+            # self.idx_uv_prev_list.append(idx_uv_prev_raw)
+            # self.idx_uv_curr_list.append(idx_uv_curr_raw)
 
     def __len__(self):
         return len(self.image_list)
@@ -857,8 +857,8 @@ class nuScenes_range_image(data.Dataset):
         gt_risk_score_map = self.risk_score_map_list[index]
         gt_depth_map = self.depth_map_list[index]
         sensor_meta = self.sensor_meta_list[index]
-        idx_uv_prev_raw = self.idx_uv_prev_list[index]
-        idx_uv_curr_raw = self.idx_uv_curr_list[index]
+        # idx_uv_prev_raw = self.idx_uv_prev_list[index]
+        # idx_uv_curr_raw = self.idx_uv_curr_list[index]
 
         # H_sph, W_sph, R, _ = idx_uv_prev_raw.shape
 
@@ -923,9 +923,9 @@ class nuScenes_range_image(data.Dataset):
         gt_risk_score_map = torch.from_numpy(gt_risk_score_map).float()
         gt_depth_map = torch.from_numpy(gt_depth_map).float()
 
-        affine_matrix = torch.from_numpy(affine_matrix)
-        idx_uv_prev_raw = torch.from_numpy(idx_uv_prev_raw) 
-        idx_uv_curr_raw = torch.from_numpy(idx_uv_curr_raw) 
+        # affine_matrix = torch.from_numpy(affine_matrix)
+        # idx_uv_prev_raw = torch.from_numpy(idx_uv_prev_raw) 
+        # idx_uv_curr_raw = torch.from_numpy(idx_uv_curr_raw) 
 
         # scale 取 (0.3, 3.0) 之间的值
         mask_scale = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
@@ -934,17 +934,21 @@ class nuScenes_range_image(data.Dataset):
         mask_depth = mask_scale
         # 拼接gt_scale和mask
         gt_scale_map_with_mask = torch.cat((gt_scale_map.unsqueeze(0), mask_scale.unsqueeze(0).float()), dim=0)
-        gt_risk_score_map_with_mask = torch.cat((gt_risk_score_map.unsqueeze(0), mask_risk_score.unsqueeze(0).float()), dim=0)
-        gt_depth_map_with_mask = torch.cat((gt_depth_map.unsqueeze(0), mask_depth.unsqueeze(0).float()), dim=0)
+        # gt_risk_score_map_with_mask = torch.cat((gt_risk_score_map.unsqueeze(0), mask_risk_score.unsqueeze(0).float()), dim=0)
+        # gt_depth_map_with_mask = torch.cat((gt_depth_map.unsqueeze(0), mask_depth.unsqueeze(0).float()), dim=0)
+
+        # return (prev_surr_view_imgs_tensor,
+        #         curr_surr_view_imgs_tensor,
+        #         gt_scale_map_with_mask, # model 的输入以及真值
+        #         gt_risk_score_map_with_mask, # model 的输入以及真值
+        #         gt_depth_map_with_mask, # model 的输入以及真值
+        #         affine_matrix,
+        #         idx_uv_prev_raw,
+        #         idx_uv_curr_raw)
 
         return (prev_surr_view_imgs_tensor,
                 curr_surr_view_imgs_tensor,
-                gt_scale_map_with_mask, # model 的输入以及真值
-                gt_risk_score_map_with_mask, # model 的输入以及真值
-                gt_depth_map_with_mask, # model 的输入以及真值
-                affine_matrix,
-                idx_uv_prev_raw,
-                idx_uv_curr_raw)
+                gt_scale_map_with_mask)
 
     '''
     def __getitem__(self, index):

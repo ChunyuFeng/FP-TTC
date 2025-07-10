@@ -85,7 +85,7 @@ class CNNEncoder(nn.Module):
         # self.final_norm_scale = norm_layer(output_dim)
         # self.final_norm_risk  = norm_layer(output_dim)
 
-        self.final_norm_scale = nn.InstanceNorm2d(output_dim, affine=True, track_running_stats=False)
+        self.final_norm = nn.InstanceNorm2d(output_dim, affine=True, track_running_stats=False)
         self.final_norm_risk  = nn.InstanceNorm2d(output_dim, affine=True, track_running_stats=False)
 
 
@@ -128,10 +128,12 @@ class CNNEncoder(nn.Module):
         
         # —— 分支归一化 —— 
         out = []
+        # for f in feats:
+        #     if branch == "scale":
+        #         out.append(self.final_norm_scale(f))
+        #     else:
+        #         out.append(self.final_norm_risk(f))
         for f in feats:
-            if branch == "scale":
-                out.append(self.final_norm_scale(f))
-            else:
-                out.append(self.final_norm_risk(f))
+            out.append(self.final_norm(f))
 
         return out

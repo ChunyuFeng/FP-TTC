@@ -52,20 +52,20 @@ class FpTTC(nn.Module):
         # 加载预训练的 cnet 权重
         if load_cnet:
             self._load_pretrained_cnet(pretrained_cnet_path, freeze_cnet)
-
-        # Scale 分支私有网络
-        self.featnet_scale   = FeatureNet(num_scales             = num_scales,
+        
+                # Scale 分支私有网络
+        self.featnet   = FeatureNet(num_scales             = num_scales,
                                           feature_channels       = feature_channels,
                                           num_head               = num_head, 
                                           ffn_dim_expansion      = ffn_dim_expansion,
                                           num_transformer_layers = num_transformer_layers)    
-        self.corrnet_scale   = FlowNet(num_scales                = num_scales,
+        self.corrnet   = FlowNet(num_scales                = num_scales,
                                        feature_channels          = feature_channels,
                                        upsample_factor           = upsample_factor,
                                        reg_refine                = reg_refine)        
-        self.conv_corr_scale = CorrEncoder(dim_in                = 2,
+        self.conv_corr = CorrEncoder(dim_in                = 2,
                                            dim_out               = feature_channels+1) 
-        self.scalenet        = ScaleNet(num_scales               = num_scales,
+        self.scalenet_singlebranch       = ScaleNet(num_scales               = num_scales,
                                         feature_channels         = feature_channels,
                                         upsample_factor          = upsample_factor,
                                         num_head                 = 4,
@@ -73,30 +73,50 @@ class FpTTC(nn.Module):
                                         reg_refine               = reg_refine, 
                                         head_type                = 'scale')
 
-        # Risk 分支私有网络
-        self.featnet_risk    = FeatureNet(num_scales             = num_scales,
-                                          feature_channels       = feature_channels,
-                                          num_head               = num_head, 
-                                          ffn_dim_expansion      = ffn_dim_expansion,
-                                          num_transformer_layers = num_transformer_layers)
-        self.corrnet_risk    = FlowNet(num_scales                = num_scales,
-                                       feature_channels          = feature_channels,
-                                       upsample_factor           = upsample_factor,
-                                       reg_refine                = reg_refine)
-        self.conv_corr_risk  = CorrEncoder(dim_in                = 2,
-                                           dim_out               = feature_channels+1)
-        self.risknet         = ScaleNet(num_scales               = num_scales,
-                                        feature_channels         = feature_channels,
-                                        upsample_factor          = upsample_factor,
-                                        num_head                 = 4,
-                                        scale_level              = num_scales, 
-                                        reg_refine               = reg_refine, 
-                                        head_type                = 'risk')
+        # # Scale 分支私有网络
+        # self.featnet_scale   = FeatureNet(num_scales             = num_scales,
+        #                                   feature_channels       = feature_channels,
+        #                                   num_head               = num_head, 
+        #                                   ffn_dim_expansion      = ffn_dim_expansion,
+        #                                   num_transformer_layers = num_transformer_layers)    
+        # self.corrnet_scale   = FlowNet(num_scales                = num_scales,
+        #                                feature_channels          = feature_channels,
+        #                                upsample_factor           = upsample_factor,
+        #                                reg_refine                = reg_refine)        
+        # self.conv_corr_scale = CorrEncoder(dim_in                = 2,
+        #                                    dim_out               = feature_channels+1) 
+        # self.scalenet_singlebranch       = ScaleNet(num_scales               = num_scales,
+        #                                 feature_channels         = feature_channels,
+        #                                 upsample_factor          = upsample_factor,
+        #                                 num_head                 = 4,
+        #                                 scale_level              = num_scales, 
+        #                                 reg_refine               = reg_refine, 
+        #                                 head_type                = 'scale')
+
+        # # Risk 分支私有网络
+        # self.featnet_risk    = FeatureNet(num_scales             = num_scales,
+        #                                   feature_channels       = feature_channels,
+        #                                   num_head               = num_head, 
+        #                                   ffn_dim_expansion      = ffn_dim_expansion,
+        #                                   num_transformer_layers = num_transformer_layers)
+        # self.corrnet_risk    = FlowNet(num_scales                = num_scales,
+        #                                feature_channels          = feature_channels,
+        #                                upsample_factor           = upsample_factor,
+        #                                reg_refine                = reg_refine)
+        # self.conv_corr_risk  = CorrEncoder(dim_in                = 2,
+        #                                    dim_out               = feature_channels+1)
+        # self.risknet         = ScaleNet(num_scales               = num_scales,
+        #                                 feature_channels         = feature_channels,
+        #                                 upsample_factor          = upsample_factor,
+        #                                 num_head                 = 4,
+        #                                 scale_level              = num_scales, 
+        #                                 reg_refine               = reg_refine, 
+        #                                 head_type                = 'risk')
         
-        # 特征融合和投影到透视图
-        self.inner_fusion    = InnerFeatureFusion(channels       = feature_channels)
-        self.voxel_to_pv     = VoxelToPV(in_channels             = feature_channels,
-                                         R                       = radial_sampling)
+        # # 特征融合和投影到透视图
+        # self.inner_fusion    = InnerFeatureFusion(channels       = feature_channels)
+        # self.voxel_to_pv     = VoxelToPV(in_channels             = feature_channels,
+        #                                  R                       = radial_sampling)
     
     def _load_pretrained_cnet(self, ckpt_path: str, freeze: bool):
         """
@@ -143,9 +163,9 @@ class FpTTC(nn.Module):
     def forward(self,
                 img_prev,
                 img_curr,
-                affine_matrix,
-                idx_uv_prev,
-                idx_uv_curr,
+                # affine_matrix,
+                # idx_uv_prev,
+                # idx_uv_curr,
                 attn_type,
                 attn_splits_list,
                 corr_radius_list,
@@ -162,91 +182,163 @@ class FpTTC(nn.Module):
             shared_prev.append(p)
             shared_curr.append(c)
 
-        ### 2）融合多视角特征 - 基于 bilinear sampling，参考 SimpleBEV 
+        # ### 2）融合多视角特征 - 基于 bilinear sampling，参考 SimpleBEV 
 
-        # 用于 voxel bilinear sampling 的 base 2D feature
-        # shared_prev 和 shared_curr 是 list，包含了每个视角的特征
-        base_feat_prev = [ self.inner_fusion(p[0], p[1]) for p in shared_prev ]
-        base_feat_curr = [ self.inner_fusion(c[0], c[1]) for c in shared_curr ]
+        # # 用于 voxel bilinear sampling 的 base 2D feature
+        # # shared_prev 和 shared_curr 是 list，包含了每个视角的特征
+        # base_feat_prev = [ self.inner_fusion(p[0], p[1]) for p in shared_prev ]
+        # base_feat_curr = [ self.inner_fusion(c[0], c[1]) for c in shared_curr ]
 
-        # voxel - 2D raw image(900*1600) 的位置对应关系为 idx_uv_prev 和 idx_uv_curr
-        # affine_matrix 表示模型输入图像(160*320)相对于数据集原始图像(900*1600)的变换矩阵，需要应用到 idx_uv_prev 和 idx_uv_curr
-        # 从输入图像(160*320)到特征图(40*80)，还存在一个缩放比例，通过 norm_factor 来归一化 (u,v) 坐标
-        norm_factor = W_img / base_feat_prev[0].shape[3]  # 计算缩放因子
-        idx_uv_prev_transformed = self.apply_affine(idx_uv_prev, affine_matrix,
-                                                    normalize=True, norm_factor=norm_factor)
-        idx_uv_curr_transformed = self.apply_affine(idx_uv_curr, affine_matrix,
-                                                    normalize=True, norm_factor=norm_factor)
+        # # voxel - 2D raw image(900*1600) 的位置对应关系为 idx_uv_prev 和 idx_uv_curr
+        # # affine_matrix 表示模型输入图像(160*320)相对于数据集原始图像(900*1600)的变换矩阵，需要应用到 idx_uv_prev 和 idx_uv_curr
+        # # 从输入图像(160*320)到特征图(40*80)，还存在一个缩放比例，通过 norm_factor 来归一化 (u,v) 坐标
+        # norm_factor = W_img / base_feat_prev[0].shape[3]  # 计算缩放因子
+        # idx_uv_prev_transformed = self.apply_affine(idx_uv_prev, affine_matrix,
+        #                                             normalize=True, norm_factor=norm_factor)
+        # idx_uv_curr_transformed = self.apply_affine(idx_uv_curr, affine_matrix,
+        #                                             normalize=True, norm_factor=norm_factor)
 
-        fused_prev = self.voxel_to_pv(
-            surround_view_feats = base_feat_prev,
-            idx_uv              = idx_uv_prev_transformed
-        )
-        fused_curr = self.voxel_to_pv(
-            surround_view_feats = base_feat_curr,
-            idx_uv              = idx_uv_curr_transformed
-        )
+        # fused_prev = self.voxel_to_pv(
+        #     surround_view_feats = base_feat_prev,
+        #     idx_uv              = idx_uv_prev_transformed
+        # )
+        # fused_curr = self.voxel_to_pv(
+        #     surround_view_feats = base_feat_curr,
+        #     idx_uv              = idx_uv_curr_transformed
+        # )
 
-        # 将 fused_feat_prev 和 fused_feat_curr 下采样，重新构建成多尺度特征
-        # 将下采样后的较小的特征图放在列表前面，原尺寸的放在后面
-        feature0_lvls = []
-        feature1_lvls = []
-        prev_feat = fused_prev
-        curr_feat = fused_curr
-        for _ in range(self.num_scales):
-            feature0_lvls.insert(0, prev_feat)
-            feature1_lvls.insert(0, curr_feat)
-            prev_feat = F.max_pool2d(prev_feat, kernel_size=2, stride=2)
-            curr_feat = F.max_pool2d(curr_feat, kernel_size=2, stride=2)
+        # # 将 fused_feat_prev 和 fused_feat_curr 下采样，重新构建成多尺度特征
+        # # 将下采样后的较小的特征图放在列表前面，原尺寸的放在后面
+        # feature0_lvls = []
+        # feature1_lvls = []
+        # prev_feat = fused_prev
+        # curr_feat = fused_curr
+        # for _ in range(self.num_scales):
+        #     feature0_lvls.insert(0, prev_feat)
+        #     feature1_lvls.insert(0, curr_feat)
+        #     prev_feat = F.max_pool2d(prev_feat, kernel_size=2, stride=2)
+        #     curr_feat = F.max_pool2d(curr_feat, kernel_size=2, stride=2)
 
+        # # —— Scale 分支：先做分支归一化，再组多视角，再预测 Scale Map ——
+        # prev_s_feats = [[self.cnet.final_norm_scale(f) for f in p] for p in shared_prev]
+        # curr_s_feats = [[self.cnet.final_norm_scale(f) for f in c] for c in shared_curr]
+        # # 多视角拼接 - 简单横向拼接
+        # feature0_lvls_s, feature1_lvls_s = [], []
+        # for lvl in range(self.num_scales):
+        #     f0 = torch.cat([f[lvl] for f in prev_s_feats], dim=3)
+        #     f1 = torch.cat([f[lvl] for f in curr_s_feats], dim=3)
+        #     feature0_lvls_s.append(f0)
+        #     feature1_lvls_s.append(f1)
+
+
+        corr_s_ = []
+        mlvl_s0_ = []
+        mlvl_s1_ = []
         # === Scale 分支 ===
-        corr_s = None
-        mlvl_s0, mlvl_s1 = [], []
-        for lvl in range(self.num_scales):
-            f0, f1     = feature0_lvls[lvl], feature1_lvls[lvl]
-            f0_s, f1_s = self.featnet_scale(f0, f1, lvl, attn_type, attn_splits_list, corr_s)
-            mlvl_s0.append(f0_s)
-            mlvl_s1.append(f1_s)
-            corr_s, _  = self.corrnet_scale(f0_s, f1_s, lvl, corr_radius_list, prop_radius_list, num_reg_refine, False, corr_s)
-            if lvl < self.num_scales - 1:
-                corr_s = F.interpolate(corr_s, scale_factor=2, mode='bilinear', align_corners=True) * 2
-        corr_enc_s = self.conv_corr_scale(corr_s)
+        for feat_prev, feat_curr in zip(shared_prev, shared_curr):
+            feature0_lvls = feat_prev
+            feature1_lvls = feat_curr
+            corr_s = None
+            mlvl_s0, mlvl_s1 = [], []
+            for lvl in range(self.num_scales):
+                f0, f1     = feature0_lvls[lvl], feature1_lvls[lvl]
+                f0_s, f1_s = self.featnet(f0, f1, lvl, attn_type, attn_splits_list, corr_s)
+                mlvl_s0.append(f0_s)
+                mlvl_s1.append(f1_s)
+                corr_s, _  = self.corrnet(f0_s, f1_s, lvl, corr_radius_list, prop_radius_list, num_reg_refine, False, corr_s)
+                if lvl < self.num_scales - 1:
+                    corr_s = F.interpolate(corr_s, scale_factor=2, mode='bilinear', align_corners=True) * 2
+            corr_s_.append(corr_s)
+            mlvl_s0_.append(mlvl_s0)
+            mlvl_s1_.append(mlvl_s1)
+        corr_s = torch.cat(corr_s_, dim=3)
+        # 将多视角下 mlvl_s0_、mlvl_s1_ 按 lvl 对应关系，在宽度维度（dim=3）拼接
+        mlvl_s0 = [
+            torch.cat([view_feats[lvl] for view_feats in mlvl_s0_], dim=3)
+            for lvl in range(self.num_scales)
+        ]
+        mlvl_s1 = [
+            torch.cat([view_feats[lvl] for view_feats in mlvl_s1_], dim=3)
+            for lvl in range(self.num_scales)
+        ]
+        
+
+        corr_enc_s = self.conv_corr(corr_s)
         ini_scale  = F.softplus(corr_enc_s[:, :1]) + 1e-3
         corr_enc_s = corr_enc_s[:, 1:]
-        scales     = self.scalenet(corr_enc_s, mlvl_s0, mlvl_s1, ini_scale)
+        scales     = self.scalenet_singlebranch(corr_enc_s, mlvl_s0, mlvl_s1, ini_scale)
 
         del corr_s, mlvl_s0, mlvl_s1
 
-        # === Risk 分支 ===
-        corr_r = None
-        mlvl_r0, mlvl_r1 = [], []
-        for lvl in range(self.num_scales):
-            f0, f1     = feature0_lvls[lvl], feature1_lvls[lvl]
-            f0_r, f1_r = self.featnet_risk(f0, f1, lvl, attn_type, attn_splits_list, corr_r)
-            mlvl_r0.append(f0_r)
-            mlvl_r1.append(f1_r)
-            corr_r, _  = self.corrnet_risk(f0_r, f1_r, lvl, corr_radius_list, prop_radius_list, num_reg_refine, False, corr_r)
-            if lvl < self.num_scales - 1:
-                corr_r = F.interpolate(corr_r, scale_factor=2, mode='bilinear', align_corners=True) * 2
-        corr_enc_r = F.relu(self.conv_corr_risk(corr_r))
-        ini_risk   = corr_enc_r[:, :1]
-        corr_enc_r = corr_enc_r[:, 1:]
-        risk_score = self.risknet(corr_enc_r, mlvl_r0, mlvl_r1, ini_risk)
+        return scales
 
-        del corr_r, mlvl_r0, mlvl_r1
-        del feature0_lvls, feature1_lvls
+        # # === Risk 分支 ===
+        # corr_r = None
+        # mlvl_r0, mlvl_r1 = [], []
+        # for lvl in range(self.num_scales):
+        #     f0, f1     = feature0_lvls[lvl], feature1_lvls[lvl]
+        #     f0_r, f1_r = self.featnet_risk(f0, f1, lvl, attn_type, attn_splits_list, corr_r)
+        #     mlvl_r0.append(f0_r)
+        #     mlvl_r1.append(f1_r)
+        #     corr_r, _  = self.corrnet_risk(f0_r, f1_r, lvl, corr_radius_list, prop_radius_list, num_reg_refine, False, corr_r)
+        #     if lvl < self.num_scales - 1:
+        #         corr_r = F.interpolate(corr_r, scale_factor=2, mode='bilinear', align_corners=True) * 2
+        # corr_enc_r = F.relu(self.conv_corr_risk(corr_r))
+        # ini_risk   = corr_enc_r[:, :1]
+        # corr_enc_r = corr_enc_r[:, 1:]
+        # risk_score = self.risknet(corr_enc_r, mlvl_r0, mlvl_r1, ini_risk)
 
-        return scales, risk_score
+        # del corr_r, mlvl_r0, mlvl_r1
+        # del feature0_lvls, feature1_lvls
+
+        # return scales, risk_score
+
+    # def forward_with_loss( 
+    #         self,
+    #         img_prev,                      # Tensor[B, V, 3, H, W]
+    #         img_curr,                      # Tensor[B, V, 3, H, W]
+    #         gt_scale_map_with_mask,        # Tensor[B, 2, H_sph, W_sph]
+    #         gt_risk_score_map_with_mask,   # Tensor[B, 2, H_sph, W_sph]
+    #         affine_matrix,                 # Tensor[B, 3, 3]
+    #         idx_uv_prev,                   # Tensor[B, H_sph, W_sph, R, 3]
+    #         idx_uv_curr,                   # Tensor[B, H_sph, W_sph, R, 3]
+    #         attn_type,                     # str
+    #         attn_splits_list,              # List[int]
+    #         corr_radius_list,              # List[int]
+    #         prop_radius_list,              # List[int]
+    #         num_reg_refine,                # int
+    #         testing                        # bool
+    #     ):
+
+    #     scales, risks = self.forward(
+    #         img_prev         = img_prev,
+    #         img_curr         = img_curr,
+    #         affine_matrix    = affine_matrix,
+    #         idx_uv_prev      = idx_uv_prev,
+    #         idx_uv_curr      = idx_uv_curr,
+    #         attn_type        = attn_type,
+    #         attn_splits_list = attn_splits_list,
+    #         corr_radius_list = corr_radius_list,
+    #         prop_radius_list = prop_radius_list,
+    #         num_reg_refine   = num_reg_refine,
+    #         testing          = testing
+    #     )
+    #     loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
+    #     loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
+    #     # loss_s_term = torch.exp(-2 * self.log_sigma_scale) * loss_s + 2 * self.log_sigma_scale
+    #     # loss_r_term = torch.exp(-2 * self.log_sigma_risk)  * loss_r + 2 * self.log_sigma_risk
+    #     # loss = 0.5 * (loss_s_term + loss_r_term)
+    #     return scales, risks, loss_s, loss_r
 
     def forward_with_loss( 
             self,
             img_prev,                      # Tensor[B, V, 3, H, W]
             img_curr,                      # Tensor[B, V, 3, H, W]
             gt_scale_map_with_mask,        # Tensor[B, 2, H_sph, W_sph]
-            gt_risk_score_map_with_mask,   # Tensor[B, 2, H_sph, W_sph]
-            affine_matrix,                 # Tensor[B, 3, 3]
-            idx_uv_prev,                   # Tensor[B, H_sph, W_sph, R, 3]
-            idx_uv_curr,                   # Tensor[B, H_sph, W_sph, R, 3]
+            # gt_risk_score_map_with_mask,   # Tensor[B, 2, H_sph, W_sph]
+            # affine_matrix,                 # Tensor[B, 3, 3]
+            # idx_uv_prev,                   # Tensor[B, H_sph, W_sph, R, 3]
+            # idx_uv_curr,                   # Tensor[B, H_sph, W_sph, R, 3]
             attn_type,                     # str
             attn_splits_list,              # List[int]
             corr_radius_list,              # List[int]
@@ -255,12 +347,12 @@ class FpTTC(nn.Module):
             testing                        # bool
         ):
 
-        scales, risks = self.forward(
+        scales = self.forward(
             img_prev         = img_prev,
             img_curr         = img_curr,
-            affine_matrix    = affine_matrix,
-            idx_uv_prev      = idx_uv_prev,
-            idx_uv_curr      = idx_uv_curr,
+            # affine_matrix    = affine_matrix,
+            # idx_uv_prev      = idx_uv_prev,
+            # idx_uv_curr      = idx_uv_curr,
             attn_type        = attn_type,
             attn_splits_list = attn_splits_list,
             corr_radius_list = corr_radius_list,
@@ -269,11 +361,7 @@ class FpTTC(nn.Module):
             testing          = testing
         )
         loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
-        loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
-        # loss_s_term = torch.exp(-2 * self.log_sigma_scale) * loss_s + 2 * self.log_sigma_scale
-        # loss_r_term = torch.exp(-2 * self.log_sigma_risk)  * loss_r + 2 * self.log_sigma_risk
-        # loss = 0.5 * (loss_s_term + loss_r_term)
-        return scales, risks, loss_s, loss_r
+        return scales, loss_s
 
     def extract_feature(self, im0, im1, branch):
         x = torch.cat([im0, im1], dim=0)
