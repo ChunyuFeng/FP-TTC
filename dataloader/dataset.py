@@ -724,6 +724,7 @@ class nuScenes_range_image(data.Dataset):
                  train_info_file='nusc_trainval_infos_160_1920.pkl'
                  ):
         self.aug_params = aug_params
+        assert split in ['training', 'validation', 'test'], "split must be one of ['training', 'validation', 'test']"
         self.split = split
         # self.root = root
         self.train_info_path = train_info_path
@@ -772,9 +773,12 @@ class nuScenes_range_image(data.Dataset):
         # self.idx_uv_prev_list = []
         # self.idx_uv_curr_list = [] 
 
-        for i in tqdm(range(len(self.data)-1170), desc='Loading nuScenes Range Image Dataset'):
-
-            if self.data[i]['scene_indice'] == '10':
+        for i in tqdm(range(len(self.data)-1750), desc='Loading nuScenes Range Image Dataset'):
+            
+            scene = self.data[i]['scene_indice']
+            if self.split == 'training' and scene == '10':
+                continue
+            if self.split == 'validation' and scene != '10':
                 continue
 
             range_image_path = os.path.join(self.data[i]['gt_map_path'], 'range_image_curr.npy')
@@ -934,7 +938,7 @@ class nuScenes_range_image(data.Dataset):
         mask_depth = mask_scale
         # 拼接gt_scale和mask
         gt_scale_map_with_mask = torch.cat((gt_scale_map.unsqueeze(0), mask_scale.unsqueeze(0).float()), dim=0)
-        # gt_risk_score_map_with_mask = torch.cat((gt_risk_score_map.unsqueeze(0), mask_risk_score.unsqueeze(0).float()), dim=0)
+        gt_risk_score_map_with_mask = torch.cat((gt_risk_score_map.unsqueeze(0), mask_risk_score.unsqueeze(0).float()), dim=0)
         # gt_depth_map_with_mask = torch.cat((gt_depth_map.unsqueeze(0), mask_depth.unsqueeze(0).float()), dim=0)
 
         # return (prev_surr_view_imgs_tensor,
@@ -948,7 +952,8 @@ class nuScenes_range_image(data.Dataset):
 
         return (prev_surr_view_imgs_tensor,
                 curr_surr_view_imgs_tensor,
-                gt_scale_map_with_mask)
+                gt_scale_map_with_mask,
+                gt_risk_score_map_with_mask)
 
     '''
     def __getitem__(self, index):
@@ -1088,7 +1093,7 @@ class nuScenes_range_image(data.Dataset):
         self.depth_map_list = v * self.depth_map_list
         return self
 
-def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
+def fetch_dataloader(args, split):
     """ Create the data loader for the corresponding trainign set """
     train_dataset = None
 
@@ -1115,16 +1120,23 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
         train_dataset = 100*nuscenes
 
     elif args.stage == 'nuscenes_range_image':
-        aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
+        aug_params = {
+            'crop_size': args.image_size,
+            'do_flip': False,
+            'rotate': False,
+            'rotate_prob': 0.1,
+            'rotate_angle': 90
+        }
+        
         train_info_file = 'nusc_trainval_infos_160_1920_fov_8_15.pkl'
         train_info_path = './Datasets/nuscenes/2_trainval_test_infos'
 
-        nuscenes = nuScenes_range_image(aug_params,
-                                        train_info_file=train_info_file,
-                                        train_info_path=train_info_path,
-                                        split='training')
-
-        train_dataset = 1*nuscenes
+        train_dataset = nuScenes_range_image(
+            aug_params,
+            train_info_file=train_info_file,
+            train_info_path=train_info_path,
+            split=split
+        )
 
     elif args.stage == 'mix':
         nusc_aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': True, 'rotate_prob': 0.2, 'rotate_angle': 90}

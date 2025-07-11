@@ -35,8 +35,7 @@ parser.add_argument('--padding_factor', default=16, type=int,
                     help='the input should be divisible by padding_factor, otherwise do padding or resizing')
 
 # evaluation
-parser.add_argument('--eval', action='store_true',
-                    help='evaluation after training done')
+
 parser.add_argument('--save_eval_to_file', action='store_true')
 parser.add_argument('--evaluate_matched_unmatched', action='store_true')
 parser.add_argument('--val_things_clean_only', action='store_true')
@@ -54,7 +53,7 @@ parser.add_argument('--grad_clip', default=1.0, type=float)
 parser.add_argument('--num_steps', default=100000, type=int)
 parser.add_argument('--seed', default=326, type=int)
 parser.add_argument('--summary_freq', default=100, type=int)
-parser.add_argument('--val_freq', default=10000, type=int)
+
 parser.add_argument('--save_ckpt_freq', default=10000, type=int)
 parser.add_argument('--save_latest_ckpt_freq', default=1000, type=int)
 
@@ -150,6 +149,17 @@ parser.add_argument('--fine_tune_cnet', action='store_true',
 # neptune
 parser.add_argument('--neptune', action='store_true',
                     help='use neptune for logging')
+
+parser.add_argument('--data_split', choices=['training','validation'],
+                    default='training',
+                    help='which split of nuScenes to load: training or validation')
+
+parser.add_argument('--eval', action='store_true',
+                    help='evaluation after training done')
+parser.add_argument('--val_freq', default=1, type=int)
+# early stopping patience
+parser.add_argument('--patience', default=10, type=int,
+                    help='early stopping patience, 0 means no early stopping')
 
 args = parser.parse_args()
 if args.freeze_cnet and args.fine_tune_cnet:
@@ -266,13 +276,26 @@ def main():
         else:
             sd = checkpoint
 
+        new_sd = {}
+        for k, v in sd.items():
+            new_sd[k] = v
+            # 如果是 featnet 的权重，就也复制到 featnet_risk
+            if k.startswith("featnet."):
+                new_sd["featnet_risk." + k[len("featnet."):]] = v
+            # corrnet → corrnet_risk
+            if k.startswith("corrnet."):
+                new_sd["corrnet_risk." + k[len("corrnet."):]] = v
+            # conv_corr → conv_corr_risk
+            if k.startswith("conv_corr."):
+                new_sd["conv_corr_risk." + k[len("conv_corr."):]] = v
+
         # 2) 载入并接收加载报告
-        load_info = model.load_state_dict(sd, strict=False)
+        load_info = model.load_state_dict(new_sd, strict=False)
 
         # 3) 打印一下各类 key
         if is_main_process():
             # 成功匹配到的 keys = 原来 sd 里所有 keys，扣掉 “unexpected_keys”
-            loaded_keys = set(sd.keys()) - set(load_info.unexpected_keys)
+            loaded_keys = set(new_sd.keys()) - set(load_info.unexpected_keys)
             print(f"[INFO] Loaded ({len(loaded_keys)}) keys:")
             for k in sorted(loaded_keys):
                 print(f"    {k}")
@@ -298,6 +321,7 @@ def main():
                     loss_txt = out_dir + '/0.txt'
                     file = open(loss_txt,'w')
                     file.close()
+        torch.distributed.barrier()  # 确保所有进程等到目录创建完毕才继续    
 
     else:
         if not os.path.isdir(out_dir):
@@ -310,13 +334,15 @@ def main():
     start = time.time()
     if is_main_process():
         print('Start Loading ...')
-    dataset = datasets.fetch_dataloader(args)
+    # dataset = datasets.fetch_dataloader(args)
+    train_dataset = datasets.fetch_dataloader(args, split=args.data_split)
+
     if is_main_process():
         print('Done ', time.time()-start)
         print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr'])        
 
     trainer = TTCTrainer(model       = model,
-                         dataset     = dataset,
+                         dataset     = train_dataset,
                          optimizer   = optimizer, 
                          args        = args, 
                          start_epoch = epoch,

@@ -183,4 +183,9 @@ KITTI:
 - [ ]  ~~现在采用120组数据，4卡，bs=6，lr=1e-4实验；~~
 - [ ]  参考minkocc使用伪标签的方式。
 - [ ]  depth anything: small: 1.2GB base: 1.9GB Large: 3.1GB
+- [ ]  目前的问题有：loss已经不再下降了，但是
+- [ ]  前景mask和背景mask分别提供，设定不同的loss，突出前景物体。（或者有什么方法可以细化边缘？）
+
+sudo apt-get update
+sudo apt-get install -y libglib2.0-0
 

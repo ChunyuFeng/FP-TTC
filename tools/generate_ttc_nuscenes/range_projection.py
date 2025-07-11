@@ -371,7 +371,7 @@ def main(args):
 
         scene_indice = current_sf_record['scene_indice']
 
-        if scene_indice not in ['11', '12', '13', '14', '15']:
+        if scene_indice not in ['20', '21', '22', '23', '24']:
             continue
 
         # 读取 scene flow 数据

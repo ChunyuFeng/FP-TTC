@@ -260,91 +260,56 @@ def main():
             curr_batch = torch.stack(curr_tensors, dim=0).unsqueeze(0).to(device)
             affine_matrix = torch.from_numpy(affine_matrix).unsqueeze(0).to(device)
 
-            # Build spherical coordinates
-            # Get UV indices for previous and current images
-            H_sph, W_sph = prev_batch.shape[-2:]
-            H_sph, W_sph = H_sph // 4, W_sph // 4 
-            W_sph = W_sph * 6  # 6 cameras concatenated horizontally
-            R = args.radial_sampling_num
-            # xyz 按照 nuScenes 的坐标系定义构建：x向右，y向前，z向上
-            # 需要修改成SJTU的坐标系定义        ：x向左，y向后，z向上
-            # sjtu: 25° up, -25° down
-            _, xyz = build_spherical_voxels(
-                    H=H_sph, W=W_sph, R=R,
-                    r_min=5.0, r_max=50.0,
-                    fov_up_deg=15.0, fov_down_deg=-15.0,
-                )
-            X, Y, Z = xyz[...,0], xyz[...,1], xyz[...,2]
-            X_new = -X
-            Y_new = -Y
-            Z_new =  Z
-            xyz = np.stack([X_new, Y_new, Z_new], axis=-1)
+            # # Build spherical coordinates
+            # # Get UV indices for previous and current images
+            # H_sph, W_sph = prev_batch.shape[-2:]
+            # H_sph, W_sph = H_sph // 4, W_sph // 4 
+            # W_sph = W_sph * 6  # 6 cameras concatenated horizontally
+            # R = args.radial_sampling_num
+            # # xyz 按照 nuScenes 的坐标系定义构建：x向右，y向前，z向上
+            # # 需要修改成SJTU的坐标系定义        ：x向左，y向后，z向上
+            # # sjtu: 25° up, -25° down
+            # _, xyz = build_spherical_voxels(
+            #         H=H_sph, W=W_sph, R=R,
+            #         r_min=5.0, r_max=50.0,
+            #         fov_up_deg=15.0, fov_down_deg=-15.0,
+            #     )
+            # X, Y, Z = xyz[...,0], xyz[...,1], xyz[...,2]
+            # X_new = -X
+            # Y_new = -Y
+            # Z_new =  Z
+            # xyz = np.stack([X_new, Y_new, Z_new], axis=-1)
 
-            raw_img_size = (orig_size[1], orig_size[0])  # (H, W)
-            idx_uv_prev_raw = project_voxel_to_camera(
-                    xyz=xyz,
-                    sensor_metas=test_entries[idx]['sensor_metas_prev'],
-                    camera_channels=camera_channels,
-                    raw_img_size=raw_img_size,
-                    min_dist=1.0,
-                    sjtu=args.sjtu_test
-                )
-            idx_uv_curr_raw = project_voxel_to_camera(
-                    xyz=xyz,
-                    sensor_metas=test_entries[idx]['sensor_metas_curr'],
-                    camera_channels=camera_channels,
-                    raw_img_size=raw_img_size,
-                    min_dist=1.0,
-                    sjtu=args.sjtu_test
-                )
+            # raw_img_size = (orig_size[1], orig_size[0])  # (H, W)
+            # idx_uv_prev_raw = project_voxel_to_camera(
+            #         xyz=xyz,
+            #         sensor_metas=test_entries[idx]['sensor_metas_prev'],
+            #         camera_channels=camera_channels,
+            #         raw_img_size=raw_img_size,
+            #         min_dist=1.0,
+            #         sjtu=args.sjtu_test
+            #     )
+            # idx_uv_curr_raw = project_voxel_to_camera(
+            #         xyz=xyz,
+            #         sensor_metas=test_entries[idx]['sensor_metas_curr'],
+            #         camera_channels=camera_channels,
+            #         raw_img_size=raw_img_size,
+            #         min_dist=1.0,
+            #         sjtu=args.sjtu_test
+            #     )
             
 
-            # # 将 idx_uv_prev_raw 的类型转为 int 以便索引
-            # cam_idx_map = idx_uv_prev_raw[...,0].astype(int)
-            # u_map       = idx_uv_prev_raw[...,1]
-            # v_map       = idx_uv_prev_raw[...,2]
-
-            # for cam_idx, ch in enumerate(camera_channels):
-            #     # 1) 复制一份图，用于绘制
-            #     img = prev_images_undistorted[ch].copy()
-            #     draw = ImageDraw.Draw(img)
-
-            #     # 2) 找到所有属于本通道的投影点
-            #     mask = (cam_idx_map == cam_idx)
-            #     us   = u_map[mask].astype(int)
-            #     vs   = v_map[mask].astype(int)
-
-            #     # 3) 在图上画点
-            #     #    点太多可先随机采样，比如最多画 5000 个
-            #     # N = us.shape[0]
-            #     # if N > 5000:
-            #     #     idxs = np.random.choice(N, size=5000, replace=False)
-            #     #     us = us[idxs]
-            #     #     vs = vs[idxs]
-
-            #     for u, v in zip(us, vs):
-            #         # 如果超出图像边界就跳过
-            #         if not (0 <= u < img.width and 0 <= v < img.height):
-            #             continue
-            #         # 小圆圈半径
-            #         r = 2
-            #         # 红色填充
-            #         draw.ellipse((u-r, v-r, u+r, v+r), fill=(255,0,0))
-
-            #     # 4) 保存或显示
-            #     img.save(f'sjtu_proj_{ch}.png')
-
-            idx_uv_curr_raw = torch.from_numpy(idx_uv_curr_raw).unsqueeze(0).to(device)
-            idx_uv_prev_raw = torch.from_numpy(idx_uv_prev_raw).unsqueeze(0).to(device)
+            # idx_uv_curr_raw = torch.from_numpy(idx_uv_curr_raw).unsqueeze(0).to(device)
+            # idx_uv_prev_raw = torch.from_numpy(idx_uv_prev_raw).unsqueeze(0).to(device)
 
             # Inference
             with torch.no_grad():
-                scale_pred, risk_pred    = model.forward(
+                scale_pred    = model.forward(
                         img_prev         = prev_batch,
                         img_curr         = curr_batch,
-                        affine_matrix    = affine_matrix,
-                        idx_uv_prev      = idx_uv_prev_raw,
-                        idx_uv_curr      = idx_uv_curr_raw,
+                        # affine_matrix    = affine_matrix,
+                        # idx_uv_prev      = idx_uv_prev_raw,
+                        # idx_uv_curr      = idx_uv_curr_raw,
                         attn_type        = args.attn_type,
                         attn_splits_list = args.attn_splits_list,
                         corr_radius_list = args.corr_radius_list,
@@ -358,33 +323,35 @@ def main():
             scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
             normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
 
-            risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
-            normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array)
+            # risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
+            # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array)
 
             # save prediction as .npy files
             # for collision map generation
-            if args.save_pred_npy:
-                # 添加以时间戳命名的子目录
-                pred_npy_subdir = os.path.join(args.pred_npy_dir, f"pred_npy_{time_stamp}")
-                os.makedirs(pred_npy_subdir, exist_ok=True)
-                pred_data = {
-                    "scale_pred": scale_prediction_array,
-                    "risk_pred": risk_prediction_array
-                }
-                np.save(os.path.join(pred_npy_subdir, f"pred_{idx}.npy"), pred_data)
+            # if args.save_pred_npy:
+            #     # 添加以时间戳命名的子目录
+            #     pred_npy_subdir = os.path.join(args.pred_npy_dir, f"pred_npy_{time_stamp}")
+            #     os.makedirs(pred_npy_subdir, exist_ok=True)
+            #     pred_data = {
+            #         "scale_pred": scale_prediction_array,
+            #         "risk_pred": risk_prediction_array
+            #     }
+            #     np.save(os.path.join(pred_npy_subdir, f"pred_{idx}.npy"), pred_data)
 
             # Save visuals
             plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
                     -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
-            plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
-                    normalized_pred_risk_image, cmap='seismic', vmin=-1, vmax=1)
+            # plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
+            #         normalized_pred_risk_image, cmap='seismic', vmin=-1, vmax=1)
 
             # Cleanup
-            del prev_batch, curr_batch, scale_pred, risk_pred
+            # del prev_batch, curr_batch, scale_pred, risk_pred
             torch.cuda.empty_cache()
         
         # test on nuScenes dataset
         else: 
+            if test_entries[idx]['scene_indice'] != '10':
+                continue
             # Load images
             prev_images = {}
             curr_images = {}
@@ -415,37 +382,37 @@ def main():
             curr_batch = torch.stack(curr_tensors, dim=0).unsqueeze(0).to(device)
             affine_matrix = torch.from_numpy(affine_matrix).unsqueeze(0).to(device)
 
-            # Build spherical coordinates
-            # Get UV indices for previous and current images
-            H_sph, W_sph = prev_batch.shape[-2:]
-            H_sph, W_sph = H_sph // 4, W_sph // 4 
-            W_sph = W_sph * 6  # 6 cameras concatenated horizontally
-            R = args.radial_sampling_num
-            _, xyz = build_spherical_voxels(
-                    H=H_sph, W=W_sph, R=R,
-                    r_min=5.0, r_max=50.0,
-                    fov_up_deg=8.0, fov_down_deg=-15.0,
-                )
+            # # Build spherical coordinates
+            # # Get UV indices for previous and current images
+            # H_sph, W_sph = prev_batch.shape[-2:]
+            # H_sph, W_sph = H_sph // 4, W_sph // 4 
+            # W_sph = W_sph * 6  # 6 cameras concatenated horizontally
+            # R = args.radial_sampling_num
+            # _, xyz = build_spherical_voxels(
+            #         H=H_sph, W=W_sph, R=R,
+            #         r_min=5.0, r_max=50.0,
+            #         fov_up_deg=8.0, fov_down_deg=-15.0,
+            #     )
 
-            raw_img_size = (orig_size[1], orig_size[0])  # (H, W)
-            idx_uv_prev_raw = project_voxel_to_camera(
-                    xyz=xyz,
-                    sensor_metas=test_entries[idx]['sensor_metas_prev'],
-                    camera_channels=camera_channels,
-                    raw_img_size=raw_img_size,
-                    min_dist=1.0
-                )
-            idx_uv_curr_raw = project_voxel_to_camera(
-                    xyz=xyz,
-                    sensor_metas=test_entries[idx]['sensor_metas_curr'],
-                    camera_channels=camera_channels,
-                    raw_img_size=raw_img_size,
-                    min_dist=1.0
-                )
+            # raw_img_size = (orig_size[1], orig_size[0])  # (H, W)
+            # idx_uv_prev_raw = project_voxel_to_camera(
+            #         xyz=xyz,
+            #         sensor_metas=test_entries[idx]['sensor_metas_prev'],
+            #         camera_channels=camera_channels,
+            #         raw_img_size=raw_img_size,
+            #         min_dist=1.0
+            #     )
+            # idx_uv_curr_raw = project_voxel_to_camera(
+            #         xyz=xyz,
+            #         sensor_metas=test_entries[idx]['sensor_metas_curr'],
+            #         camera_channels=camera_channels,
+            #         raw_img_size=raw_img_size,
+            #         min_dist=1.0
+            #     )
             
             
-            idx_uv_curr_raw = torch.from_numpy(idx_uv_curr_raw).unsqueeze(0).to(device)
-            idx_uv_prev_raw = torch.from_numpy(idx_uv_prev_raw).unsqueeze(0).to(device)
+            # idx_uv_curr_raw = torch.from_numpy(idx_uv_curr_raw).unsqueeze(0).to(device)
+            # idx_uv_prev_raw = torch.from_numpy(idx_uv_prev_raw).unsqueeze(0).to(device)
 
             if test_entries[idx]['gt_map_path'] is not None:
                 # Load ground-truth maps
@@ -469,12 +436,12 @@ def main():
 
             # Inference
             with torch.no_grad():
-                scale_pred, risk_pred    = model.forward(
+                scale_pred               = model.forward(
                         img_prev         = prev_batch,
                         img_curr         = curr_batch,
-                        affine_matrix    = affine_matrix,
-                        idx_uv_prev      = idx_uv_prev_raw,
-                        idx_uv_curr      = idx_uv_curr_raw,
+                        # affine_matrix    = affine_matrix,
+                        # idx_uv_prev      = idx_uv_prev_raw,
+                        # idx_uv_curr      = idx_uv_curr_raw,
                         attn_type        = args.attn_type,
                         attn_splits_list = args.attn_splits_list,
                         corr_radius_list = args.corr_radius_list,
@@ -498,11 +465,11 @@ def main():
             scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
             normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
 
-            gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
-            normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array)
+            # gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
+            # normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array)
 
-            risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
-            normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array)
+            # risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
+            # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array)
 
             # save prediction as .npy files
             # for collision map generation
@@ -521,17 +488,15 @@ def main():
                     -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
             plt.imsave(os.path.join(output_dir, f"gt_scale_{idx}.png"),
                     -normalized_gt_scale_image, cmap='seismic', vmin=-1, vmax=1)
-            plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
-                    normalized_pred_risk_image, cmap='seismic', vmin=-1, vmax=1)
-            plt.imsave(os.path.join(output_dir, f"gt_risk_{idx}.png"),
-                    normalized_gt_risk_image, cmap='seismic', vmin=-1, vmax=1)
+            # plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
+            #         normalized_pred_risk_image, cmap='seismic', vmin=-1, vmax=1)
+            # plt.imsave(os.path.join(output_dir, f"gt_risk_{idx}.png"),
+            #         normalized_gt_risk_image, cmap='seismic', vmin=-1, vmax=1)
 
             # Cleanup
-            del prev_batch, curr_batch, scale_pred, risk_pred
+            # del prev_batch, curr_batch, scale_pred, risk_pred
             torch.cuda.empty_cache()
 
-            with open(os.path.join(output_dir, "processed_indices.txt"), "a") as f:
-                f.write(f"{idx}\n")
 
 if __name__ == "__main__":
     main()

@@ -194,6 +194,10 @@ def main(nusc, val_list, indice, args):
     else:
         raise NotImplementedError
 
+    args.scene_num -= 1
+    if args.scene_num < 0:
+        return
+
     # load the first sample to start
     first_sample_token = my_scene['first_sample_token']
     my_sample = nusc.get('sample', first_sample_token)
@@ -584,6 +588,7 @@ if __name__ == '__main__':
     parse.add_argument('--save_path', type=str, default='./Datasets/nuscenes/0_scene_flow')
     parse.add_argument('--start', type=int, default=0)
     parse.add_argument('--end', type=int, default=2)
+    parse.add_argument('--scene_num', type=int, default=10)
     parse.add_argument('--dataroot', type=str, default='./Datasets/nuscenes/')
     parse.add_argument('--nusc_val_list', type=str, default='./tools/generate_scene_flow_nuscenes/nuscenes_val_list.txt')
     args=parse.parse_args()
@@ -612,6 +617,6 @@ if __name__ == '__main__':
     # with open(label_mapping, 'r') as stream:
     #     nuscenesyaml = yaml.safe_load(stream)
 
-    for i in range(args.start,args.end):
+    for i in range(args.start, args.end):
         print('processing sequecne:', i)
         main(nusc, val_list, indice=i, args=args)

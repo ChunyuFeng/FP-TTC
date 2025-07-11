@@ -45,15 +45,16 @@ class FpTTC(nn.Module):
 
         self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                                 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+        
 
         # 仅底层共享：CNNEncoder
         self.cnet = CNNEncoder(output_dim=feature_channels, num_output_scales=num_scales)
 
-        # 加载预训练的 cnet 权重
-        if load_cnet:
-            self._load_pretrained_cnet(pretrained_cnet_path, freeze_cnet)
+        # # 加载预训练的 cnet 权重
+        # if load_cnet:
+        #     self._load_pretrained_cnet(pretrained_cnet_path, freeze_cnet)
         
-                # Scale 分支私有网络
+        # Scale 分支私有网络
         self.featnet   = FeatureNet(num_scales             = num_scales,
                                           feature_channels       = feature_channels,
                                           num_head               = num_head, 
@@ -65,7 +66,7 @@ class FpTTC(nn.Module):
                                        reg_refine                = reg_refine)        
         self.conv_corr = CorrEncoder(dim_in                = 2,
                                            dim_out               = feature_channels+1) 
-        self.scalenet_singlebranch       = ScaleNet(num_scales               = num_scales,
+        self.scale_net  = ScaleNet(num_scales               = num_scales,
                                         feature_channels         = feature_channels,
                                         upsample_factor          = upsample_factor,
                                         num_head                 = 4,
@@ -93,72 +94,33 @@ class FpTTC(nn.Module):
         #                                 reg_refine               = reg_refine, 
         #                                 head_type                = 'scale')
 
-        # # Risk 分支私有网络
-        # self.featnet_risk    = FeatureNet(num_scales             = num_scales,
-        #                                   feature_channels       = feature_channels,
-        #                                   num_head               = num_head, 
-        #                                   ffn_dim_expansion      = ffn_dim_expansion,
-        #                                   num_transformer_layers = num_transformer_layers)
-        # self.corrnet_risk    = FlowNet(num_scales                = num_scales,
-        #                                feature_channels          = feature_channels,
-        #                                upsample_factor           = upsample_factor,
-        #                                reg_refine                = reg_refine)
-        # self.conv_corr_risk  = CorrEncoder(dim_in                = 2,
-        #                                    dim_out               = feature_channels+1)
-        # self.risknet         = ScaleNet(num_scales               = num_scales,
-        #                                 feature_channels         = feature_channels,
-        #                                 upsample_factor          = upsample_factor,
-        #                                 num_head                 = 4,
-        #                                 scale_level              = num_scales, 
-        #                                 reg_refine               = reg_refine, 
-        #                                 head_type                = 'risk')
+        # Risk 分支私有网络
+        self.featnet_risk    = FeatureNet(num_scales             = num_scales,
+                                          feature_channels       = feature_channels,
+                                          num_head               = num_head, 
+                                          ffn_dim_expansion      = ffn_dim_expansion,
+                                          num_transformer_layers = num_transformer_layers)
+        self.corrnet_risk    = FlowNet(num_scales                = num_scales,
+                                       feature_channels          = feature_channels,
+                                       upsample_factor           = upsample_factor,
+                                       reg_refine                = reg_refine)
+        self.conv_corr_risk  = CorrEncoder(dim_in                = 2,
+                                           dim_out               = feature_channels+1)
+        self.risk_net         = ScaleNet(num_scales               = num_scales,
+                                        feature_channels         = feature_channels,
+                                        upsample_factor          = upsample_factor,
+                                        num_head                 = 4,
+                                        scale_level              = num_scales, 
+                                        reg_refine               = reg_refine, 
+                                        head_type                = 'risk')
+        
         
         # # 特征融合和投影到透视图
         # self.inner_fusion    = InnerFeatureFusion(channels       = feature_channels)
         # self.voxel_to_pv     = VoxelToPV(in_channels             = feature_channels,
         #                                  R                       = radial_sampling)
     
-    def _load_pretrained_cnet(self, ckpt_path: str, freeze: bool):
-        """
-        仅加载预训练 checkpoint 中与 cnet 相关的权重，
-        支持 key 前缀 'module.cnet.' 或 'cnet.'，加载后可选冻结。
-        """
-        ckpt = torch.load(ckpt_path, map_location='cpu')
 
-        # 1) 优先取 'net'，否则尝试 'state_dict'
-        if 'net' in ckpt:
-            raw_state = ckpt['net']
-        elif 'state_dict' in ckpt:
-            raw_state = ckpt['state_dict']
-        else:
-            raw_state = ckpt
-
-        # 2) 筛选出 cnet keys
-        enc_state = {}
-        for k, v in raw_state.items():
-            # 可能的前缀有："module.cnet." 或 "cnet."
-            if k.startswith('module.cnet.'):
-                new_k = k[len('module.cnet.'):]
-            elif k.startswith('cnet.'):
-                new_k = k[len('cnet.'):]
-            else:
-                continue
-            enc_state[new_k] = v
-
-        # 3) 加载到 self.cnet（strict=False 允许部分层不匹配）
-        missing, unexpected = self.cnet.load_state_dict(enc_state, strict=False)
-        if is_main_process():
-            if missing:
-                print(f"[WARN] cnet missing keys: {missing}")
-            if unexpected:
-                print(f"[WARN] cnet unexpected keys: {unexpected}")
-
-        # 4) freeze cnet 参数
-        if freeze:
-            for p in self.cnet.parameters():
-                p.requires_grad = False
-            if is_main_process():
-                print("[INFO] cnet parameters frozen.")
 
     def forward(self,
                 img_prev,
@@ -266,32 +228,54 @@ class FpTTC(nn.Module):
         corr_enc_s = self.conv_corr(corr_s)
         ini_scale  = F.softplus(corr_enc_s[:, :1]) + 1e-3
         corr_enc_s = corr_enc_s[:, 1:]
-        scales     = self.scalenet_singlebranch(corr_enc_s, mlvl_s0, mlvl_s1, ini_scale)
+        scales     = self.scale_net(corr_enc_s, mlvl_s0, mlvl_s1, ini_scale)
 
         del corr_s, mlvl_s0, mlvl_s1
 
-        return scales
+        # return scales
 
-        # # === Risk 分支 ===
-        # corr_r = None
-        # mlvl_r0, mlvl_r1 = [], []
-        # for lvl in range(self.num_scales):
-        #     f0, f1     = feature0_lvls[lvl], feature1_lvls[lvl]
-        #     f0_r, f1_r = self.featnet_risk(f0, f1, lvl, attn_type, attn_splits_list, corr_r)
-        #     mlvl_r0.append(f0_r)
-        #     mlvl_r1.append(f1_r)
-        #     corr_r, _  = self.corrnet_risk(f0_r, f1_r, lvl, corr_radius_list, prop_radius_list, num_reg_refine, False, corr_r)
-        #     if lvl < self.num_scales - 1:
-        #         corr_r = F.interpolate(corr_r, scale_factor=2, mode='bilinear', align_corners=True) * 2
-        # corr_enc_r = F.relu(self.conv_corr_risk(corr_r))
-        # ini_risk   = corr_enc_r[:, :1]
-        # corr_enc_r = corr_enc_r[:, 1:]
-        # risk_score = self.risknet(corr_enc_r, mlvl_r0, mlvl_r1, ini_risk)
+        corr_r_ = []
+        mlvl_r0_ = []
+        mlvl_r1_ = []
+        # === Risk 分支 ===
+        for feat_prev, feat_curr in zip(shared_prev, shared_curr):
+            feature0_lvls = feat_prev
+            feature1_lvls = feat_curr
+            # 这里 corr_r 初始化为 None，表示每个视角的 Risk 分支从头开始计算
+            corr_r = None
+            mlvl_r0, mlvl_r1 = [], []
+            for lvl in range(self.num_scales):
+                f0, f1     = feature0_lvls[lvl], feature1_lvls[lvl]
+                f0_r, f1_r = self.featnet_risk(f0, f1, lvl, attn_type, attn_splits_list, corr_r)
+                mlvl_r0.append(f0_r)
+                mlvl_r1.append(f1_r)
+                corr_r, _  = self.corrnet_risk(f0_r, f1_r, lvl, corr_radius_list, prop_radius_list, num_reg_refine, False, corr_r)
+                if lvl < self.num_scales - 1:
+                    corr_r = F.interpolate(corr_r, scale_factor=2, mode='bilinear', align_corners=True) * 2
+            corr_r_.append(corr_r)
+            mlvl_r0_.append(mlvl_r0)
+            mlvl_r1_.append(mlvl_r1)
+        
+        corr_r = torch.cat(corr_r_, dim=3)
+        # 将多视角下 mlvl_r0_、mlvl_r1_ 按 lvl 对应关系，在宽度维度（dim=3）拼接
+        mlvl_r0 = [
+            torch.cat([view_feats[lvl] for view_feats in mlvl_r0_], dim=3)
+            for lvl in range(self.num_scales)
+        ]
+        mlvl_r1 = [
+            torch.cat([view_feats[lvl] for view_feats in mlvl_r1_], dim=3)
+            for lvl in range(self.num_scales)
+        ]
 
-        # del corr_r, mlvl_r0, mlvl_r1
-        # del feature0_lvls, feature1_lvls
+        corr_enc_r = F.relu(self.conv_corr_risk(corr_r))
+        ini_risk   = corr_enc_r[:, :1]
+        corr_enc_r = corr_enc_r[:, 1:]
+        risk_score = self.risk_net(corr_enc_r, mlvl_r0, mlvl_r1, ini_risk)
 
-        # return scales, risk_score
+        del corr_r, mlvl_r0, mlvl_r1
+        del feature0_lvls, feature1_lvls
+
+        return scales, risk_score
 
     # def forward_with_loss( 
     #         self,
@@ -335,7 +319,7 @@ class FpTTC(nn.Module):
             img_prev,                      # Tensor[B, V, 3, H, W]
             img_curr,                      # Tensor[B, V, 3, H, W]
             gt_scale_map_with_mask,        # Tensor[B, 2, H_sph, W_sph]
-            # gt_risk_score_map_with_mask,   # Tensor[B, 2, H_sph, W_sph]
+            gt_risk_score_map_with_mask,   # Tensor[B, 2, H_sph, W_sph]
             # affine_matrix,                 # Tensor[B, 3, 3]
             # idx_uv_prev,                   # Tensor[B, H_sph, W_sph, R, 3]
             # idx_uv_curr,                   # Tensor[B, H_sph, W_sph, R, 3]
@@ -347,7 +331,7 @@ class FpTTC(nn.Module):
             testing                        # bool
         ):
 
-        scales = self.forward(
+        scales, risks = self.forward(
             img_prev         = img_prev,
             img_curr         = img_curr,
             # affine_matrix    = affine_matrix,
@@ -361,7 +345,8 @@ class FpTTC(nn.Module):
             testing          = testing
         )
         loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
-        return scales, loss_s
+        loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
+        return scales, risks, loss_s, loss_r
 
     def extract_feature(self, im0, im1, branch):
         x = torch.cat([im0, im1], dim=0)
