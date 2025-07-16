@@ -47,7 +47,8 @@ class CNNEncoder(nn.Module):
 
         feature_dims = [64, 96, 128]
 
-        self.conv1 = nn.Conv2d(3, feature_dims[0], kernel_size=7, stride=2, padding=3, bias=False)  # 1/2
+        # self.conv1 = nn.Conv2d(3, feature_dims[0], kernel_size=7, stride=2, padding=3, bias=False)  # 1/2
+        self.conv1 = nn.Conv2d(4, feature_dims[0], kernel_size=7, stride=2, padding=3, bias=False)  # 1/2
         self.norm1 = norm_layer(feature_dims[0])
         self.relu1 = nn.ReLU(inplace=True)
 

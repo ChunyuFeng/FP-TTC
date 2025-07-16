@@ -17,8 +17,11 @@ from .utils.rectangle_noise import retangle
 from .utils import frame_utils
 import  cv2
 from .utils.augmentor import FlowAugmentor, SparseFlowAugmentorm, NuscAugmentor, NuscRangeImageAugmentor
-
-from fpttc.scale_net.utils.spherical import build_spherical_voxels, project_voxel_to_camera
+from dataloader.utils.geometry import get_geometry, range_projection_with_mapping
+import open3d as o3d
+import matplotlib.pyplot as plt
+from scipy.ndimage import distance_transform_edt
+from fpttc.scale_net.utils.spherical import build_spherical_voxels, project_voxel_to_camera, build_lidar_to_camera_projection
 '''
 from pyquaternion import Quaternion
 import matplotlib.pyplot as plt
@@ -742,13 +745,14 @@ class nuScenes_range_image(data.Dataset):
         else:
             raise FileNotFoundError(f"No such file: {pkl_file_path}")
 
-        # # 使用 scene_indice 为 4 的数据，做小数据集快速迭代测试
-        # self.data = [d for d in self.data if d.get('scene_indice') == '4']
-
         # 数据增强设置
         self.augmentor = None
         if self.aug_params is not None:
-            self.augmentor = NuscRangeImageAugmentor(**self.aug_params)
+            self.augmentor = NuscRangeImageAugmentor(**self.aug_params)      
+        # 获取数据增强的 affine 参数
+        orig_size = (1600, 900)  # (W, H)
+        self.affine_params = self.augmentor.sample_params(orig_size)
+        self.affine_matrix = self.augmentor.get_affine_matrix(self.affine_params)
         
         self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                                 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
@@ -760,75 +764,40 @@ class nuScenes_range_image(data.Dataset):
         # - gt range images path (including scale map, depth map and risk score map)
         # - nuscenes scene flow pointcloud path
         self.image_list = [] # input images
-        self.sensor_meta_list = []
+        # self.sensor_meta_list = []
         self.scale_map_list = [] # ground truth
         self.risk_score_map_list = []
-        # TODO: 目前 depth map 是将碰撞点反投影回图像平面时使用的，仅在可视化时使用
+        # [TODO] 目前 depth map 是将碰撞点反投影回图像平面时使用的，仅在可视化时使用
         self.depth_map_list = []
 
-        # 在加载数据集时离线构建 spherical voxel grid
-        # 并且提前计算好每一帧的 voxel 对应的 uv 坐标
-        # 因为Nuscenes的点云到图像投影关系考虑了不同传感器采样时自车的位姿，所以每一帧的外参都不同
-        # self.idx_uv_prev_list = []
-        # self.idx_uv_curr_list = [] 
+        self.proj_list = [] # 记录 环视图 (cam_idx, u, v) 和 range image (u, v) 的映射关系
 
-        for i in tqdm(range(len(self.data)-1170), desc='Loading nuScenes Range Image Dataset'):
+        # 在加载数据集时离线构建 spherical voxel grid
+        # 结合 DepthAnything 预测的 Depth Pred Map，提前计算每一个像素坐标对应的 Range View 坐标
+
+        for i in tqdm(range(len(self.data)-1790), desc='Loading nuScenes Range Image Dataset'):
 
             if self.data[i]['scene_indice'] == '10':
                 continue
-
-            range_image_path = os.path.join(self.data[i]['gt_map_path'], 'range_image_curr.npy')
-            if not osp.exists(range_image_path):
-                print(f"Range image file {range_image_path} does not exist.")
-                continue
-            # 读取 range image
-            range_image = np.load(range_image_path, allow_pickle=True).item()
-
+            
+            # 1. 模型 Input
             self.image_list.append([self.data[i]['prev_camera_data'],
                                     self.data[i]['curr_camera_data']])
-            self.data[i]['sensor_metas_prev']['frame'] = 'prev'
-            self.data[i]['sensor_metas_curr']['frame'] = 'curr'
-            self.sensor_meta_list.append([self.data[i]['sensor_metas_prev'],
-                                          self.data[i]['sensor_metas_curr']])
+            
+            # 2. Ground Truth Range Image —— Scale Map, Risk Score Map, Depth Map
+            range_image_path = os.path.join(self.data[i]['gt_map_path'], 'range_image_curr.npy')
+            if not osp.exists(range_image_path):
+                raise FileNotFoundError(f"Range image file {range_image_path} does not exist.")
+            range_image = np.load(range_image_path, allow_pickle=True).item()
             self.scale_map_list.append(range_image['scale'])
             self.risk_score_map_list.append(range_image['risk_score'])
             self.depth_map_list.append(range_image['depth'])
 
-            # # 多视角融合时，使用的特征图尺寸为真值图尺寸的 1/4
-            # H_sph, W_sph = self.scale_map_list[-1].shape
-            # H_sph //= 4 
-            # W_sph //= 4
-            # R = 16 # 径向采样 16 个点
-
-            # # 构建 spherical voxel，获取每个 voxel 的 3D 笛卡尔坐标
-            # _, xyz = build_spherical_voxels(
-            #     H=H_sph, W=W_sph, R=R,
-            #     r_min=5.0, r_max=50.0,
-            #     # fov_up_deg=22.0, fov_down_deg=-17.0,
-            #     fov_up_deg=8.0, fov_down_deg=-15.0,
-            # )
-
-            # camera_channels = self.camera_channels
-            # raw_img_size = (self.data[i]['prev_camera_data']['CAM_FRONT']['height'],
-            #                 self.data[i]['prev_camera_data']['CAM_FRONT']['width'])
-            # idx_uv_prev_raw = project_voxel_to_camera(
-            #     xyz=xyz,
-            #     sensor_metas=self.data[i]['sensor_metas_prev'],
-            #     camera_channels=camera_channels,
-            #     raw_img_size=raw_img_size,
-            #     min_dist=1.0
-            # )
-
-            # idx_uv_curr_raw = project_voxel_to_camera(
-            #     xyz=xyz,
-            #     sensor_metas=self.data[i]['sensor_metas_curr'],
-            #     camera_channels=camera_channels,
-            #     raw_img_size=raw_img_size,
-            #     min_dist=1.0
-            # )
-
-            # self.idx_uv_prev_list.append(idx_uv_prev_raw)
-            # self.idx_uv_curr_list.append(idx_uv_curr_raw)
+            # 3. 环视图像 (cam_idx, u, v) 与 range image (u, v) 之间的映射关系
+            #    通过 DepthAnything 预测的 Depth Pred Map + 内外参 计算得到
+            proj_range_prev, proj_pix_prev = self.build_frame_mapping('prev', i, H_r=40, W_r=480)
+            proj_range_curr, proj_pix_curr = self.build_frame_mapping('curr', i, H_r=40, W_r=480)
+            self.proj_list.append([proj_pix_prev, proj_pix_curr])
 
     def __len__(self):
         return len(self.image_list)
@@ -838,255 +807,180 @@ class nuScenes_range_image(data.Dataset):
         prev_surr_view_imgs = {}
         curr_surr_view_imgs = {}
 
-        # camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
-        #                    'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
-        # 后续会按照这个顺序拼接，和 Range Image 对应 
-        camera_channels = self.camera_channels
-        
+        prev_surr_view_depths = {}
+        curr_surr_view_depths = {}
+
+        camera_channels = self.camera_channels    
         path_prefix = './Datasets/nuscenes/'
+
+        # 1. 按照相机通道读取相邻帧的图像和深度预测结果
         for channel in camera_channels:
-            prev_surr_view_imgs_path = os.path.join(path_prefix,
-                                                    self.image_list[index][0][channel]['filename'])
+            # 1）读取相邻帧的图像
+            prev_surr_view_imgs_path     = os.path.join(path_prefix, self.image_list[index][0][channel]['filename'])
             prev_surr_view_imgs[channel] = Image.open(prev_surr_view_imgs_path)
 
-            curr_surr_view_imgs_path = os.path.join(path_prefix,
-                                                    self.image_list[index][1][channel]['filename'])
+            curr_surr_view_imgs_path     = os.path.join(path_prefix, self.image_list[index][1][channel]['filename'])
             curr_surr_view_imgs[channel] = Image.open(curr_surr_view_imgs_path)
-        
-        gt_scale_map = self.scale_map_list[index]
+
+            # 2) 读取相邻帧的 Depth Pred Map (DepthAnythingV2 Metric)
+            prev_surr_view_depths_path     = self.image_list[index][0][channel]['depth_pred']
+            prev_surr_view_depths[channel] = np.load(prev_surr_view_depths_path)
+
+            curr_surr_view_depths_path     = self.image_list[index][1][channel]['depth_pred']
+            curr_surr_view_depths[channel] = np.load(curr_surr_view_depths_path)
+
+        # 2. 获取 ground truth 的 scale map、risk score map 和 depth map
+        gt_scale_map      = self.scale_map_list[index]
         gt_risk_score_map = self.risk_score_map_list[index]
-        gt_depth_map = self.depth_map_list[index]
-        sensor_meta = self.sensor_meta_list[index]
-        # idx_uv_prev_raw = self.idx_uv_prev_list[index]
-        # idx_uv_curr_raw = self.idx_uv_curr_list[index]
+        gt_depth_map      = self.depth_map_list[index]
 
-        # H_sph, W_sph, R, _ = idx_uv_prev_raw.shape
+        # 3. 获取 (cam_idx, u, v) 到 range image (u, v) 的映射关系
+        proj_pix_prev, proj_pix_curr = self.proj_list[index]
 
-        # # 将 idx_uv_prev_raw 的类型转为 int 以便索引
-        # cam_idx_map = idx_uv_prev_raw[...,0].astype(int)
-        # u_map       = idx_uv_prev_raw[...,1]
-        # v_map       = idx_uv_prev_raw[...,2]
-
-        # for cam_idx, ch in enumerate(camera_channels):
-        #     # 1) 复制一份图，用于绘制
-        #     img = prev_surr_view_imgs[ch].copy()
-        #     draw = ImageDraw.Draw(img)
-
-        #     # 2) 找到所有属于本通道的投影点
-        #     mask = (cam_idx_map == cam_idx)
-        #     us   = u_map[mask].astype(int)
-        #     vs   = v_map[mask].astype(int)
-
-        #     # 3) 在图上画点
-        #     #    点太多可先随机采样，比如最多画 5000 个
-        #     # N = us.shape[0]
-        #     # if N > 5000:
-        #     #     idxs = np.random.choice(N, size=5000, replace=False)
-        #     #     us = us[idxs]
-        #     #     vs = vs[idxs]
-
-        #     for u, v in zip(us, vs):
-        #         # 如果超出图像边界就跳过
-        #         if not (0 <= u < img.width and 0 <= v < img.height):
-        #             continue
-        #         # 小圆圈半径
-        #         r = 2
-        #         # 红色填充
-        #         draw.ellipse((u-r, v-r, u+r, v+r), fill=(255,0,0))
-
-        #     # 4) 保存或显示
-        #     img.save(f'proj_{ch}.png')
-
-
-        # 获取数据增强的 affine 参数
+        # 4. 对 input 图像进行数据增强
         orig_size = next(iter(prev_surr_view_imgs.values())).size  # (W, H)
         affine_params = self.augmentor.sample_params(orig_size)
-        # 将 affine 参数应用到图像上，实现数据增强
         prev_surr_view_imgs, _ = self.augmentor(prev_surr_view_imgs, affine_params)
         curr_surr_view_imgs, _ = self.augmentor(curr_surr_view_imgs, affine_params)
-        # 获取 affine 矩阵
         affine_matrix = self.augmentor.get_affine_matrix(affine_params)
-        # # 数据增强
-        # if self.augmentor is not None:
-        #     prev_surr_view_imgs, self.affine = self.augmentor(prev_surr_view_imgs)
-        #     curr_surr_view_imgs, _ = self.augmentor(curr_surr_view_imgs)
         
-        # 转换为 Tensor
+        # 5. 将上述收集的信息转换为 Tensor
+        # 1）将 input 图像和 depth pred map 转换为 Tensor
         for channel in camera_channels:
             prev_surr_view_imgs[channel] = torch.from_numpy(prev_surr_view_imgs[channel]).permute(2, 0, 1).float()
             curr_surr_view_imgs[channel] = torch.from_numpy(curr_surr_view_imgs[channel]).permute(2, 0, 1).float()
+            prev_surr_view_depths[channel] = torch.from_numpy(prev_surr_view_depths[channel]).float()
+            curr_surr_view_depths[channel] = torch.from_numpy(curr_surr_view_depths[channel]).float()
         
         prev_surr_view_imgs_tensor = torch.stack([prev_surr_view_imgs[channel] for channel in camera_channels], dim=0)
         curr_surr_view_imgs_tensor = torch.stack([curr_surr_view_imgs[channel] for channel in camera_channels], dim=0)
 
+        prev_surr_view_depths_tensor = torch.stack([prev_surr_view_depths[channel] for channel in camera_channels], dim=0)
+        curr_surr_view_depths_tensor = torch.stack([curr_surr_view_depths[channel] for channel in camera_channels], dim=0)
+        prev_surr_view_depths_tensor = prev_surr_view_depths_tensor.unsqueeze(1)
+        curr_surr_view_depths_tensor = curr_surr_view_depths_tensor.unsqueeze(1)
+
+        # 2）将 ground truth 的 scale map、risk score map 和 depth map 转换为 Tensor
         gt_scale_map = torch.from_numpy(gt_scale_map).float()
         gt_risk_score_map = torch.from_numpy(gt_risk_score_map).float()
         gt_depth_map = torch.from_numpy(gt_depth_map).float()
-
-        # affine_matrix = torch.from_numpy(affine_matrix)
-        # idx_uv_prev_raw = torch.from_numpy(idx_uv_prev_raw) 
-        # idx_uv_curr_raw = torch.from_numpy(idx_uv_curr_raw) 
-
-        # scale 取 (0.3, 3.0) 之间的值
         mask_scale = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
-        # risk score & depth 取相同的 mask
-        mask_risk_score = mask_scale
-        mask_depth = mask_scale
-        # 拼接gt_scale和mask
         gt_scale_map_with_mask = torch.cat((gt_scale_map.unsqueeze(0), mask_scale.unsqueeze(0).float()), dim=0)
-        # gt_risk_score_map_with_mask = torch.cat((gt_risk_score_map.unsqueeze(0), mask_risk_score.unsqueeze(0).float()), dim=0)
-        # gt_depth_map_with_mask = torch.cat((gt_depth_map.unsqueeze(0), mask_depth.unsqueeze(0).float()), dim=0)
 
-        # return (prev_surr_view_imgs_tensor,
-        #         curr_surr_view_imgs_tensor,
-        #         gt_scale_map_with_mask, # model 的输入以及真值
-        #         gt_risk_score_map_with_mask, # model 的输入以及真值
-        #         gt_depth_map_with_mask, # model 的输入以及真值
-        #         affine_matrix,
-        #         idx_uv_prev_raw,
-        #         idx_uv_curr_raw)
+        # 3）将 (cam_idx, u, v) 到 range image (u, v) 的映射关系转换为 Tensor
+        proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
+        proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
+
+        # 4) 将图像增强的仿射矩阵转换为 Tensor
+        affine_matrix = torch.from_numpy(affine_matrix)
 
         return (prev_surr_view_imgs_tensor,
                 curr_surr_view_imgs_tensor,
-                gt_scale_map_with_mask)
+                prev_surr_view_depths_tensor,
+                curr_surr_view_depths_tensor,
+                proj_pix_prev_tensor,
+                proj_pix_curr_tensor,
+                gt_scale_map_with_mask,
+                affine_matrix)
 
-    '''
-    def __getitem__(self, index):
-
-        prev_surr_view_imgs = {}
-        curr_surr_view_imgs = {}
-
-        # 后续会按照这个顺序拼接，和 Range Image 对应 
-        camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-                           'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
-        
-        path_prefix = './Datasets/nuscenes/'
-        for channel in camera_channels:
-            prev_surr_view_imgs_path = os.path.join(path_prefix,
-                                                    self.image_list[index][0][channel]['filename'])
-            prev_surr_view_imgs[channel] = Image.open(prev_surr_view_imgs_path)
-
-            curr_surr_view_imgs_path = os.path.join(path_prefix,
-                                                    self.image_list[index][1][channel]['filename'])
-            curr_surr_view_imgs[channel] = Image.open(curr_surr_view_imgs_path)
-        
-        gt_scale_map = self.scale_map_list[index]
-        gt_risk_score_map = self.risk_score_map_list[index]
-        gt_depth_map = self.depth_map_list[index]
-
-        sensor_meta = self.sensor_meta_list[index]
-
-        # 转换为 Tensor
-        for channel in camera_channels:
-            prev_surr_view_imgs[channel] = torch.from_numpy(np.array(prev_surr_view_imgs[channel])).permute(2, 0, 1).float()
-            curr_surr_view_imgs[channel] = torch.from_numpy(np.array(curr_surr_view_imgs[channel])).permute(2, 0, 1).float()
-        
-        warped_prev = []
-        warped_curr = []
-        for channel in camera_channels:
-            # 1) 原始相机图像转 Tensor [3,H_cam,W_cam]
-            img_prev = prev_surr_view_imgs[channel]
-            img_curr = curr_surr_view_imgs[channel]
-
-            # 2) 从 sensor_meta 里获取投影信息
-            unit_range_view_vector = self.d.view(3, -1).T
-            # lidar 2 ego
-            rot_lidar_to_ego = Quaternion(sensor_meta['lidar']['calibrated_sensor']['rotation']).rotation_matrix
-            trans_lidar_to_ego = np.array(sensor_meta['lidar']['calibrated_sensor']['translation'])
-            unit_range_view_vector = unit_range_view_vector.T
-            unit_range_view_vector = np.dot(rot_lidar_to_ego, unit_range_view_vector).T
-            unit_range_view_vector += trans_lidar_to_ego
-
-            # ego 2 global
-            rot_ego_to_global = Quaternion(sensor_meta['lidar']['ego_pose']['rotation']).rotation_matrix
-            trans_ego_to_global = np.array(sensor_meta['lidar']['ego_pose']['translation'])
-            unit_range_view_vector = unit_range_view_vector.T
-            unit_range_view_vector = np.dot(rot_ego_to_global, unit_range_view_vector).T
-            unit_range_view_vector += trans_ego_to_global
-
-            # global 2 ego_camera
-            trans_global_to_ego_cam = -np.array(sensor_meta['camera']['ego_pose'][channel]['translation'])
-            rot_global_to_ego_cam = Quaternion(sensor_meta['camera']['ego_pose'][channel]['rotation']).rotation_matrix.T
-            unit_range_view_vector += trans_global_to_ego_cam
-            unit_range_view_vector = np.dot(rot_global_to_ego_cam, unit_range_view_vector.T).T
-
-            # ego_camera 2 camera
-            trans_ego_cam_to_camera = -np.array(sensor_meta['camera']['calibrated_sensor'][channel]['translation'])
-            rot_ego_cam_to_camera = Quaternion(sensor_meta['camera']['calibrated_sensor'][channel]['rotation']).rotation_matrix.T
-            unit_range_view_vector += trans_ego_cam_to_camera
-            unit_range_view_vector = np.dot(rot_ego_cam_to_camera, unit_range_view_vector.T).T
-
-            # camera 2 pixel
-            points_2d = view_points(unit_range_view_vector.T,
-                                    np.array(sensor_meta['camera']['calibrated_sensor'][channel]['camera_intrinsic']),
-                                    normalize=True)
-
-            points_2d = torch.from_numpy(points_2d).float()
-
-            u, v = points_2d[0], points_2d[1] # [H*W]
-            u_norm = 2*(u/(1600-1)) - 1  # 归一到 [-1,1]
-            v_norm = 2*(v/(900-1)) - 1
-            grid = torch.stack([u_norm, v_norm], dim=1)  # [H*W, 2]
-            grid = grid.view(1, self.H, self.W, 2)  # [1,H,W,2]
-
-            # 3) warp
-            warped_p = F.grid_sample(
-                img_prev.unsqueeze(0), grid,
-                mode='bilinear',
-                padding_mode='zeros',
-                align_corners=True
-            )[0]  # [3,H,W]
-            warped_c = F.grid_sample(
-                img_curr.unsqueeze(0), grid,
-                mode='bilinear',
-                padding_mode='zeros',
-                align_corners=True
-            )[0]
-
-            warped_prev.append(warped_p)
-            warped_curr.append(warped_c)
-
-        # 5) 最后再沿视角维度拼接成 [6,3,H,W]
-        prev_surr_view_imgs_tensor = torch.stack(warped_prev, dim=0)
-        curr_surr_view_imgs_tensor = torch.stack(warped_curr, dim=0)
-
-        # visualize_warped(prev_surr_view_imgs_tensor, channel_names=camera_channels)
-        visualize_concat(prev_surr_view_imgs_tensor, horizontal=True, title="Horizontally Concatenated Prev")
-
-        
-        # 数据增强
-        if self.augmentor is not None:
-            prev_surr_view_imgs = self.augmentor(prev_surr_view_imgs)
-            curr_surr_view_imgs = self.augmentor(curr_surr_view_imgs)
-
-        gt_scale_map = torch.from_numpy(gt_scale_map).float()
-        gt_risk_score_map = torch.from_numpy(gt_risk_score_map).float()
-        gt_depth_map = torch.from_numpy(gt_depth_map).float()
-
-        # scale 取 (0.3, 3.0) 之间的值
-        mask_scale = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
-        # risk score & depth 取相同的 mask
-        mask_risk_score = mask_scale
-        mask_depth = mask_scale
-        # 拼接gt_scale和mask
-        gt_scale_map_with_mask = torch.cat((gt_scale_map.unsqueeze(0), mask_scale.unsqueeze(0).float()), dim=0)
-        gt_risk_score_map_with_mask = torch.cat((gt_risk_score_map.unsqueeze(0), mask_risk_score.unsqueeze(0).float()), dim=0)
-        gt_depth_map_with_mask = torch.cat((gt_depth_map.unsqueeze(0), mask_depth.unsqueeze(0).float()), dim=0)
-
-        return (prev_surr_view_imgs_tensor,
-                curr_surr_view_imgs_tensor,
-                gt_scale_map_with_mask, # model 的输入以及真值
-                gt_risk_score_map_with_mask, # model 的输入以及真值
-                gt_depth_map_with_mask, # model 的输入以及真值
-                sensor_meta)
-    '''
     def __rmul__(self, v):
-        self.image_list = v * self.image_list
-        self.sensor_meta_list = v * self.sensor_meta_list
-        self.scale_map_list = v * self.scale_map_list
+        self.image_list          = v * self.image_list
+        self.scale_map_list      = v * self.scale_map_list
         self.risk_score_map_list = v * self.risk_score_map_list
-        self.depth_map_list = v * self.depth_map_list
+        self.depth_map_list      = v * self.depth_map_list
+        self.proj_list           = v * self.proj_list
         return self
+
+    def build_frame_mapping(self, frame_key, idx, H_r=40, W_r=480):
+        """
+        读取该帧的相机深度预测结果，以及内外参信息，将其反投影到 LiDAR 坐标系
+        并进行 range projection，得到 range image 的投影坐标
+        以及 (cam_idx, u, v) 到 range image (u, v) 的映射关系
+        该映射关系用于后续的多视角特征融合
+        """
+        all_points = []
+        all_pix    = []
+
+        # 遍历 6 路相机
+        for cam_idx, channel in enumerate(self.camera_channels):
+            # 1) 读取该帧该相机的深度预测
+            depth_pred_path = self.data[idx][f'{frame_key}_camera_data'][channel]['depth_pred']
+            depth_pred_map  = np.load(depth_pred_path)  # (H_img, W_img)
+
+            # 2) 构造内外参与仿射矩阵
+            proj_matrix, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
+                self.data[idx][f'sensor_metas_{frame_key}'],
+                self.data[idx][f'sensor_metas_{frame_key}']['camera']['calibrated_sensor'][channel],
+                self.data[idx][f'sensor_metas_{frame_key}']['camera']['ego_pose'][channel]
+            )
+            sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c}
+            affine_matrix = self.affine_matrix
+
+            # 3) 反投影到 LiDAR 坐标系
+            coords = get_geometry(depth_pred_map, sensor_meta, affine_matrix)  # (H_img, W_img, 3)
+
+            H_img, W_img, _ = coords.shape
+            pts = coords.reshape(-1, 3)
+
+            # 4) 构造 (cam_idx, u, v)
+            u_grid, v_grid = np.meshgrid(np.arange(W_img), np.arange(H_img))
+            cam_idx_arr = np.full((H_img, W_img), cam_idx, dtype=np.int32)
+            pix = np.stack([cam_idx_arr, u_grid, v_grid], axis=-1).reshape(-1, 3)
+
+            # 5) 过滤无效点
+            valid = np.linalg.norm(pts, axis=1) > 0
+            pts   = pts[valid]
+            pix   = pix[valid]
+
+            all_points.append(pts)
+            all_pix.append(pix)
+
+        # 6) 合并所有相机
+        points = np.vstack(all_points)  # (M, 3)
+        pix    = np.vstack(all_pix)     # (M, 3)
+
+        # 7) range 投影并保留映射
+        proj_range, proj_xyz, proj_idx, proj_mask, proj_pix = \
+            range_projection_with_mapping(points, pix, H=H_r, W=W_r,
+                                        fov_up=8.0, fov_down=-15.0)
+        
+        # —— 如果有空洞，就用最近邻填 proj_pix 和 proj_range
+        valid = proj_mask.astype(bool)
+        if not valid.all():
+            # distance_transform_edt on the *holes* mask, get indices of nearest valid
+            # inds shape = (2, H_r, W_r): inds[0] = row indices, inds[1] = col indices
+            _, inds = distance_transform_edt(~valid, return_distances=True, return_indices=True)
+            i_near, j_near = inds  # each is shape (H_r, W_r)
+
+            # fill proj_pix: for each hole (h,w) copy from (i_near[h,w], j_near[h,w])
+            proj_pix = proj_pix[i_near, j_near]
+
+            # 同理，将 proj_range 也补全：
+            proj_range = proj_range[i_near, j_near]
+            proj_mask[:] = 1  # 全都变成有效了
+        
+        # —— 归一化 proj_range 到 [0,1]
+        valid = proj_mask.astype(bool)
+        if valid.any():
+            r_min = proj_range[valid].min()
+            r_max = proj_range[valid].max()
+            proj_range_norm = (proj_range - r_min) / (r_max - r_min + 1e-6)
+        else:
+            proj_range_norm = np.zeros_like(proj_range)
+
+        visualize = True
+        # —— 可视化
+        if visualize and frame_key == 'prev':
+            # only save the normalized prev‐frame range image
+            plt.figure(figsize=(5,4))
+            plt.title("Prev frame - Normalized Range")
+            plt.imshow(proj_range_norm, cmap='jet', vmin=0, vmax=1)
+            plt.axis('off')
+            plt.tight_layout()
+            plt.savefig(f"/mnt/data/fpttc_ground_truth/3_visualization/depth_pred_range/{frame_key}_normalized_range_{idx}.png", bbox_inches='tight', pad_inches=0)
+            plt.close()
+
+        return proj_range, proj_pix
 
 def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
     """ Create the data loader for the corresponding trainign set """
@@ -1116,7 +1010,7 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
 
     elif args.stage == 'nuscenes_range_image':
         aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
-        train_info_file = 'nusc_trainval_infos_160_1920_fov_8_15.pkl'
+        train_info_file = 'nusc_trainval_infos_160_1920_fov_8_15_dpt.pkl'
         train_info_path = './Datasets/nuscenes/2_trainval_test_infos'
 
         nuscenes = nuScenes_range_image(aug_params,

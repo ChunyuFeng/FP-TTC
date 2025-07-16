@@ -14,6 +14,8 @@ import torch.distributed as dist
 import numpy as np
 from utils.dist import is_main_process
 
+import matplotlib.pyplot as plt
+
 class CorrEncoder(nn.Module):
     def __init__(self, dim_in, dim_out):
         super(CorrEncoder, self).__init__()
@@ -55,23 +57,24 @@ class FpTTC(nn.Module):
         
                 # Scale 分支私有网络
         self.featnet   = FeatureNet(num_scales             = num_scales,
-                                          feature_channels       = feature_channels,
-                                          num_head               = num_head, 
-                                          ffn_dim_expansion      = ffn_dim_expansion,
-                                          num_transformer_layers = num_transformer_layers)    
+                                    feature_channels       = feature_channels,
+                                    num_head               = num_head, 
+                                    ffn_dim_expansion      = ffn_dim_expansion,
+                                    num_transformer_layers = num_transformer_layers)    
         self.corrnet   = FlowNet(num_scales                = num_scales,
-                                       feature_channels          = feature_channels,
-                                       upsample_factor           = upsample_factor,
-                                       reg_refine                = reg_refine)        
+                                feature_channels          = feature_channels,
+                                upsample_factor           = upsample_factor,
+                                reg_refine                = reg_refine)        
         self.conv_corr = CorrEncoder(dim_in                = 2,
                                            dim_out               = feature_channels+1) 
-        self.scalenet_singlebranch       = ScaleNet(num_scales               = num_scales,
+        self.scalenet_singlebranch = ScaleNet(num_scales               = num_scales,
                                         feature_channels         = feature_channels,
                                         upsample_factor          = upsample_factor,
                                         num_head                 = 4,
                                         scale_level              = num_scales, 
                                         reg_refine               = reg_refine, 
                                         head_type                = 'scale')
+        
 
         # # Scale 分支私有网络
         # self.featnet_scale   = FeatureNet(num_scales             = num_scales,
@@ -163,7 +166,11 @@ class FpTTC(nn.Module):
     def forward(self,
                 img_prev,
                 img_curr,
-                # affine_matrix,
+                depth_prev,
+                depth_curr,
+                proj_pix_prev,
+                proj_pix_curr,
+                affine_matrix,
                 # idx_uv_prev,
                 # idx_uv_curr,
                 attn_type,
@@ -173,12 +180,23 @@ class FpTTC(nn.Module):
                 num_reg_refine,
                 testing):
 
+        # ### 1）提取输入的多视角图像的底层特征
+        # img0, img1 = normalize_img(img_prev, img_curr)
+        # B, V, C, H_img, W_img = img0.shape
+        # shared_prev, shared_curr = [], []
+        # for view in range(img0.size(1)):
+        #     p, c = self.extract_feature(img0[:, view], img1[:, view], branch=None)
+        #     shared_prev.append(p)
+        #     shared_curr.append(c)
+
         ### 1）提取输入的多视角图像的底层特征
         img0, img1 = normalize_img(img_prev, img_curr)
+        rgbd0 = torch.cat([img0, depth_prev], dim=2)  # [B, V, 4, H, W]
+        rgbd1 = torch.cat([img1, depth_curr], dim=2)  # [B, V, 4, H, W]
         B, V, C, H_img, W_img = img0.shape
         shared_prev, shared_curr = [], []
-        for view in range(img0.size(1)):
-            p, c = self.extract_feature(img0[:, view], img1[:, view], branch=None)
+        for view in range(rgbd0.size(1)):
+            p, c = self.extract_feature(rgbd0[:, view], rgbd1[:, view], branch=None)
             shared_prev.append(p)
             shared_curr.append(c)
 
@@ -251,18 +269,60 @@ class FpTTC(nn.Module):
             corr_s_.append(corr_s)
             mlvl_s0_.append(mlvl_s0)
             mlvl_s1_.append(mlvl_s1)
-        corr_s = torch.cat(corr_s_, dim=3)
-        # 将多视角下 mlvl_s0_、mlvl_s1_ 按 lvl 对应关系，在宽度维度（dim=3）拼接
-        mlvl_s0 = [
-            torch.cat([view_feats[lvl] for view_feats in mlvl_s0_], dim=3)
-            for lvl in range(self.num_scales)
-        ]
-        mlvl_s1 = [
-            torch.cat([view_feats[lvl] for view_feats in mlvl_s1_], dim=3)
-            for lvl in range(self.num_scales)
-        ]
         
+        # 根据 surroud view pixel 和 range view pixel 的投影关系，将 corr_s_ 和 mlvl_s0_/mlvl_s1_ 投影到 range view 上
 
+        # 1）将 corr_s_ 投影到 range view 上
+        # corr_s_ 只有一个尺度        
+        corr_s = self.project_views_to_range(
+            corr_s_,
+            proj_pix_curr,
+            H_img=160, W_img=320
+        )
+
+        # 2）将 mlvl_s0_/mlvl_s1_ 投影到 range view 上
+        # mlvl_s0_ 和 mlvl_s1_ 是多尺度的特征图，分别对应于 s0 和 s1
+        # lvl 1
+        proj_pix_lvl1_prev = proj_pix_prev           # [B,40,480,3]
+        proj_pix_lvl1_curr = proj_pix_curr
+
+        s0_lvl1 = [view_feats[1] for view_feats in mlvl_s0_]
+        s1_lvl1 = [view_feats[1] for view_feats in mlvl_s1_]
+
+        range_s0_lvl1 = self.project_views_to_range(
+            s0_lvl1,
+            proj_pix_lvl1_prev,
+            H_img=160, W_img=320
+        )
+
+        range_s1_lvl1 = self.project_views_to_range(
+            s1_lvl1,
+            proj_pix_lvl1_curr,
+            H_img=160, W_img=320
+        )
+
+        # lvl 0
+        proj_pix_lvl0_prev = proj_pix_prev[:, ::2, ::2, :]  # [B,20,240,3]
+        proj_pix_lvl0_curr = proj_pix_curr[:, ::2, ::2, :]
+
+        s0_lvl0 = [view_feats[0] for view_feats in mlvl_s0_]
+        s1_lvl0 = [view_feats[0] for view_feats in mlvl_s1_]
+
+        range_s0_lvl0 = self.project_views_to_range(
+            s0_lvl0,
+            proj_pix_lvl0_prev,
+            H_img=160, W_img=320
+        )
+
+        range_s1_lvl0 = self.project_views_to_range(
+            s1_lvl0,
+            proj_pix_lvl0_curr,
+            H_img=160, W_img=320
+        )
+
+        mlvl_s0 = [range_s0_lvl0, range_s0_lvl1]
+        mlvl_s1 = [range_s1_lvl0, range_s1_lvl1]   
+        
         corr_enc_s = self.conv_corr(corr_s)
         ini_scale  = F.softplus(corr_enc_s[:, :1]) + 1e-3
         corr_enc_s = corr_enc_s[:, 1:]
@@ -334,7 +394,12 @@ class FpTTC(nn.Module):
             self,
             img_prev,                      # Tensor[B, V, 3, H, W]
             img_curr,                      # Tensor[B, V, 3, H, W]
+            depth_prev,                    # Tensor[B, V, 1, H, W]
+            depth_curr,                    # Tensor[B, V, 1, H, W]
+            proj_pix_prev,
+            proj_pix_curr,
             gt_scale_map_with_mask,        # Tensor[B, 2, H_sph, W_sph]
+            affine_matrix,                 # Tensor[B, 3, 3]
             # gt_risk_score_map_with_mask,   # Tensor[B, 2, H_sph, W_sph]
             # affine_matrix,                 # Tensor[B, 3, 3]
             # idx_uv_prev,                   # Tensor[B, H_sph, W_sph, R, 3]
@@ -350,7 +415,11 @@ class FpTTC(nn.Module):
         scales = self.forward(
             img_prev         = img_prev,
             img_curr         = img_curr,
-            # affine_matrix    = affine_matrix,
+            depth_prev       = depth_prev,
+            depth_curr       = depth_curr,
+            proj_pix_prev    = proj_pix_prev,
+            proj_pix_curr    = proj_pix_curr,
+            affine_matrix    = affine_matrix,
             # idx_uv_prev      = idx_uv_prev,
             # idx_uv_curr      = idx_uv_curr,
             attn_type        = attn_type,
@@ -415,7 +484,79 @@ class FpTTC(nn.Module):
             idx_uv_transformed[..., 2] /= norm_factor
 
         return idx_uv_transformed
+    
 
+    def project_views_to_range(
+        self,
+        features_list,   # list of V tensors, each [B, C, H_feat, W_feat]
+        proj_pix,        # LongTensor [B, H_r, W_r, 3] = (cam_idx, u_orig, v_orig)
+        H_img=160, W_img=320
+    ):
+        """
+        把 V 路视角、同一尺度的特征图，按 proj_pix 映射到 range-view [B, C, H_r, W_r]。
+        """
+        B, H_r, W_r, _ = proj_pix.shape
+        V = len(features_list)
+        C = features_list[0].shape[1]
+        H_feat, W_feat = features_list[0].shape[2], features_list[0].shape[3]
+
+        # 1) 下采样比例
+        s_u = W_feat / W_img
+        s_v = H_feat / H_img
+
+        # 2) 合并成 [B, V, C, Hf, Wf] → [B*V, C, Hf, Wf]
+        feats = torch.stack(features_list, dim=1)         # [B,V,C,Hf,Wf]
+        feats = feats.view(B*V, C, H_feat, W_feat)
+        feats_flat = feats.view(B*V, C, -1)               # [B*V, C, Hf*Wf]
+
+        # 3) 拆出并缩放像素索引
+        cam_idx = proj_pix[..., 0].reshape(B, -1)         # [B, N]
+        u_orig  = proj_pix[..., 1].float().reshape(B, -1) # [B, N]
+        v_orig  = proj_pix[..., 2].float().reshape(B, -1) # [B, N]
+
+        u_feat = (u_orig * s_u).long().clamp(0, W_feat-1) # [B, N]
+        v_feat = (v_orig * s_v).long().clamp(0, H_feat-1) # [B, N]
+
+        # 4) 计算扁平化后的批次＋视角索引
+        #    batch_idx ∈ [0..B) 重复 N 次，拼接 cam_idx → [B*N]
+        batch_idx = torch.arange(B, device=cam_idx.device)\
+                        .unsqueeze(1).repeat(1, H_r*W_r)\
+                        .reshape(-1)
+        view_idx  = batch_idx * V + cam_idx.reshape(-1)   # [B*N]
+
+        # 5) 计算在 Hf*Wf 上的线性化像素
+        pix_idx   = (v_feat * W_feat + u_feat).reshape(-1)  # [B*N]
+
+        # 6) 一次性 gather
+        #    feats_flat[view_idx, :, pix_idx] → [B*N, C]
+        selected = feats_flat[view_idx, :, pix_idx]
+
+        # 7) 重塑回 [B, C, H_r, W_r]
+        range_feat = selected.view(B, H_r*W_r, C) \
+                            .permute(0,2,1) \
+                            .reshape(B, C, H_r, W_r)
+        return range_feat
+    
+def visualize_corr_s(corr_s, title="corr_s projection"):
+    """
+    corr_s: Tensor of shape [B, C, H_r, W_r]
+    """
+    # 1) 选第 0 个 batch
+    x = corr_s[0]  # [C, H_r, W_r]
+
+    # 2) 聚合通道：你可以选单个通道，也可以做平均/最大
+    #    这里我们取通道维度的平均，得到 [H_r, W_r]
+    img = x.mean(dim=0).cpu().detach().numpy()  
+
+    # 3) 画图
+    plt.figure(figsize=(8, 2))
+    plt.title(title + " (mean over channels)")
+    plt.imshow(img, cmap='jet', aspect='auto')  
+    plt.colorbar(fraction=0.046, pad=0.04)
+    plt.xlabel("range width")
+    plt.ylabel("range height")
+    plt.tight_layout()
+    plt.show()
 
 class InnerFeatureFusion(nn.Module):
     """

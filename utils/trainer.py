@@ -162,27 +162,25 @@ class TTCTrainer(object):
         out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
         save_index = 1000
         for i, data in enumerate(self.train_loader):
-
-            # (prev_surr_view_imgs_tensor,
-            #  curr_surr_view_imgs_tensor,
-            #  gt_scale_map_with_mask,
-            #  gt_risk_score_map_with_mask,
-            #  gt_depth_map_with_mask,
-            #  affine_matrix,
-            #  idx_uv_prev_raw,
-            #  idx_uv_curr_raw) = data
             
             (prev_surr_view_imgs_tensor,
              curr_surr_view_imgs_tensor,
-             gt_scale_map_with_mask) = data
+             prev_surr_view_depths_tensor,
+             curr_surr_view_depths_tensor,
+             proj_pix_prev_tensor,
+             proj_pix_curr_tensor,
+             gt_scale_map_with_mask,
+             affine_matrix) = data
             
             prev_surr_view_imgs_tensor  = prev_surr_view_imgs_tensor.to(self.device)
             curr_surr_view_imgs_tensor  = curr_surr_view_imgs_tensor.to(self.device)
+            prev_surr_view_depths_tensor = prev_surr_view_depths_tensor.to(self.device)
+            curr_surr_view_depths_tensor = curr_surr_view_depths_tensor.to(self.device)
+            proj_pix_prev_tensor        = proj_pix_prev_tensor.to(self.device)
+            proj_pix_curr_tensor        = proj_pix_curr_tensor.to(self.device)
             gt_scale_map_with_mask      = gt_scale_map_with_mask.to(self.device)
             # gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.to(self.device)
-            # affine_matrix               = affine_matrix.to(self.device)
-            # idx_uv_prev_raw             = idx_uv_prev_raw.to(self.device)
-            # idx_uv_curr_raw             = idx_uv_curr_raw.to(self.device)
+            affine_matrix               = affine_matrix.to(self.device)
 
             self.optimizer.zero_grad()
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
@@ -222,7 +220,12 @@ class TTCTrainer(object):
                 scale, loss_s = self.model.module.forward_with_loss(
                     img_prev                      = prev_surr_view_imgs_tensor,
                     img_curr                      = curr_surr_view_imgs_tensor,
+                    depth_prev                    = prev_surr_view_depths_tensor,
+                    depth_curr                    = curr_surr_view_depths_tensor,
+                    proj_pix_prev                 = proj_pix_prev_tensor,
+                    proj_pix_curr                 = proj_pix_curr_tensor,
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
+                    affine_matrix                 = affine_matrix,
                     # gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
                     # affine_matrix                 = affine_matrix,
                     # idx_uv_prev                   = idx_uv_prev_raw,
@@ -238,7 +241,12 @@ class TTCTrainer(object):
                 scale, loss_s = self.model.forward_with_loss(
                     img_prev                      = prev_surr_view_imgs_tensor,
                     img_curr                      = curr_surr_view_imgs_tensor,
+                    depth_prev                    = prev_surr_view_depths_tensor,
+                    depth_curr                    = curr_surr_view_depths_tensor,
+                    proj_pix_prev                 = proj_pix_prev_tensor,
+                    proj_pix_curr                 = proj_pix_curr_tensor,
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
+                    affine_matrix                 = affine_matrix,
                     # gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
                     # affine_matrix                 = affine_matrix,
                     # idx_uv_prev                   = idx_uv_prev_raw,
