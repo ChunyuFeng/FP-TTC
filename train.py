@@ -265,9 +265,21 @@ def main():
             sd = checkpoint['state_dict']
         else:
             sd = checkpoint
+        
+        new_sd = {}
+        for k, v in sd.items():
+            if k == 'cnet.conv1.weight':
+                out, c, h, w = v.shape
+                new_w = torch.zeros(out, 4, h, w)
+                new_w[:, :3, :, :] = v                      # 复用原来那 3 个通道
+                new_w[:, 3:4, :, :] = v.mean(dim=1, keepdim=True)  # 第 4 通道取均值
+                new_sd[k] = new_w
+            else:
+                new_sd[k] = v
+
 
         # 2) 载入并接收加载报告
-        load_info = model.load_state_dict(sd, strict=False)
+        load_info = model.load_state_dict(new_sd, strict=False)
 
         # 3) 打印一下各类 key
         if is_main_process():
