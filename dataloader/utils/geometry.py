@@ -245,6 +245,7 @@ def get_geometry(depth_map: np.ndarray,
                  sensor_meta: dict,
                  affine_matrix: np.ndarray) -> np.ndarray:
     """
+    根据深度图和相机内外参，将像素坐标转换为 LiDAR 坐标系下的 XYZ 坐标。
     :param depth_map:    (H, W) 预处理后图像上的深度
     :param sensor_meta:  包含内参和 LiDAR→Camera 外参的字典，格式如下:
                          - 'K'    : 3×3 相机内参

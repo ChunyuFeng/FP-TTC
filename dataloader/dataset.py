@@ -18,7 +18,6 @@ from .utils import frame_utils
 import  cv2
 from .utils.augmentor import FlowAugmentor, SparseFlowAugmentorm, NuscAugmentor, NuscRangeImageAugmentor
 from dataloader.utils.geometry import get_geometry, range_projection_with_mapping
-import open3d as o3d
 import matplotlib.pyplot as plt
 from scipy.ndimage import distance_transform_edt
 from fpttc.scale_net.utils.spherical import build_spherical_voxels, project_voxel_to_camera, build_lidar_to_camera_projection
@@ -775,7 +774,7 @@ class nuScenes_range_image(data.Dataset):
         # 在加载数据集时离线构建 spherical voxel grid
         # 结合 DepthAnything 预测的 Depth Pred Map，提前计算每一个像素坐标对应的 Range View 坐标
 
-        for i in tqdm(range(len(self.data)-1790), desc='Loading nuScenes Range Image Dataset'):
+        for i in tqdm(range(len(self.data) - 1790), desc='Loading nuScenes Range Image Dataset'):
 
             if self.data[i]['scene_indice'] == '10':
                 continue
@@ -795,8 +794,8 @@ class nuScenes_range_image(data.Dataset):
 
             # 3. 环视图像 (cam_idx, u, v) 与 range image (u, v) 之间的映射关系
             #    通过 DepthAnything 预测的 Depth Pred Map + 内外参 计算得到
-            proj_range_prev, proj_pix_prev = self.build_frame_mapping('prev', i, H_r=40, W_r=480)
-            proj_range_curr, proj_pix_curr = self.build_frame_mapping('curr', i, H_r=40, W_r=480)
+            proj_range_prev, proj_pix_prev = build_frame_mapping(self.data, 'nusc', 'prev', self.affine_matrix, i, H_r=40, W_r=480)
+            proj_range_curr, proj_pix_curr = build_frame_mapping(self.data, 'nusc', 'curr', self.affine_matrix, i, H_r=40, W_r=480)
             self.proj_list.append([proj_pix_prev, proj_pix_curr])
 
     def __len__(self):
@@ -891,75 +890,100 @@ class nuScenes_range_image(data.Dataset):
         self.proj_list           = v * self.proj_list
         return self
 
-    def build_frame_mapping(self, frame_key, idx, H_r=40, W_r=480):
-        """
-        读取该帧的相机深度预测结果，以及内外参信息，将其反投影到 LiDAR 坐标系
-        并进行 range projection，得到 range image 的投影坐标
-        以及 (cam_idx, u, v) 到 range image (u, v) 的映射关系
-        该映射关系用于后续的多视角特征融合
-        """
-        all_points = []
-        all_pix    = []
 
-        # 遍历 6 路相机
-        for cam_idx, channel in enumerate(self.camera_channels):
-            # 1) 读取该帧该相机的深度预测
-            depth_pred_path = self.data[idx][f'{frame_key}_camera_data'][channel]['depth_pred']
-            depth_pred_map  = np.load(depth_pred_path)  # (H_img, W_img)
+def build_frame_mapping(data, dataset_key, frame_key, affine_matrix, idx, H_r=40, W_r=480, visualize=False):
+    """
+    读取该帧的相机深度预测结果，以及内外参信息，将其反投影到 LiDAR 坐标系
+    并进行 range projection，得到 range image 的投影坐标
+    以及 (cam_idx, u, v) 到 range image (u, v) 的映射关系
+    该映射关系用于后续的多视角特征融合
+    """
+    camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                       'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+    all_points = []
+    all_pix    = []
 
-            # 2) 构造内外参与仿射矩阵
+    for cam_idx, channel in enumerate(camera_channels):
+        # 1) 读取 idx 帧、cam_idx 相机的 depth pred map
+        depth_pred_path = data[idx][f'{frame_key}_camera_data'][channel]['depth_pred']
+        depth_pred_map  = np.load(depth_pred_path)  # (H_img, W_img)
+
+        # 2) 将 nusc 提供的四元数内参转换为矩阵 K
+        #    将 LiDAR --> Ego_LiDAR_Frame --> Global --> Ego_Camera_Frame --> Camera 的外参投影矩阵合并
+        #    得到 LiDAR --> Camera 的旋转、平移矩阵
+        if dataset_key == 'sjtu':
+            K = data[idx][f'sensor_metas_{frame_key}'][channel]['K_undist']
+            R_l2c = data[idx][f'sensor_metas_{frame_key}'][channel]['R_l2c']
+            t_l2c = data[idx][f'sensor_metas_{frame_key}'][channel]['t_l2c']
+            sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c}
+
+            # 3) 根据深度图和相机内外参，将像素坐标转换为 LiDAR 坐标系下的 XYZ 坐标
+            coords = get_geometry(depth_pred_map, sensor_meta, affine_matrix)  # (H_img, W_img, 3)
+            coords_n = coords.copy() 
+            # 翻转 x、y
+            coords_n[:, :, 0] *= -1            # x_n = -x_local
+            coords_n[:, :, 1] *= -1            # y_n = -y_local
+
+        elif dataset_key == 'nusc':
             proj_matrix, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
-                self.data[idx][f'sensor_metas_{frame_key}'],
-                self.data[idx][f'sensor_metas_{frame_key}']['camera']['calibrated_sensor'][channel],
-                self.data[idx][f'sensor_metas_{frame_key}']['camera']['ego_pose'][channel]
+                data[idx][f'sensor_metas_{frame_key}'],
+                data[idx][f'sensor_metas_{frame_key}']['camera']['calibrated_sensor'][channel],
+                data[idx][f'sensor_metas_{frame_key}']['camera']['ego_pose'][channel]
             )
             sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c}
-            affine_matrix = self.affine_matrix
 
-            # 3) 反投影到 LiDAR 坐标系
+            # 3) 根据深度图和相机内外参，将像素坐标转换为 LiDAR 坐标系下的 XYZ 坐标
             coords = get_geometry(depth_pred_map, sensor_meta, affine_matrix)  # (H_img, W_img, 3)
+            coords_n = coords.copy()   
 
-            H_img, W_img, _ = coords.shape
-            pts = coords.reshape(-1, 3)
+        else:
+            raise ValueError(f"Unsupported dataset key: {dataset_key}")
 
-            # 4) 构造 (cam_idx, u, v)
-            u_grid, v_grid = np.meshgrid(np.arange(W_img), np.arange(H_img))
-            cam_idx_arr = np.full((H_img, W_img), cam_idx, dtype=np.int32)
-            pix = np.stack([cam_idx_arr, u_grid, v_grid], axis=-1).reshape(-1, 3)
+        H_img, W_img, _ = coords_n.shape
+        pts = coords_n.reshape(-1, 3)
 
-            # 5) 过滤无效点
-            valid = np.linalg.norm(pts, axis=1) > 0
-            pts   = pts[valid]
-            pix   = pix[valid]
+        # 4) 构造 (cam_idx, u, v)
+        u_grid, v_grid = np.meshgrid(np.arange(W_img), np.arange(H_img))
+        cam_idx_arr    = np.full((H_img, W_img), cam_idx, dtype=np.int32)
+        pix            = np.stack([cam_idx_arr, u_grid, v_grid], axis=-1).reshape(-1, 3)
 
-            all_points.append(pts)
-            all_pix.append(pix)
+        # 5) 过滤无效点
+        valid = np.linalg.norm(pts, axis=1) > 0
+        pts   = pts[valid]
+        pix   = pix[valid]
 
-        # 6) 合并所有相机
-        points = np.vstack(all_points)  # (M, 3)
-        pix    = np.vstack(all_pix)     # (M, 3)
+        all_points.append(pts)
+        all_pix.append(pix)
 
-        # 7) range 投影并保留映射
-        proj_range, proj_xyz, proj_idx, proj_mask, proj_pix = \
-            range_projection_with_mapping(points, pix, H=H_r, W=W_r,
-                                        fov_up=8.0, fov_down=-15.0)
-        
-        # —— 如果有空洞，就用最近邻填 proj_pix 和 proj_range
-        valid = proj_mask.astype(bool)
-        if not valid.all():
-            # distance_transform_edt on the *holes* mask, get indices of nearest valid
-            # inds shape = (2, H_r, W_r): inds[0] = row indices, inds[1] = col indices
-            _, inds = distance_transform_edt(~valid, return_distances=True, return_indices=True)
-            i_near, j_near = inds  # each is shape (H_r, W_r)
+    # 6) 合并所有相机
+    points = np.vstack(all_points)  # (M, 3)
+    pix    = np.vstack(all_pix)     # (M, 3)
 
-            # fill proj_pix: for each hole (h,w) copy from (i_near[h,w], j_near[h,w])
-            proj_pix = proj_pix[i_near, j_near]
+    # 7) range 投影并保留 (idx, u_rgb, v_rgb) <-> (u_range, v_range) 映射关系
+    proj_range, proj_xyz, proj_idx, proj_mask, proj_pix = \
+        range_projection_with_mapping(points, pix, H=H_r, W=W_r,
+                                    fov_up=8.0, fov_down=-15.0)
+    
+    # 8) 如果有空洞，使用最近邻填补 proj_pix 和 proj_range
+    valid = proj_mask.astype(bool)
+    if not valid.all():
+        # distance_transform_edt on the *holes* mask, get indices of nearest valid
+        # inds shape = (2, H_r, W_r): inds[0] = row indices, inds[1] = col indices
+        _, inds = distance_transform_edt(~valid, return_distances=True, return_indices=True)
+        i_near, j_near = inds  # each is shape (H_r, W_r)
 
-            # 同理，将 proj_range 也补全：
-            proj_range = proj_range[i_near, j_near]
-            proj_mask[:] = 1  # 全都变成有效了
-        
-        # —— 归一化 proj_range 到 [0,1]
+        # fill proj_pix: for each hole (h,w) copy from (i_near[h,w], j_near[h,w])
+        proj_pix = proj_pix[i_near, j_near]
+
+        # 同理，将 proj_range 也补全：
+        proj_range = proj_range[i_near, j_near]
+        proj_mask[:] = 1
+    
+  
+    # 9) 可视化
+    if visualize and frame_key == 'prev':
+
+         # —— 归一化 proj_range 到 [0,1]
         valid = proj_mask.astype(bool)
         if valid.any():
             r_min = proj_range[valid].min()
@@ -968,19 +992,17 @@ class nuScenes_range_image(data.Dataset):
         else:
             proj_range_norm = np.zeros_like(proj_range)
 
-        visualize = True
-        # —— 可视化
-        if visualize and frame_key == 'prev':
-            # only save the normalized prev‐frame range image
-            plt.figure(figsize=(5,4))
-            plt.title("Prev frame - Normalized Range")
-            plt.imshow(proj_range_norm, cmap='jet', vmin=0, vmax=1)
-            plt.axis('off')
-            plt.tight_layout()
-            plt.savefig(f"/mnt/data/fpttc_ground_truth/3_visualization/depth_pred_range/{frame_key}_normalized_range_{idx}.png", bbox_inches='tight', pad_inches=0)
-            plt.close()
+        # only save the normalized prev‐frame range image
+        plt.figure(figsize=(5,4))
+        plt.title("Prev frame - Normalized Range")
+        plt.imshow(proj_range_norm, cmap='jet', vmin=0, vmax=1)
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(f"./Datasets/cyberrock/scene_5/depth_vis/{frame_key}_normalized_range_{idx}.png", bbox_inches='tight', pad_inches=0)
+        plt.close()
 
-        return proj_range, proj_pix
+    return proj_range, proj_pix
+
 
 def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
     """ Create the data loader for the corresponding trainign set """
