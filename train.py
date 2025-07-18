@@ -180,10 +180,6 @@ def main():
                   ffn_dim_expansion      = args.ffn_dim_expansion,
                   num_transformer_layers = args.num_transformer_layers,
                   reg_refine             = args.reg_refine,
-                  radial_sampling        = args.radial_sampling_num,
-                  load_cnet              = args.load_cnet,
-                  pretrained_cnet_path   = args.load_cnet_path,
-                  freeze_cnet            = args.freeze_cnet,
                   train                  = True).cuda()
     
     max_lr = args.lr
@@ -199,57 +195,8 @@ def main():
         }
     ],
     lr=max_lr, weight_decay=args.weight_decay)
-    
-    if args.load_cnet and args.fine_tune_cnet:
-        ########################### 微调 cnet ############################
-        net = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        
-        # 为 cnet 设置更小的学习率，仅仅微调
-        cnet_lr = max_lr * 0.1
-        cnet_ini_lr = ini_lr * 0.1
-        cnet_min_lr = min_lr * 0.1
-
-        other_lr = max_lr
-        other_ini_lr = ini_lr
-        other_min_lr = min_lr
-
-        optimizer = torch.optim.AdamW([
-            {
-                "params": net.cnet.parameters(),
-                "max_lr": cnet_lr,
-                "initial_lr": cnet_ini_lr,
-                "min_lr": cnet_min_lr
-            },
-            {
-                "params": [p for n,p in net.named_parameters() if not n.startswith("cnet.")],
-                "max_lr": other_lr,
-                "initial_lr": other_ini_lr,
-                "min_lr": other_min_lr
-            },
-        ],
-        lr=max_lr, weight_decay=args.weight_decay)
-        ########################### 微调 cnet ############################
 
     epoch = 0
-
-    '''
-    # if args.resume is not None:
-    #     checkpoint = torch.load(args.resume, map_location=device)
-    #     if args.load_opt:
-    #         epoch = checkpoint['epoch']
-    #         optimizer.load_state_dict(checkpoint['optimizer'])
-
-    #     if 'model' in checkpoint:
-    #         model.load_state_dict(checkpoint['model'])
-    #     elif 'net' in checkpoint:
-    #         # model.load_state_dict(data['net'])
-    #         #print(data['net'].items())
-    #         model.load_state_dict({k.replace('module.', ''): v for k, v in checkpoint['net'].items()})
-    #     elif 'state_dict' in checkpoint:
-    #         model.load_state_dict(checkpoint['state_dict'])
-    #     else:
-    #         model.load_state_dict(checkpoint)
-    '''
 
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device)
@@ -268,14 +215,24 @@ def main():
         
         new_sd = {}
         for k, v in sd.items():
+            new_sd[k] = v
+            # 这一层的输入由 RGB 改为 RGBD
+            # 如果是 cnet.conv1.weight，就把它的第 4 个通道设置为原来 3 个通道的均值
             if k == 'cnet.conv1.weight':
                 out, c, h, w = v.shape
                 new_w = torch.zeros(out, 4, h, w)
                 new_w[:, :3, :, :] = v                      # 复用原来那 3 个通道
                 new_w[:, 3:4, :, :] = v.mean(dim=1, keepdim=True)  # 第 4 通道取均值
                 new_sd[k] = new_w
-            else:
-                new_sd[k] = v
+            # 如果是 featnet 的权重，就也复制到 featnet_risk
+            if k.startswith("featnet."):
+                new_sd["featnet_risk." + k[len("featnet."):]] = v
+            # corrnet → corrnet_risk
+            if k.startswith("corrnet."):
+                new_sd["corrnet_risk." + k[len("corrnet."):]] = v
+            # conv_corr → conv_corr_risk
+            if k.startswith("conv_corr."):
+                new_sd["conv_corr_risk." + k[len("conv_corr."):]] = v
 
 
         # 2) 载入并接收加载报告

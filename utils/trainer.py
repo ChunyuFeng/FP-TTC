@@ -170,54 +170,22 @@ class TTCTrainer(object):
              proj_pix_prev_tensor,
              proj_pix_curr_tensor,
              gt_scale_map_with_mask,
-             affine_matrix) = data
+             gt_risk_score_map_with_mask) = data
             
-            prev_surr_view_imgs_tensor  = prev_surr_view_imgs_tensor.to(self.device)
-            curr_surr_view_imgs_tensor  = curr_surr_view_imgs_tensor.to(self.device)
+            prev_surr_view_imgs_tensor   = prev_surr_view_imgs_tensor.to(self.device)
+            curr_surr_view_imgs_tensor   = curr_surr_view_imgs_tensor.to(self.device)
             prev_surr_view_depths_tensor = prev_surr_view_depths_tensor.to(self.device)
             curr_surr_view_depths_tensor = curr_surr_view_depths_tensor.to(self.device)
-            proj_pix_prev_tensor        = proj_pix_prev_tensor.to(self.device)
-            proj_pix_curr_tensor        = proj_pix_curr_tensor.to(self.device)
-            gt_scale_map_with_mask      = gt_scale_map_with_mask.to(self.device)
-            # gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.to(self.device)
-            affine_matrix               = affine_matrix.to(self.device)
+            proj_pix_prev_tensor         = proj_pix_prev_tensor.to(self.device)
+            proj_pix_curr_tensor         = proj_pix_curr_tensor.to(self.device)
+            gt_scale_map_with_mask       = gt_scale_map_with_mask.to(self.device)
+            gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
+            # affine_matrix                = affine_matrix.to(self.device)
 
             self.optimizer.zero_grad()
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
-            # if hasattr(self.model, "module"):
-            #     scale, risk_score, loss_s, loss_r = self.model.module.forward_with_loss(
-            #         img_prev                      = prev_surr_view_imgs_tensor,
-            #         img_curr                      = curr_surr_view_imgs_tensor,
-            #         gt_scale_map_with_mask        = gt_scale_map_with_mask,
-            #         gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
-            #         affine_matrix                 = affine_matrix,
-            #         idx_uv_prev                   = idx_uv_prev_raw,
-            #         idx_uv_curr                   = idx_uv_curr_raw,
-            #         attn_type                     = self.attn_type,
-            #         attn_splits_list              = self.attn_splits_list,
-            #         corr_radius_list              = self.corr_radius_list,
-            #         prop_radius_list              = self.prop_radius_list,
-            #         num_reg_refine                = self.num_reg_refine,
-            #         testing                       = False
-            #     )
-            # else:
-            #     scale, risk_score, loss_s, loss_r = self.model.forward_with_loss(
-            #         img_prev                      = prev_surr_view_imgs_tensor,
-            #         img_curr                      = curr_surr_view_imgs_tensor,
-            #         gt_scale_map_with_mask        = gt_scale_map_with_mask,
-            #         gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
-            #         affine_matrix                 = affine_matrix,
-            #         idx_uv_prev                   = idx_uv_prev_raw,
-            #         idx_uv_curr                   = idx_uv_curr_raw,
-            #         attn_type                     = self.attn_type,
-            #         attn_splits_list              = self.attn_splits_list,
-            #         corr_radius_list              = self.corr_radius_list,
-            #         prop_radius_list              = self.prop_radius_list,
-            #         num_reg_refine                = self.num_reg_refine,
-            #         testing                       = False
-            #     )
             if hasattr(self.model, "module"):
-                scale, loss_s = self.model.module.forward_with_loss(
+                scale, risk_score, loss_s, loss_r = self.model.module.forward_with_loss(
                     img_prev                      = prev_surr_view_imgs_tensor,
                     img_curr                      = curr_surr_view_imgs_tensor,
                     depth_prev                    = prev_surr_view_depths_tensor,
@@ -225,11 +193,7 @@ class TTCTrainer(object):
                     proj_pix_prev                 = proj_pix_prev_tensor,
                     proj_pix_curr                 = proj_pix_curr_tensor,
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
-                    affine_matrix                 = affine_matrix,
-                    # gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
-                    # affine_matrix                 = affine_matrix,
-                    # idx_uv_prev                   = idx_uv_prev_raw,
-                    # idx_uv_curr                   = idx_uv_curr_raw,
+                    gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
                     attn_type                     = self.attn_type,
                     attn_splits_list              = self.attn_splits_list,
                     corr_radius_list              = self.corr_radius_list,
@@ -238,7 +202,7 @@ class TTCTrainer(object):
                     testing                       = False
                 )
             else:
-                scale, loss_s = self.model.forward_with_loss(
+                scale, risk_score, loss_s, loss_r = self.model.forward_with_loss(
                     img_prev                      = prev_surr_view_imgs_tensor,
                     img_curr                      = curr_surr_view_imgs_tensor,
                     depth_prev                    = prev_surr_view_depths_tensor,
@@ -246,11 +210,7 @@ class TTCTrainer(object):
                     proj_pix_prev                 = proj_pix_prev_tensor,
                     proj_pix_curr                 = proj_pix_curr_tensor,
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
-                    affine_matrix                 = affine_matrix,
-                    # gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
-                    # affine_matrix                 = affine_matrix,
-                    # idx_uv_prev                   = idx_uv_prev_raw,
-                    # idx_uv_curr                   = idx_uv_curr_raw,
+                    gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
                     attn_type                     = self.attn_type,
                     attn_splits_list              = self.attn_splits_list,
                     corr_radius_list              = self.corr_radius_list,
@@ -258,24 +218,28 @@ class TTCTrainer(object):
                     num_reg_refine                = self.num_reg_refine,
                     testing                       = False
                 )
-            loss_last = None
-            loss = loss_s
-            # # 根据 scale 和 risk 分支的梯度范数，动态计算 loss 权重
-            # scale_keys = [
-            #     "featnet_scale",
-            #     "corrnet_scale",
-            #     "conv_corr_scale",
-            #     "scale_net"
-            # ]
-            # risk_keys = [k.replace("scale", "risk") for k in scale_keys]
-            # model_ref = getattr(self.model, "module", self.model)
-            # loss, w_s, w_r = self._weighted_loss(
-            #     keys_s    = scale_keys,
-            #     keys_r    = risk_keys,
-            #     loss_s    = loss_s,
-            #     loss_r    = loss_r,
-            #     model_ref = model_ref
-            # )
+            
+            # 根据 scale 和 risk 分支的梯度范数，动态计算 loss 权重
+            scale_keys = [
+                "featnet.",      # FeatureNet 主分支
+                "corrnet.",      # FlowNet 主分支
+                "conv_corr.",    # CorrEncoder 主分支
+                "scale_net."     # ScaleNet 主分支
+            ]
+            risk_keys = [
+                "featnet_risk.",   # FeatureNet 风险分支
+                "corrnet_risk.",   # FlowNet 风险分支
+                "conv_corr_risk.", # CorrEncoder 风险分支
+                "risk_net."        # RiskNet 分支
+            ]
+            model_ref = getattr(self.model, "module", self.model)
+            loss, w_s, w_r = self._weighted_loss(
+                keys_s    = scale_keys,
+                keys_r    = risk_keys,
+                loss_s    = loss_s,
+                loss_r    = loss_r,
+                model_ref = model_ref
+            )
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
@@ -301,20 +265,21 @@ class TTCTrainer(object):
                 pred_valid_mask = scale_np > 0
                 normalized_pred = visual_scale_map_range_image(scale_np, pred_valid_mask)
 
-                # # 可视化 risk_score 和 gt_risk_score
-                # gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
-                # gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
-                # normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np)
+                # 可视化 risk_score 和 gt_risk_score
+                gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
+                gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
+                normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np)
 
-                # risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
-                # normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np)
+                risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
+                normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np)
 
                 # 保存可视化结果
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
-                # plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), normalized_pred_risk_score, cmap='seismic', vmin=-1, vmax=1)
-                # plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), normalized_gt_risk_score, cmap='seismic', vmin=-1, vmax=1)
+                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), normalized_pred_risk_score, cmap='seismic', vmin=-1, vmax=1)
+                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), normalized_gt_risk_score, cmap='seismic', vmin=-1, vmax=1)
 
+            loss_last = None
             # If an auxiliary loss (loss_last) is available, use it for reporting.
             if loss_last is not None:
                 self.loss_per_epoch += loss.item()
@@ -341,8 +306,8 @@ class TTCTrainer(object):
             global_step = epoch * len(self.train_loader) + i
             if self.neptune_run is not None and is_main_process():
                 self.neptune_run["train/batch_loss"].append(loss.item(), step=global_step)
-                # self.neptune_run["train/batch_loss_scale"].append(loss_s.item(), step=global_step)
-                # self.neptune_run["train/batch_loss_risk"].append(loss_r.item(), step=global_step)
+                self.neptune_run["train/batch_loss_scale"].append(loss_s.item(), step=global_step)
+                self.neptune_run["train/batch_loss_risk"].append(loss_r.item(), step=global_step)
             if self.neptune_run is not None and is_main_process():
                 for group_idx, pg in enumerate(self.optimizer.param_groups):
                     tag = f"train/batch_learning_rate_group_{group_idx}"

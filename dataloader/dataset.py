@@ -774,7 +774,7 @@ class nuScenes_range_image(data.Dataset):
         # 在加载数据集时离线构建 spherical voxel grid
         # 结合 DepthAnything 预测的 Depth Pred Map，提前计算每一个像素坐标对应的 Range View 坐标
 
-        for i in tqdm(range(len(self.data) - 1790), desc='Loading nuScenes Range Image Dataset'):
+        for i in tqdm(range(len(self.data)), desc='Loading nuScenes Range Image Dataset'):
 
             if self.data[i]['scene_indice'] == '10':
                 continue
@@ -865,6 +865,7 @@ class nuScenes_range_image(data.Dataset):
         gt_depth_map = torch.from_numpy(gt_depth_map).float()
         mask_scale = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
         gt_scale_map_with_mask = torch.cat((gt_scale_map.unsqueeze(0), mask_scale.unsqueeze(0).float()), dim=0)
+        gt_risk_map_with_mask  = torch.cat((gt_risk_score_map.unsqueeze(0), mask_scale.unsqueeze(0).float()), dim=0)
 
         # 3）将 (cam_idx, u, v) 到 range image (u, v) 的映射关系转换为 Tensor
         proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
@@ -880,7 +881,7 @@ class nuScenes_range_image(data.Dataset):
                 proj_pix_prev_tensor,
                 proj_pix_curr_tensor,
                 gt_scale_map_with_mask,
-                affine_matrix)
+                gt_risk_map_with_mask)
 
     def __rmul__(self, v):
         self.image_list          = v * self.image_list
