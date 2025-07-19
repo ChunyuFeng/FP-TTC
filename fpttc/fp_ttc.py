@@ -44,50 +44,40 @@ class FpTTC(nn.Module):
         self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                                 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
 
-        # 仅底层共享：CNNEncoder
-        self.cnet = CNNEncoder(output_dim=feature_channels, num_output_scales=num_scales)
-
+        self.cnet = CNNEncoder(output_dim        = feature_channels, 
+                               num_output_scales = num_scales)
         
-        # Scale 分支
-        self.featnet   = FeatureNet(num_scales             = num_scales,
-                                    feature_channels       = feature_channels,
-                                    num_head               = num_head, 
-                                    ffn_dim_expansion      = ffn_dim_expansion,
-                                    num_transformer_layers = num_transformer_layers)    
-        self.corrnet   = FlowNet(num_scales                = num_scales,
-                                 feature_channels          = feature_channels,
-                                 upsample_factor           = upsample_factor,
-                                 reg_refine                = reg_refine)        
-        self.conv_corr = CorrEncoder(dim_in                = 2,
-                                     dim_out               = feature_channels+1) 
-        self.scale_net  = ScaleNet(num_scales              = num_scales,
-                                  feature_channels         = feature_channels,
-                                  upsample_factor          = upsample_factor,
-                                  num_head                 = 4,
-                                  scale_level              = num_scales, 
-                                  reg_refine               = reg_refine, 
-                                  head_type                = 'scale')
+        self.featnet = FeatureNet(num_scales             = num_scales,
+                                  feature_channels       = feature_channels,
+                                  num_head               = num_head, 
+                                  ffn_dim_expansion      = ffn_dim_expansion,
+                                  num_transformer_layers = num_transformer_layers)   
+         
+        self.corrnet = FlowNet(num_scales       = num_scales,
+                               feature_channels = feature_channels,
+                               upsample_factor  = upsample_factor,
+                               reg_refine       = reg_refine) 
         
+        self.conv_corr = CorrEncoder(dim_in  = 2,
+                                     dim_out = feature_channels+1)
+        self.scale_net = ScaleNet(num_scales      = num_scales,
+                                 feature_channels = feature_channels,
+                                 upsample_factor  = upsample_factor,
+                                 num_head         = 4,
+                                 scale_level      = num_scales, 
+                                 reg_refine       = reg_refine, 
+                                 head_type        = 'scale')
 
         # Risk 分支
-        self.featnet_risk    = FeatureNet(num_scales             = num_scales,
-                                          feature_channels       = feature_channels,
-                                          num_head               = num_head, 
-                                          ffn_dim_expansion      = ffn_dim_expansion,
-                                          num_transformer_layers = num_transformer_layers)
-        self.corrnet_risk    = FlowNet(num_scales                = num_scales,
-                                       feature_channels          = feature_channels,
-                                       upsample_factor           = upsample_factor,
-                                       reg_refine                = reg_refine)
-        self.conv_corr_risk  = CorrEncoder(dim_in                = 2,
-                                           dim_out               = feature_channels+1)
-        self.risk_net         = ScaleNet(num_scales              = num_scales,
-                                        feature_channels         = feature_channels,
-                                        upsample_factor          = upsample_factor,
-                                        num_head                 = 4,
-                                        scale_level              = num_scales, 
-                                        reg_refine               = reg_refine, 
-                                        head_type                = 'risk')
+        self.conv_corr_risk = CorrEncoder(dim_in  = 2,
+                                          dim_out = feature_channels+1)
+        self.risk_net = ScaleNet(num_scales       = num_scales,
+                                 feature_channels = feature_channels,
+                                 upsample_factor  = upsample_factor,
+                                 num_head         = 4,
+                                 scale_level      = num_scales, 
+                                 reg_refine       = reg_refine, 
+                                 head_type        = 'risk')
         
 
     def forward(self,
@@ -112,88 +102,6 @@ class FpTTC(nn.Module):
             shared_prev.append(p)
             shared_curr.append(c)
 
-        # === Scale 分支 ===
-        corr_features_s = []
-        multi_level_feats_prev_s = []
-        multi_level_feats_curr_s = []
-
-        for prev_lvls, curr_lvls in zip(shared_prev, shared_curr):
-            corr = None
-            lvl_feats_prev = []
-            lvl_feats_curr = []
-            # 多尺度特征融合与相关性计算
-            for lvl in range(self.num_scales):
-                prev_feat = prev_lvls[lvl]
-                curr_feat = curr_lvls[lvl]
-                # 1. 前后帧特征融合
-                fused_prev, fused_curr = self.featnet(
-                    prev_feat, curr_feat, lvl, 
-                    attn_type, attn_splits_list, 
-                    corr
-                )
-                lvl_feats_prev.append(fused_prev)
-                lvl_feats_curr.append(fused_curr)
-                # 2. 计算前后帧特征图的相关性
-                corr, _ = self.corrnet(
-                    fused_prev, fused_curr, lvl, 
-                    corr_radius_list, prop_radius_list, 
-                    num_reg_refine, False, corr
-                )
-                # 3. 如果不是最后一个尺度，则将 correlation map 上采样
-                if lvl < self.num_scales - 1:
-                    corr = F.interpolate(
-                        corr, scale_factor=2, 
-                        mode='bilinear', align_corners=True
-                    ) * 2
-            corr_features_s.append(corr)
-            multi_level_feats_prev_s.append(lvl_feats_prev)
-            multi_level_feats_curr_s.append(lvl_feats_curr)
-
-        # 1) 投影 scale 分支 corr 特征到 range-view
-        corr_range_s = self.project_views_to_range(
-            corr_features_s, proj_pix_curr,
-            H_img=160, W_img=320
-        )
-
-        # 2) 将多层多视角特征投影到 range-view
-        multi_level_ranges_prev_s = []
-        multi_level_ranges_curr_s = []
-        for lvl in range(self.num_scales):   
-            scale = 2 ** (self.num_scales - 1 - lvl)
-            proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
-            proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
-
-            prev_feats = [feats[lvl] for feats in multi_level_feats_prev_s]
-            curr_feats = [feats[lvl] for feats in multi_level_feats_curr_s]
-
-            range_prev = self.project_views_to_range(
-                prev_feats, proj_prev_lvl,
-                H_img=160, W_img=320
-            )
-            range_curr = self.project_views_to_range(
-                curr_feats, proj_curr_lvl,
-                H_img=160, W_img=320
-            )
-
-            multi_level_ranges_prev_s.append(range_prev)
-            multi_level_ranges_curr_s.append(range_curr)
-
-        # 3) 编码并预测尺度分支输出
-        corr_encoded_s = self.conv_corr(corr_range_s)
-        initial_scale = F.softplus(corr_encoded_s[:, :1]) + 1e-3
-        corr_encoded_s = corr_encoded_s[:, 1:]
-        scales = self.scale_net(
-            corr_encoded_s,
-            multi_level_ranges_prev_s,
-            multi_level_ranges_curr_s,
-            initial_scale
-        )
-
-        # 清理 scale 分支临时变量
-        del corr_range_s, multi_level_ranges_prev_s, multi_level_ranges_curr_s
-        del prev_lvls, curr_lvls
-
-        # === Risk 分支 ===
         corr_features = []
         multi_level_feats_prev = []
         multi_level_feats_curr = []
@@ -207,7 +115,7 @@ class FpTTC(nn.Module):
                 prev_feat = prev_lvls[lvl]
                 curr_feat = curr_lvls[lvl]
                 # 1. 前后帧特征融合
-                fused_prev, fused_curr = self.featnet_risk(
+                fused_prev, fused_curr = self.featnet(
                     prev_feat, curr_feat,
                     lvl, attn_type, attn_splits_list,
                     corr
@@ -215,7 +123,7 @@ class FpTTC(nn.Module):
                 lvl_feats_prev.append(fused_prev)
                 lvl_feats_curr.append(fused_curr)
                 # 2. 计算前后帧特征图的相关性
-                corr, _ = self.corrnet_risk(
+                corr, _ = self.corrnet(
                     fused_prev, fused_curr,
                     lvl, corr_radius_list, prop_radius_list,
                     num_reg_refine, False, corr
@@ -236,7 +144,7 @@ class FpTTC(nn.Module):
             H_img=160, W_img=320
         )
 
-        # 2) 通用多层多视角特征投影（risk）
+        # 2) multi-lvl、multi-view 特征投影
         multi_level_ranges_prev = []
         multi_level_ranges_curr = []
         for lvl in range(self.num_scales):
@@ -264,6 +172,17 @@ class FpTTC(nn.Module):
             multi_level_ranges_curr.append(range_curr)
 
         # 3) 编码并预测风险分支输出
+        # scale 分支
+        corr_encoded_s = self.conv_corr(corr_range)
+        initial_scale = F.softplus(corr_encoded_s[:, :1]) + 1e-3
+        corr_encoded_s = corr_encoded_s[:, 1:]
+        scales = self.scale_net(
+            corr_encoded_s,
+            multi_level_ranges_prev,
+            multi_level_ranges_curr,
+            initial_scale
+        )
+        # risk 分支
         corr_encoded = self.conv_corr_risk(corr_range)
         initial_risk = corr_encoded[:, :1]
         corr_encoded = corr_encoded[:, 1:]
@@ -273,10 +192,6 @@ class FpTTC(nn.Module):
             multi_level_ranges_curr,
             initial_risk
         )
-
-        # 清理 risk 分支临时变量
-        del corr_range, multi_level_ranges_prev, multi_level_ranges_curr
-        del prev_lvls, curr_lvls
 
         return scales, risk_score
 
@@ -312,9 +227,9 @@ class FpTTC(nn.Module):
             num_reg_refine   = num_reg_refine,
             testing          = testing
         )
-        loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
+        # loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
         loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
-        return scales, risks, loss_s, loss_r
+        return scales, risks, loss_r
 
     def extract_feature(self, im0, im1, branch):
         x = torch.cat([im0, im1], dim=0)

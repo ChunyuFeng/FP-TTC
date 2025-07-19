@@ -58,28 +58,16 @@ class TTCTrainer(object):
         if self.start_epoch>0:
             starte = self.start_epoch - 1
         
-        if args.load_cnet and args.fine_tune_cnet:
-            self.lr_scheduler3 = torch.optim.lr_scheduler.OneCycleLR(
-                self.optimizer,
-                max_lr=[max_lr*0.1, max_lr], # 微调 cnet 的学习率，以及其他模型正常学习率
-                epochs=self.epoch,
-                steps_per_epoch=steps_per_epoch,
-                pct_start=0.05,
-                cycle_momentum=False,
-                anneal_strategy='cos',
-                last_epoch=max(steps_per_epoch*starte,-1),
-            )
-        else:
-            self.lr_scheduler3 = torch.optim.lr_scheduler.OneCycleLR(
-                self.optimizer,
-                max_lr=max_lr,
-                epochs=self.epoch,
-                steps_per_epoch=steps_per_epoch,
-                pct_start=0.05,
-                cycle_momentum=False,
-                anneal_strategy='cos',
-                last_epoch=max(steps_per_epoch*starte,-1),
-            )
+        self.lr_scheduler3 = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=max_lr,
+            epochs=self.epoch,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=0.05,
+            cycle_momentum=False,
+            anneal_strategy='cos',
+            last_epoch=max(steps_per_epoch*starte,-1),
+        )
 
         self.device = device
         self.train_loss_history = []
@@ -185,7 +173,7 @@ class TTCTrainer(object):
             self.optimizer.zero_grad()
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
             if hasattr(self.model, "module"):
-                scale, risk_score, loss_s, loss_r = self.model.module.forward_with_loss(
+                scale, risk_score, loss_r = self.model.module.forward_with_loss(
                     img_prev                      = prev_surr_view_imgs_tensor,
                     img_curr                      = curr_surr_view_imgs_tensor,
                     depth_prev                    = prev_surr_view_depths_tensor,
@@ -202,7 +190,7 @@ class TTCTrainer(object):
                     testing                       = False
                 )
             else:
-                scale, risk_score, loss_s, loss_r = self.model.forward_with_loss(
+                scale, risk_score, loss_r = self.model.forward_with_loss(
                     img_prev                      = prev_surr_view_imgs_tensor,
                     img_curr                      = curr_surr_view_imgs_tensor,
                     depth_prev                    = prev_surr_view_depths_tensor,
@@ -219,27 +207,28 @@ class TTCTrainer(object):
                     testing                       = False
                 )
             
-            # 根据 scale 和 risk 分支的梯度范数，动态计算 loss 权重
-            scale_keys = [
-                "featnet.",      # FeatureNet 主分支
-                "corrnet.",      # FlowNet 主分支
-                "conv_corr.",    # CorrEncoder 主分支
-                "scale_net."     # ScaleNet 主分支
-            ]
-            risk_keys = [
-                "featnet_risk.",   # FeatureNet 风险分支
-                "corrnet_risk.",   # FlowNet 风险分支
-                "conv_corr_risk.", # CorrEncoder 风险分支
-                "risk_net."        # RiskNet 分支
-            ]
-            model_ref = getattr(self.model, "module", self.model)
-            loss, w_s, w_r = self._weighted_loss(
-                keys_s    = scale_keys,
-                keys_r    = risk_keys,
-                loss_s    = loss_s,
-                loss_r    = loss_r,
-                model_ref = model_ref
-            )
+            # # 根据 scale 和 risk 分支的梯度范数，动态计算 loss 权重
+            # scale_keys = [
+            #     "featnet.",      # FeatureNet 主分支
+            #     "corrnet.",      # FlowNet 主分支
+            #     "conv_corr.",    # CorrEncoder 主分支
+            #     "scale_net."     # ScaleNet 主分支
+            # ]
+            # risk_keys = [
+            #     "featnet_risk.",   # FeatureNet 风险分支
+            #     "corrnet_risk.",   # FlowNet 风险分支
+            #     "conv_corr_risk.", # CorrEncoder 风险分支
+            #     "risk_net."        # RiskNet 分支
+            # ]
+            # model_ref = getattr(self.model, "module", self.model)
+            # loss, w_s, w_r = self._weighted_loss(
+            #     keys_s    = scale_keys,
+            #     keys_r    = risk_keys,
+            #     loss_s    = loss_s,
+            #     loss_r    = loss_r,
+            #     model_ref = model_ref
+            # )
+            loss = loss_r
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
