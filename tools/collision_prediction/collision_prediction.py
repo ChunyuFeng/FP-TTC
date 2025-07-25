@@ -11,6 +11,10 @@ import matplotlib.cm as mpl_cm
 import matplotlib.pyplot as plt
 from PIL import Image
 import datetime
+import mplcursors
+import random
+
+from dataloader.utils.augmentor import NuscRangeImageAugmentor
 
 from utils.draw import (
     visual_scale_map_range_image,
@@ -67,8 +71,177 @@ def parse_args():
                         help='Path to test info file (e.g., nusc_trainval_infos_160_1920.pkl)')
     parser.add_argument("--vis_dir", type=str, required=True,
                         help="Output directory for RGB overlays")
+    parser.add_argument("--sjtu_test", action="store_true",
+                        help="Use SJTU test set, which has no ground truth data")
+    parser.add_argument("--sjtu_surround_view_path", type=str, default='./Datasets/sjtu_surround_view',
+                        help="Path to SJTU surround view images")
+    parser.add_argument("--sjtu_scene_indice", type=int, default=0,
+                        help="Scene index for SJTU test set, default is 0")
     return parser.parse_args()
 
+def inspect_scale_risk(scale_map, risk_map):
+    """
+    弹出一个 1×2 的窗口：
+     - 左图显示原始 scale_map，鼠标 hover 即可查看 scale 值
+     - 右图显示原始 risk_map，鼠标 hover 即可查看 risk 值
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    im0 = axes[0].imshow(scale_map, cmap='viridis')
+    axes[0].set_title('Scale Map')
+    axes[0].axis('off')
+    im1 = axes[1].imshow(risk_map, cmap='inferno')
+    axes[1].set_title('Risk Map')
+    axes[1].axis('off')
+    plt.tight_layout()
+
+    # scale hover
+    cursor0 = mplcursors.cursor(im0, hover=True)
+    @cursor0.connect("add")
+    def _(sel):
+        x, y = int(sel.target[0]+0.5), int(sel.target[1]+0.5)
+        sel.annotation.set_text(f"({x},{y})  scale={scale_map[y,x]:.3f}")
+
+    # risk hover
+    cursor1 = mplcursors.cursor(im1, hover=True)
+    @cursor1.connect("add")
+    def _(sel):
+        x, y = int(sel.target[0]+0.5), int(sel.target[1]+0.5)
+        sel.annotation.set_text(f"({x},{y})  risk ={risk_map[y,x]:.3f}")
+
+    plt.show()
+
+def compute_and_save_masks(scale_map, risk_map, delta_t, ttc_thresh, risk_thresh, save_dir, idx):
+    """
+    计算两个 mask 后，将它们以二值图形式保存到磁盘：
+      mask_ttc： ttc = delta_t/(1-scale_map) < ttc_thresh
+      mask_risk：risk_map > risk_thresh
+    save_dir:  输出目录
+    idx:       用于文件命名的帧索引
+    返回:
+      mask_ttc, mask_risk （布尔数组）
+    """
+    eps = 1e-5
+    # 1) 计算 ttc 和两个 mask
+    ttc       = delta_t / (1.0 - scale_map + eps)
+    mask_ttc  = (ttc       < ttc_thresh)
+    mask_risk = (risk_map  > risk_thresh)
+    # 2) 转为 0/255 的 uint8 图
+    ttc_img  = (mask_ttc .astype(np.uint8) * 255)
+    risk_img = (mask_risk.astype(np.uint8) * 255)
+    # 3) 确保目录存在并保存
+    os.makedirs(save_dir, exist_ok=True)
+    cv2.imwrite(os.path.join(save_dir, f"mask_ttc_{idx}.png"),  ttc_img)
+    cv2.imwrite(os.path.join(save_dir, f"mask_risk_{idx}.png"), risk_img)
+    return mask_ttc, mask_risk
+
+
+def compute_and_save_percentile_masks_and_compose(
+    scale_map, risk_map,
+    save_dir, idx
+):
+    """
+    1) 在 scale_map 的子区域（纵向 30%~90%，横向 10%~90%）中，
+       分别计算最小 3% 阈值 thr_scale 和最大 3% 阈值 thr_risk。
+    2) 只在该子区域内生成 mask_scale_low3 与 mask_risk_high3，
+       子区域外均为 False。并计算二者交集 mask_intersect。
+    3) 纵向拼接 5 幅图并保存，并在左上角标注 thr_scale 和 thr_risk：
+       [全量 scale]
+       [scale ≤ thr_scale]
+       [scale ∧ risk 交集]
+       [全量 risk]
+       [risk ≥ thr_risk]
+    """
+    H, W = scale_map.shape
+    # 子区域 ROI
+    y1, y2 = int(0.3*H), int(0.9*H)
+    x1, x2 = int(0.1*W), int(0.9*W)
+    sub_scale = scale_map[y1:y2, x1:x2]
+    sub_risk  = risk_map [y1:y2, x1:x2]
+
+    # 1) 子区域百分位阈值
+    thr_scale = np.percentile(sub_scale, 10)   # 最小 3%
+    thr_risk  = np.percentile(sub_risk,  70) # 最大 3%
+    # thr_scale = 0.990
+    # thr_risk = 0.03
+
+    # 2) 在全图上生成 mask
+    mask_scale_low3 = np.zeros_like(scale_map, dtype=bool)
+    mask_risk_high3 = np.zeros_like(risk_map,  dtype=bool)
+    mask_scale_low3[y1:y2, x1:x2] = (sub_scale <= thr_scale)
+    mask_risk_high3[y1:y2, x1:x2] = (sub_risk  >= thr_risk)
+    mask_intersect  = mask_scale_low3 & mask_risk_high3
+
+    # 3) 准备 5 幅 disp 图
+    default_mask = (scale_map > 0.3) & (scale_map < 3.0)
+    disp0 = -visual_scale_map_range_image(scale_map, default_mask)
+    disp1 = -visual_scale_map_range_image(scale_map, mask_scale_low3)
+    disp2 = -visual_scale_map_range_image(scale_map, mask_intersect)
+    disp3 =  visual_risk_score_map_range_image(risk_map)
+    tmp   = risk_map.copy()
+    tmp[~mask_risk_high3] = 0.0
+    disp4 =  visual_risk_score_map_range_image(tmp)
+
+    # 4) 纵向拼接并保存
+    fig, axes = plt.subplots(5, 1, figsize=(W/100, 5*H/100), constrained_layout=True)
+    for ax in axes:
+        ax.axis('off')
+
+    # 在左上角添加阈值注释（相对于整张 figure）
+    fig.text(
+        0.01, 0.99,
+        f"Thresholds: Scale ≤ {thr_scale:.3f}, Risk ≥ {thr_risk:.3f}",
+        color='black',
+        fontsize=12,
+        va='top',
+        ha='left'
+    )
+
+    axes[0].imshow(disp0, cmap='seismic', vmin=-1, vmax=1)
+    axes[0].set_title('Full Scale Map', color='white', pad=4)
+
+    axes[1].imshow(disp1, cmap='seismic', vmin=-1, vmax=1)
+    axes[1].set_title(f'Scale ≤ {thr_scale:.3f}', color='white', pad=4)
+
+    axes[2].imshow(disp2, cmap='seismic', vmin=-1, vmax=1)
+    axes[2].set_title('Scale ∧ Risk Intersection', color='white', pad=4)
+
+    axes[3].imshow(disp3, cmap='seismic', vmin=-1, vmax=1)
+    axes[3].set_title('Full Risk Map', color='white', pad=4)
+
+    axes[4].imshow(disp4, cmap='seismic', vmin=-1, vmax=1)
+    axes[4].set_title(f'Risk ≥ {thr_risk:.3f}', color='white', pad=4)
+
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, f"composed_{idx}.png")
+    fig.savefig(out_path, dpi=100, bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+
+    return mask_scale_low3, mask_risk_high3, mask_intersect
+
+def extract_small_regions(args, scale_map, risk_map, delta_t, ttc_thresh):
+    """
+    把所有 scale<阈值 的连通域都当碰撞点，
+    返回 [x, y, ttc, scale, risk]
+    """
+    thresh_mask = (scale_map < args.approach_threshold).astype(np.uint8)  # 0/1
+    # 可选：先膨胀一轮，填补极窄通道
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    mask_closed = cv2.morphologyEx(thresh_mask, cv2.MORPH_CLOSE, kernel)
+
+    # 连通域
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask_closed, connectivity=8
+    )
+    out = []
+    for i in range(1, num_labels):
+        cx, cy = centroids[i]
+        cx, cy = int(cx), int(cy)
+        ttc = delta_t / (1 - scale_map[cy, cx] + 1e-5)
+        if 0 < ttc < ttc_thresh:
+            out.append([cx, cy, ttc,
+                        scale_map[cy, cx],
+                        risk_map[cy, cx]])
+    return out
 
 def init_visualization(save_mode, keyboard_mode):
     """
@@ -90,10 +263,10 @@ def load_test_infos(test_info_path):
 
 def get_pred_npy_files(pred_dir):
     """
-    获取并排序预测 .npy 文件列表
+    获取并排序预测 .npy 文件列表，文件名格式为 xxx_<idx>.npy
     """
     files = [f for f in os.listdir(pred_dir) if f.endswith('.npy')]
-    files.sort(key=lambda x: int(x[5:-4]))
+    files.sort(key=lambda x: int(os.path.splitext(x)[0].split('_')[-1]))
     return files
 
 
@@ -166,7 +339,7 @@ def extract_candidate_points(scale_map, norm_scale, valid_grad_mask, grid_map, g
 
     for kp in kps:
         x, y = int(kp.pt[0]), int(kp.pt[1])
-        if not (0.4*proc_h < y < 0.9*proc_h and 0.2*proc_w < x < 0.8*proc_w):
+        if not (0.3*proc_h < y < 0.9*proc_h and 0.1*proc_w < x < 0.9*proc_w):
             continue
         area = 9
         y0, y1 = max(y-area//2,0), min(y+area//2+1,proc_h)
@@ -263,6 +436,98 @@ def cluster_and_compute(scale_map, risk_map, candidates, delta_t, risk_time_thre
                 collisions.append([int(cx),int(cy),ctmin,scale_map[int(cy),int(cx)],risk_map[int(cy),int(cx)]])
     return collisions
 
+# def cluster_and_compute(scale_map, risk_map, candidates,
+#                         delta_t, risk_time_threshold,
+#                         save_dir=None, idx=None, visualize=False):
+#     collisions = []
+#     if candidates.size == 0:
+#         return collisions
+
+#     # ———— 第一阶段聚类 ————
+#     clu1 = DBSCAN(eps=50, min_samples=5).fit(candidates)
+#     clusters1 = {}
+#     for i, label in enumerate(clu1.labels_):
+#         if label < 0: continue
+#         clusters1.setdefault(label, []).append(candidates[i])
+
+#     # 如果需要可视化并保存第一阶段结果
+#     if visualize and save_dir and idx is not None:
+#         fig1, ax1 = plt.subplots(figsize=(6,6))
+#         ax1.set_title(f'Stage1 Clusters (frame {idx})')
+#         ax1.invert_yaxis()
+#         for label, pts in clusters1.items():
+#             arr = np.array(pts)
+#             color = (random.random(), random.random(), random.random())
+#             ax1.scatter(arr[:,0], arr[:,1], s=10, c=[color], label=f'C{label}')
+#             (cx,cy), r = cv2.minEnclosingCircle(arr[:,:2].astype(np.int32))
+#             circle = plt.Circle((cx,cy), r, fill=False, color=color, linewidth=2)
+#             ax1.add_patch(circle)
+#         ax1.legend(loc='upper right', fontsize='small')
+#         os.makedirs(save_dir, exist_ok=True)
+#         fig1.savefig(os.path.join(save_dir, f'stage1_clusters_{idx}.png'),
+#                      dpi=150, bbox_inches='tight')
+#         plt.close(fig1)
+
+#     # 准备第二阶段的临时中心和区域
+#     sec_centers, sec_regions = [], []
+#     for pts in clusters1.values():
+#         arr = np.array(pts)[:,:2].astype(int)
+#         (cx,cy), r = cv2.minEnclosingCircle(arr)
+#         ct = delta_t/(1-scale_map[int(cy),int(cx)]+1e-5)
+#         if r<6 and arr.shape[0]<4:
+#             continue
+#         sec_centers.append([cx,cy,ct*200])
+#         sec_regions.append(arr)
+#     sec_centers = np.array(sec_centers)
+#     if sec_centers.size == 0:
+#         return collisions
+
+#     # ———— 第二阶段聚类 ————
+#     clu2 = DBSCAN(eps=100, min_samples=3).fit(sec_centers)
+#     regions = {}
+#     for i, label in enumerate(clu2.labels_):
+#         regions.setdefault(label, []).append(sec_regions[i])
+
+#     # 如果需要可视化并保存第二阶段结果
+#     if visualize and save_dir and idx is not None:
+#         fig2, ax2 = plt.subplots(figsize=(6,6))
+#         ax2.set_title(f'Stage2 Clusters (frame {idx})')
+#         ax2.invert_yaxis()
+#         for label, regs in regions.items():
+#             merged = np.vstack(regs)
+#             color = (random.random(), random.random(), random.random())
+#             ax2.scatter(merged[:,0], merged[:,1], s=10, c=[color], label=f'C{label}')
+#             (cx,cy), r = cv2.minEnclosingCircle(merged)
+#             circle = plt.Circle((cx,cy), r, fill=False, color=color, linewidth=2)
+#             ax2.add_patch(circle)
+#         ax2.legend(loc='upper right', fontsize='small')
+#         os.makedirs(save_dir, exist_ok=True)
+#         fig2.savefig(os.path.join(save_dir, f'stage2_clusters_{idx}.png'),
+#                      dpi=150, bbox_inches='tight')
+#         plt.close(fig2)
+
+    # ———— 后续原有的 collision 过滤逻辑 ————
+    for label, regs in regions.items():
+        if label < 0:
+            for reg in regs:
+                (cx,cy),_ = cv2.minEnclosingCircle(reg)
+                ct = delta_t/(1-scale_map[int(cy),int(cx)]+1e-5)
+                if 0<ct<risk_time_threshold:
+                    collisions.append([int(cx),int(cy),ct,
+                                       scale_map[int(cy),int(cx)],
+                                       risk_map[int(cy),int(cx)]])
+        else:
+            merged = np.vstack(regs)
+            cts = [delta_t/(1-scale_map[int(p[1]),int(p[0])]+1e-5) 
+                   for p in merged]
+            ctmin = min(cts)
+            (cx,cy),_ = cv2.minEnclosingCircle(merged)
+            if 0<ctmin<risk_time_threshold:
+                collisions.append([int(cx),int(cy),ctmin,
+                                   scale_map[int(cy),int(cx)],
+                                   risk_map[int(cy),int(cx)]])
+
+    return collisions
 
 def filter_by_risk(collisions, risk_pred_threshold):
     """
@@ -295,6 +560,34 @@ def visualize_range_image(ax, map_to_vis, collisions, type='scale'):
                 f"t={ttc:.2f}\nr={risk:.2f}",
                 color='black', fontsize=12,
                 va='top', ha='left')
+    # # 仅在图像中心（纵向 10%~90%，横向 10%~90%）区域选取最小/最大值位置并标注其数值
+    # H, W = map_to_vis.shape
+    # y1, y2 = int(0.1 * H), int(0.9 * H)
+    # x1, x2 = int(0.1 * W), int(0.9 * W)
+    # sub_map = map_to_vis[y1:y2, x1:x2]
+
+    # if type == 'scale':
+    #     val = np.min(sub_map)
+    #     idx0 = np.argmin(sub_map)
+    # else:  # type == 'risk'
+    #     val = np.max(sub_map)
+    #     idx0 = np.argmax(sub_map)
+
+    # # 将局部索引转换为全图坐标
+    # y_rel, x_rel = np.unravel_index(idx0, sub_map.shape)
+    # y0, x0 = y1 + y_rel, x1 + x_rel
+
+    # # 绘制标记和文本
+    # circ = plt.Circle((x0, y0), 8, edgecolor='yellow', facecolor='none', linewidth=2)
+    # ax.add_patch(circ)
+    # ax.text(
+    #     x0 + 10, y0,
+    #     f"{val:.2f}",
+    #     color='yellow',
+    #     fontsize=12,
+    #     va='center', ha='left',
+    #     bbox=dict(facecolor='black', alpha=0.6, pad=2)
+    # )
 
 def save_range_image(fig, ax, out_path, scale_map):
     """
@@ -309,6 +602,49 @@ def save_range_image(fig, ax, out_path, scale_map):
     plt.savefig(out_path, dpi=dpi, bbox_inches=None, pad_inches=0)
     ax.clear()
 
+def overlay_surround_views_sjtu(collisions, test_info, args, idx):
+    """
+    在 SJTU 环视图上叠加碰撞点、裁剪、拼接并保存；
+    即使 collisions 为空，也会输出原始环视图。
+    [WARN] 由于目前 SJTU 测试集没有 ground truth 数据，
+    这里直接将碰撞点在 range image 上的坐标点同步到环视图上。
+    """
+    surround_view_img_files = [f for f in os.listdir(args.sjtu_surround_view_path) if f.endswith('.png')] 
+    # 1. 过滤出当前 SJTU 场景和帧对应的拼接环视图文件
+    scene_idx = args.sjtu_scene_indice
+    target_filename = f"scene_{scene_idx}_concat_prev_{idx}.png"
+    if target_filename not in surround_view_img_files:
+        print(f"Warning: {target_filename} not found in {args.sjtu_surround_view_path}. Skipping overlay.")
+        return
+    img_path = os.path.join(args.sjtu_surround_view_path, target_filename)
+
+    # 2. 读取拼接图，并在上面叠加碰撞点和文字
+    cv_img = cv2.imread(img_path)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    thickness = 1
+    line_h = int(30 * font_scale)
+
+    for x, y, ttc, _, risk in collisions:
+        cv2.circle(cv_img, (x, y), 6, (255, 0, 0), -1)
+        cv2.putText(cv_img,
+                    f"t={ttc:.2f}",
+                    (x + 6, y - 6),
+                    font, font_scale,
+                    (255, 0, 0), thickness,
+                    lineType=cv2.LINE_AA)
+        cv2.putText(cv_img,
+                    f"r={risk:.2f}",
+                    (x + 6, y - 6 + line_h),
+                    font, font_scale,
+                    (255, 0, 0), thickness,
+                    lineType=cv2.LINE_AA)
+
+    # 3. 保存结果到 vis_dir
+    out_path = os.path.join(args.vis_dir, f"surround_sjtu_{idx}.png")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cv2.imwrite(out_path, cv_img)
+    
 
 def overlay_surround_views(collisions, test_info, args, idx):
     """
@@ -317,11 +653,11 @@ def overlay_surround_views(collisions, test_info, args, idx):
     """
     # 读取深度真值和相机元数据
     gt = np.load(
-        os.path.join(test_info['gt_map_path'], 'range_image.npy'),
+        os.path.join(test_info['gt_map_path'], 'range_image_prev.npy'),
         allow_pickle=True
     ).item()
     depth_map = gt['depth']
-    metas     = test_info['sensor_metas']
+    metas     = test_info['sensor_metas_prev']
     prev_cam  = test_info['prev_camera_data']
 
     # 1. 先获取所有原始环视图（没有任何点），并转为 PIL.Image
@@ -344,7 +680,7 @@ def overlay_surround_views(collisions, test_info, args, idx):
                 x, y, d,
                 H=depth_map.shape[0],
                 W=depth_map.shape[1],
-                fov_up=10.0, fov_down=-30.0
+                fov_up=8.0, fov_down=-15.0
             )
             proj_pts = project_lidar_to_surround_view_img(
                 np.array([xyz]), prev_cam, metas, min_dist=1.0
@@ -443,13 +779,24 @@ def main():
     args.vis_dir = os.path.join(args.vis_dir, f'collision_{ts}_ttc{args.risk_time_threshold}_risk{args.risk_pred_threshold}')
     os.makedirs(args.vis_dir, exist_ok=True)
 
+    # Instantiate augmentor using --image_size as [height, width]
+    resize_height, resize_width = args.image_size  # height, width from CLI
+    # crop_size expects (crop_h, crop_w)
+    augmentor = NuscRangeImageAugmentor(crop_size=(resize_height, resize_width),
+                                        do_flip=False,
+                                        rotate=False)
+
     delta_t = 1.0 / args.fps
     test_infos = load_test_infos(args.test_info_path)
     files = get_pred_npy_files(args.pred_npy_dir)
     # results = {}
     fig, ax = init_visualization(args.save, args.keyboard)
 
+    idx_offset = int(files[0].split('_')[-1].split('.')[0]) if files else 0
     for idx, fn in enumerate(tqdm(files)):
+        if idx > 190:
+            continue
+        idx = idx + idx_offset
         pred_path = os.path.join(args.pred_npy_dir, fn)
         scale_map, risk_map = load_prediction(pred_path)
         crop_scale, norm_scale = preprocess_scale_map(
@@ -467,7 +814,19 @@ def main():
         collisions = cluster_and_compute(
             crop_scale, risk_map, candidates, delta_t, args.risk_time_threshold
         )
+        # collisions = cluster_and_compute(
+        #     crop_scale, risk_map, candidates, delta_t, args.risk_time_threshold,
+        #     save_dir=args.vis_dir, idx=idx, visualize=args.save
+        # )
+        regions = extract_small_regions(
+            args, crop_scale, risk_map, delta_t, args.risk_time_threshold
+        )
+        # 把这些小区域也加入最终碰撞列表
+        for r in regions:
+            collisions.append(r)
+
         collisions = filter_by_risk(collisions, args.risk_pred_threshold)
+
 
         # 可视化 range image
         ax.clear()
@@ -478,38 +837,70 @@ def main():
             plt.draw()
             plt.waitforbuttonpress()
             ax.clear()
+            inspect_scale_risk(crop_scale, risk_map)
         # 保存可视化结果
         elif args.save:
-            # 1. 保存 pred range image 可视化结果
-            out_colli_scale_pred = os.path.join(args.vis_dir, f'colli_scale_pred_{idx}.png')
-            save_range_image(fig, ax, out_colli_scale_pred, scale_map)
-            # 2. 保存环视图叠加结果
-            overlay_surround_views(collisions, test_infos[idx], args, idx)
-            # 3. 保存 gt scale range image 可视化结果
-            out_colli_scale_gt = os.path.join(args.vis_dir, f'colli_scale_gt_{idx}.png')
-            gt = np.load(
-                os.path.join(test_infos[idx]['gt_map_path'], 'range_image.npy'),
-                allow_pickle=True
-            ).item()
-            gt_scale_map = gt['scale']
-            ax.clear()
-            visualize_range_image(ax, gt_scale_map, collisions, type='scale')
-            save_range_image(fig, ax, out_colli_scale_gt, gt_scale_map)
-            # 4. 保存 gt risk range image 可视化结果
-            out_colli_risk_gt = os.path.join(args.vis_dir, f'colli_risk_gt_{idx}.png')
-            gt = np.load(
-                os.path.join(test_infos[idx]['gt_map_path'], 'range_image.npy'),
-                allow_pickle=True
-            ).item()
-            gt_risk_map = gt['risk_score']
-            ax.clear()
-            visualize_range_image(ax, gt_risk_map, collisions, type='risk')
-            save_range_image(fig, ax, out_colli_risk_gt, gt_risk_map)
-            # 5. 保存 pred risk range image 可视化结果
-            out_colli_risk_pred = os.path.join(args.vis_dir, f'colli_risk_pred_{idx}.png')
-            ax.clear()
-            visualize_range_image(ax, risk_map, collisions, type='risk')
-            save_range_image(fig, ax, out_colli_risk_pred, risk_map) 
+            if not args.sjtu_test:
+                # 1. 保存 pred range image 可视化结果
+                out_colli_scale_pred = os.path.join(args.vis_dir, f'colli_scale_pred_{idx}.png')
+                save_range_image(fig, ax, out_colli_scale_pred, scale_map)
+                # 2. 保存环视图叠加结果
+                overlay_surround_views(collisions, test_infos[idx], args, idx)
+                # 3. 保存 gt scale range image 可视化结果
+                out_colli_scale_gt = os.path.join(args.vis_dir, f'colli_scale_gt_{idx}.png')
+                gt = np.load(
+                    os.path.join(test_infos[idx]['gt_map_path'], 'range_image_prev.npy'),
+                    allow_pickle=True
+                ).item()
+                gt_scale_map = gt['scale']
+                ax.clear()
+                visualize_range_image(ax, gt_scale_map, collisions, type='scale')
+                save_range_image(fig, ax, out_colli_scale_gt, gt_scale_map)
+                # 4. 保存 gt risk range image 可视化结果
+                out_colli_risk_gt = os.path.join(args.vis_dir, f'colli_risk_gt_{idx}.png')
+                gt = np.load(
+                    os.path.join(test_infos[idx]['gt_map_path'], 'range_image_prev.npy'),
+                    allow_pickle=True
+                ).item()
+                gt_risk_map = gt['risk_score']
+                ax.clear()
+                visualize_range_image(ax, gt_risk_map, collisions, type='risk')
+                save_range_image(fig, ax, out_colli_risk_gt, gt_risk_map)
+                # 5. 保存 pred risk range image 可视化结果
+                out_colli_risk_pred = os.path.join(args.vis_dir, f'colli_risk_pred_{idx}.png')
+                ax.clear()
+                visualize_range_image(ax, risk_map, collisions, type='risk')
+                save_range_image(fig, ax, out_colli_risk_pred, risk_map) 
+            else:
+                # 1. 保存 pred range image 可视化结果
+                out_colli_scale_pred = os.path.join(args.vis_dir, f'colli_scale_pred_{idx}.png')
+                save_range_image(fig, ax, out_colli_scale_pred, scale_map)
+                # 2. 保存环视图叠加结果
+                # overlay_surround_views_sjtu(collisions, test_infos[idx], args, idx)
+                # 3. 保存 pred risk range image 可视化结果
+                out_colli_risk_pred = os.path.join(args.vis_dir, f'colli_risk_pred_{idx}.png')
+                ax.clear()
+                visualize_range_image(ax, risk_map, collisions, type='risk')
+                save_range_image(fig, ax, out_colli_risk_pred, risk_map) 
+
+                # mask_ttc, mask_risk = compute_and_save_masks(
+                #     scale_map, risk_map,
+                #     delta_t,
+                #     args.risk_time_threshold,
+                #     args.risk_pred_threshold,
+                #     args.vis_dir, idx
+                # )
+                # mask_lo, mask_hi, intersect = compute_and_save_percentile_masks(
+                #     scale_map, risk_map,
+                #     save_dir=args.vis_dir,
+                #     idx=idx
+                # )
+                mask_lo3, mask_hi3, mask_int = compute_and_save_percentile_masks_and_compose(
+                    scale_map, risk_map,
+                    save_dir=args.vis_dir,
+                    idx=idx
+                )
+
         # 逐帧自动显示结果
         else:
             plt.draw()

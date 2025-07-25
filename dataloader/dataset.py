@@ -774,7 +774,7 @@ class nuScenes_range_image(data.Dataset):
         # 在加载数据集时离线构建 spherical voxel grid
         # 结合 DepthAnything 预测的 Depth Pred Map，提前计算每一个像素坐标对应的 Range View 坐标
 
-        for i in tqdm(range(len(self.data)-1790), desc='Loading nuScenes Range Image Dataset'):
+        for i in tqdm(range(len(self.data)), desc='Loading nuScenes Range Image Dataset'):
 
             if self.data[i]['scene_indice'] == '10':
                 continue
@@ -999,7 +999,7 @@ def build_frame_mapping(data, dataset_key, frame_key, affine_matrix, idx, H_r=40
         plt.imshow(proj_range_norm, cmap='jet', vmin=0, vmax=1)
         plt.axis('off')
         plt.tight_layout()
-        plt.savefig(f"./Datasets/cyberrock/scene_5/depth_vis/{frame_key}_normalized_range_{idx}.png", bbox_inches='tight', pad_inches=0)
+        plt.savefig(f"./Datasets/cyberrock/scene_7/depth_vis/{frame_key}_normalized_range_{idx}.png", bbox_inches='tight', pad_inches=0)
         plt.close()
 
     return proj_range, proj_pix

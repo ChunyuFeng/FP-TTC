@@ -645,6 +645,61 @@ class NuscRangeImageAugmentor:
             img = img.crop((0, 0, crop_w, crop_h))
         return img
     
+    def sample_params_sjtu(self, img_size):
+        """
+        先在原图上裁剪出 1600×800 （横向居中，纵向底部对齐），
+        然后再对这个子图执行与 sample_params 一致的 
+        resize → crop → flip → rotate 操作。
+        返回值格式与 sample_params 完全一致，可直接传给 apply_affine。
+        """
+        w, h = img_size
+        crop_h, crop_w = self.crop_size
+
+        # —— 第一步：在原图上预裁剪 1600×800 —— 
+        pre_w, pre_h = 1600, 800
+        # 横向居中
+        x0 = (w - pre_w) // 2
+        # 底部对齐
+        y0 = h - pre_h
+
+        # —— 第二步：计算相对于预裁剪图的缩放比例 —— 
+        scale_h = crop_h / pre_h
+        scale_w = crop_w / pre_w
+        scale = max(scale_h, scale_w)
+
+        # resize 整张原图到 (resize_w, resize_h)
+        resize_w = int(w * scale)
+        resize_h = int(h * scale)
+
+        # —— 将预裁剪区域映射到 resize 后的坐标系 —— 
+        pre_x_scaled = x0 * scale
+        pre_y_scaled = y0 * scale
+        pre_w_scaled = pre_w * scale
+        pre_h_scaled = pre_h * scale
+
+        # 在预裁剪图内取 final crop 设置：水平居中、底部对齐
+        cx2 = (pre_w_scaled - crop_w) / 2
+        cy2 = pre_h_scaled - crop_h
+
+        # —— 最终在 resize 后的整图上裁剪 —— 
+        crop_x = int(pre_x_scaled + cx2)
+        crop_y = int(pre_y_scaled + cy2)
+
+        # 随机翻转 & 旋转参数与 sample_params 保持一致
+        flip_h     = self.do_flip and (np.random.rand() < 0.5)
+        flip_v     = self.do_flip and (np.random.rand() < 0.1)
+        rotate_flag= self.rotate  and (np.random.rand() < self.rotate_prob)
+        angle      = self.rotate_angle if rotate_flag else 0
+
+        return {
+            'scale':  scale,
+            'resize': (resize_w, resize_h),
+            'crop':   (crop_x, crop_y),
+            'flip_h': flip_h,
+            'flip_v': flip_v,
+            'rotate': rotate_flag,
+            'angle':  angle
+        }
 
     def get_affine_matrix(self, params):
         """
