@@ -241,6 +241,9 @@ class TTCTrainer(object):
             gt_scale = gt_scale_map_with_mask[:,0,:,:]
             gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]
 
+            gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
+            gt_risk_score_valid_mask = gt_risk_score_map_with_mask[:,1,:,:]
+
             if type(scale) == list:
                 scale = scale[-1]
             if i%int(save_index)==0 and is_main_process():
@@ -251,22 +254,23 @@ class TTCTrainer(object):
                 normalized_gt = visual_scale_map_range_image(gt_scale_np, gt_scale_valid_mask_np)
 
                 scale_np = scale[0].detach().squeeze(0).cpu().numpy()
-                pred_valid_mask = scale_np > 0
-                normalized_pred = visual_scale_map_range_image(scale_np, pred_valid_mask)
+                pred_scale_valid_mask = scale_np > 0
+                normalized_pred = visual_scale_map_range_image(scale_np, pred_scale_valid_mask)
 
                 # 可视化 risk_score 和 gt_risk_score
-                gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
                 gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
-                normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np)
+                gt_risk_score_valid_mask_np = gt_risk_score_valid_mask[:1].squeeze(0).cpu().detach().bool()
+                normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np, gt_risk_score_valid_mask_np)
 
                 risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
-                normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np)
+                pred_risk_score_valid_mask = (risk_score_np > (-np.pi/2)) & (risk_score_np < (np.pi/2))
+                normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np, pred_risk_score_valid_mask)
 
                 # 保存可视化结果
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), normalized_pred_risk_score, cmap='seismic', vmin=-1, vmax=1)
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), normalized_gt_risk_score, cmap='seismic', vmin=-1, vmax=1)
+                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), -normalized_pred_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), -normalized_gt_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
 
             loss_last = None
             # If an auxiliary loss (loss_last) is available, use it for reporting.

@@ -197,6 +197,59 @@ def range_projection(points, scales, risk_score, H=160, W=1920, fov_up=10.0, fov
 
     return proj_range, proj_scale, proj_risk_score, proj_xyz, proj_idx, proj_mask
 
+def compute_radical_angle(points_prev,
+                          points_curr,
+                          motion_thresh=1e-3):
+    """
+    计算每个点在 x-y 平面上，从 points_prev 到 points_curr 的运动矢量
+    与从 points_prev 到原点连线方向之间的夹角（单位为弧度）。
+
+    对于运动幅度小于 motion_thresh 的点，视作“静止”，其角度设为 np.nan。
+
+    参数:
+      points_prev: np.ndarray, 形状 (n, 3)
+      points_curr: np.ndarray, 形状 (n, 3)
+      motion_thresh: float
+          运动矢量长度的最小阈值，小于此阈值认为该点静止，不计算角度。
+
+    返回:
+      angles: np.ndarray, 形状 (n,)
+          每个点的夹角（单位为弧度），取值范围 [0, π]。静止点为 np.nan。
+    """
+    # 提取 x-y 分量
+    p_prev_xy = points_prev[:, :2]  # (n, 2)
+    p_curr_xy = points_curr[:, :2]
+
+    # 运动矢量
+    motion_xy = p_curr_xy - p_prev_xy  # (n, 2)
+    motion_mag = np.linalg.norm(motion_xy, axis=1)  # (n,)
+
+    # 标记有效运动点
+    valid = motion_mag >= motion_thresh
+    n = points_prev.shape[0]
+    angles = np.full(n, np.pi/2, dtype=np.float32)
+
+    if not np.any(valid):
+        return angles  # 全部静止
+
+    # 只在有效点上计算
+    to_origin = -p_prev_xy[valid]  # (m, 2), m = sum(valid)
+
+    dot = np.einsum('ij,ij->i', motion_xy[valid], to_origin)  # (m,)
+    norm_motion = motion_mag[valid]
+    norm_to_origin = np.linalg.norm(to_origin, axis=1)
+
+    # 防止除零
+    eps = 1e-6
+    norm_to_origin = np.maximum(norm_to_origin, eps)
+
+    cos_theta = dot / (norm_motion * norm_to_origin)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    angles_valid = np.arccos(cos_theta)  # (m,)
+
+    angles[valid] = angles_valid
+    return angles
+
 def compute_radical_component(points_prev, points_curr):
     """
     计算每个点在 x-y 平面上，从 points_prev 到 points_curr 的运动矢量
@@ -371,8 +424,8 @@ def main(args):
 
         scene_indice = current_sf_record['scene_indice']
 
-        if scene_indice not in ['11', '12', '13', '14', '15']:
-            continue
+        # if scene_indice not in ['20', '23', '24']:
+        #     continue
 
         # 读取 scene flow 数据
         if (not os.path.exists(os.path.join(args.scene_flow_path, current_sf_record['folder_name'], 'pc_prev.npy'))
@@ -397,7 +450,10 @@ def main(args):
         depth_xy_prev[depth_xy_prev == 0] = 1e-6
         scales = depth_xy_curr / depth_xy_prev
 
-        risk_score = compute_radical_component(points_prev, points_curr)
+        # 用径向速度作为风险系数
+        # risk_score = compute_radical_component(points_prev, points_curr)
+        # 用运动矢量和径向之间的角度作为风险系数
+        risk_score = compute_radical_angle(points_prev, points_curr, motion_thresh=0.005)
 
         # Range Projection，将 scale 和 risk_score 投影到 Range Image 上
         proj_range, proj_scale, proj_risk_score, proj_xyz, proj_idx, proj_mask = range_projection(
@@ -420,35 +476,6 @@ def main(args):
             fov_down=-args.fov[1]  # nuscenes 使用的 LiDAR fov
         )
 
-        # # [TODO] ONEBEV 的 stitch 函数，仍然有重叠，且没有与 range image 对齐，需要改进
-        # image_list = []
-        # cam_info_list = []
-        # camera_channel_stitch = [
-        #     'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_FRONT_LEFT',
-        #     'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_RIGHT'
-        # ]
-        # for camera_channel in camera_channel_stitch:
-        #     filename = current_surround_view_data[camera_channel]['filename']
-        #     image_path = os.path.join(nusc.dataroot, filename)
-        #     image_list.append(cv2.imread(image_path))
-
-        #     cs_record = nusc.get('calibrated_sensor', 
-        #                          current_surround_view_data[camera_channel]['calibrated_sensor_token'])
-            
-        #     cam_info_list.append({
-        #         "translation": 
-        #         cs_record['translation'],
-        #         "rotation":
-        #         cs_record['rotation'],
-        #         "camera_intrinsic":
-        #         cs_record['camera_intrinsic'],
-        #     })
-
-        # pano_image_rgb = stitch(
-        #     image_list,
-        #     cam_info_list
-        # )
-
         range_image_prev = {
             'depth': proj_range,
             'scale': proj_scale,
@@ -468,7 +495,7 @@ def main(args):
         }
 
         range_image_save_path = os.path.join(args.gt_map_save_path,
-                                             f'range_image_all_frames_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}',
+                                             f'range_image_all_frames_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_new',
                                              current_sf_record['folder_name'])
         if not os.path.exists(range_image_save_path):
             os.makedirs(range_image_save_path)
@@ -532,36 +559,13 @@ def main(args):
         trainval_test_infos.append(info)
 
         ###################################### 可视化 ######################################
+        
         if args.risk_score_map_vis:
-            risk_score_display = np.copy(proj_risk_score)
-
-            pos_mask = risk_score_display > 0
-            neg_mask = risk_score_display < 0
-
-            normalized_risk_score = np.zeros_like(risk_score_display, dtype=np.float32)
-
-            # 分段归一化，大于 0 表示朝向自车运动，小于 0 表示远离自车运动
-            # 处理大于0的部分
-            if np.any(pos_mask):
-                pos_risk = risk_score_display[pos_mask]
-                pos_max = pos_risk.max()
-                pos_min = pos_risk.min()
-                if pos_max > pos_min >= 0:
-                    normalized_risk_score[pos_mask] = (pos_risk - pos_min) / (pos_max - pos_min)
-                else:
-                    normalized_risk_score[pos_mask] = 0.0
-            # 处理小于0的部分
-            if np.any(neg_mask):
-                neg_risk = risk_score_display[neg_mask]
-                neg_max = neg_risk.max()
-                neg_min = neg_risk.min()
-                if neg_min < neg_max <= 0:
-                    normalized_risk_score[neg_mask] = (neg_risk - neg_min) / (neg_max - neg_min) - 1.0
-                else:
-                    normalized_risk_score[neg_mask] = 0.0
+            risk_score_display = np.copy(proj_risk_score) - np.pi/2
+            risk_score_display[proj_mask == 0] = 0.0  # 将无效像素设为0
             
             risk_score_vis_save_path = os.path.join(args.vis_dir, 'risk_score_map',
-                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}")
+                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_theta_new")
             
             if not os.path.exists(risk_score_vis_save_path):
                 os.makedirs(risk_score_vis_save_path)
@@ -569,8 +573,8 @@ def main(args):
             risk_score_vis_name = f"scene_{scene_indice}_risk_score_map_{i}.png"
 
             plt.imsave(os.path.join(risk_score_vis_save_path, risk_score_vis_name),
-                       normalized_risk_score, cmap='seismic', vmin=-1, vmax=1)
-             
+                       -risk_score_display, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+            
         if args.scale_map_vis:
             scale_display = np.copy(proj_scale)
 
@@ -634,7 +638,7 @@ def main(args):
           Sorted by timestamp. {len(trainval_test_infos)} items in total.")
 
     with open(os.path.join(args.pkl_save_path,
-                           f"nusc_{args.trainval_test_split}_infos_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_.pkl"),'wb') as f:
+                           f"nusc_{args.trainval_test_split}_infos_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_new.pkl"),'wb') as f:
         pickle.dump(trainval_test_infos, f)
     print(f"Saved nusc_trainval_infos.pkl to {args.pkl_save_path}")
 

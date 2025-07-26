@@ -413,78 +413,10 @@ def visual_scale_map_range_image(scale_map, valid_mask, colormap_name='seismic')
 
     return normalized_display
 
-def visual_risk_score_map_range_image(risk_score_map):
+def visual_risk_score_map_range_image(risk_score_map, valid_mask):
 
-    risk_score_display = risk_score_map
-    low, high = np.percentile(risk_score_display, [2, 98])
-    clipped_risk_score = np.clip(risk_score_display, low, high)
+    risk_score_display = risk_score_map - np.pi/2  # 将风险分数从 [0, π] 映射到 [-π/2, π/2]
+    risk_score_display[valid_mask] = np.clip(risk_score_display[valid_mask], -np.pi/2, np.pi/2)  # 限制范围
+    risk_score_display[~valid_mask] = 0.0  # 将无效像素设为0
 
-    risk_score_display = clipped_risk_score
-
-    pos_mask = risk_score_display > 0
-    neg_mask = risk_score_display < 0
-
-    normalized_risk_score = np.zeros_like(risk_score_display, dtype=np.float32)
-
-    # 分段归一化，大于 0 表示朝向自车运动，小于 0 表示远离自车运动
-    # 处理大于0的部分
-    if np.any(pos_mask):
-        pos_risk = risk_score_display[pos_mask]
-        pos_max = pos_risk.max()
-        pos_min = pos_risk.min()
-        if pos_max > pos_min >= 0:
-            normalized_risk_score[pos_mask] = (pos_risk - pos_min) / (pos_max - pos_min)
-        else:
-            normalized_risk_score[pos_mask] = 0.0
-    # 处理小于0的部分
-    if np.any(neg_mask):
-        neg_risk = risk_score_display[neg_mask]
-        neg_max = neg_risk.max()
-        neg_min = neg_risk.min()
-        if neg_min < neg_max <= 0:
-            normalized_risk_score[neg_mask] = (neg_risk - neg_min) / (neg_max - neg_min) - 1.0
-        else:
-            normalized_risk_score[neg_mask] = 0.0
-    
-    return normalized_risk_score
-
-def visual_risk_score_map_range_image_nonlinear(risk_score_map, gamma=1.5):
-    """
-    在原有线性归一化前，先做 Gamma 校正放大小幅度变化：
-      boosted = sign(x) * |x|**gamma
-    参数：
-      risk_score_map: 原始相对径向速度映射
-      gamma: Gamma 校正系数 (<1 放大小变化，>1 强化极值)
-    返回：
-      normalized_risk_score: 归一化到 [-1,1] 的非线性增强结果
-    """
-    # 1. 非线性增强
-    boosted = np.sign(risk_score_map) * (np.abs(risk_score_map) ** gamma)
-
-    # 2. 复用原有分段线性归一化逻辑
-    risk_score_display = boosted
-    pos_mask = risk_score_display > 0
-    neg_mask = risk_score_display < 0
-    normalized_risk_score = np.zeros_like(risk_score_display, dtype=np.float32)
-
-    # 处理大于0的部分
-    if np.any(pos_mask):
-        pos_risk = risk_score_display[pos_mask]
-        pmax, pmin = pos_risk.max(), pos_risk.min()
-        if pmax > pmin >= 0:
-            normalized_risk_score[pos_mask] = (pos_risk - pmin) / (pmax - pmin)
-        else:
-            normalized_risk_score[pos_mask] = 0.0
-
-    # 处理小于0的部分
-    if np.any(neg_mask):
-        neg_risk = risk_score_display[neg_mask]
-        nmax, nmin = neg_risk.max(), neg_risk.min()
-        if nmin < nmax <= 0:
-            # 先映射到 [0,1]，再减1 得到 [-1,0]
-            normalized_risk_score[neg_mask] = (neg_risk - nmin) / (nmax - nmin) - 1.0
-        else:
-            normalized_risk_score[neg_mask] = 0.0
-
-    return normalized_risk_score
-    
+    return risk_score_display
