@@ -11,17 +11,17 @@ from fpttc.fp_ttc import FpTTC
 from utils.trainer import TTCTrainer
 from utils.draw import (
     visual_scale_map_range_image,
-    visual_risk_score_map_range_image,
-    visual_risk_score_map_range_image_nonlinear
+    visual_risk_score_map_range_image
 )
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
 from dataloader.dataset import build_frame_mapping
 import pickle
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from fpttc.scale_net.utils.spherical import build_spherical_voxels, project_voxel_to_camera
-from tools.cyberrock.sjtu_test_info import undistort_image, intersect_rois
+from tools.cyberrock.sjtu_test_info import undistort_image
 from PIL import ImageDraw
+from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
+
 parser = argparse.ArgumentParser()
 
 # Dataset & evaluation parameters
@@ -154,11 +154,26 @@ def main():
         'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
         'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT'
         ]
+    
+    # Load DepthAnythingV2 model for depth prediction
+    model_configs = {
+    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]}
+    }
+
+    encoder = 'vitl' # or 'vits', 'vitb'
+    dataset = 'vkitti' # 'hypersim' for indoor model, 'vkitti' for outdoor model
+    max_depth = 80 # 20 for indoor model, 80 for outdoor model
+
+    depth_model = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': max_depth})
+    depth_model.load_state_dict(torch.load(f'pretrained/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
+    depth_model.to('cuda').eval()
 
     for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
         if args.sjtu_test:
-            if idx <= 100 or idx >= 450:
-                continue
+            # if idx <= 180:
+            #     continue
             # 1) Load input images
             prev_images_undistorted = {}
             curr_images_undistorted = {}
@@ -219,12 +234,30 @@ def main():
             # 2) Load Depth Pred Map (DepthAnythingV2)
             prev_depth_pred_map = {}
             curr_depth_pred_map = {}
-            for channel in camera_channels:
-                depth_pred_prev_path = test_entries[idx]['prev_camera_data'][channel]['depth_pred']
-                depth_pred_curr_path = test_entries[idx]['curr_camera_data'][channel]['depth_pred']
 
-                prev_depth_pred_map[channel] = np.load(depth_pred_prev_path)
-                curr_depth_pred_map[channel] = np.load(depth_pred_curr_path)
+            ######################### 从预先生成的 Depth Map 中加载 #########################
+            # for channel in camera_channels:
+            #     depth_pred_prev_path = test_entries[idx]['prev_camera_data'][channel]['depth_pred']
+            #     depth_pred_curr_path = test_entries[idx]['curr_camera_data'][channel]['depth_pred']
+
+            #     prev_depth_pred_map[channel] = np.load(depth_pred_prev_path)
+            #     curr_depth_pred_map[channel] = np.load(depth_pred_curr_path)
+
+            #     prev_depth_pred_map[channel] = torch.from_numpy(prev_depth_pred_map[channel])
+            #     curr_depth_pred_map[channel] = torch.from_numpy(curr_depth_pred_map[channel])
+
+            ######################### 用 DepthAnythingV2 推理生成 Depth Map #########################
+            # 测算 DepthAnythingV2 的推理时间
+            # start_event = torch.cuda.Event(enable_timing=True)
+            # end_event   = torch.cuda.Event(enable_timing=True)
+            # start_event.record()
+
+            for channel in camera_channels:
+                raw_image_prev = cv2.cvtColor(augmented_prev[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
+                prev_depth_pred_map[channel] = depth_model.infer_image(raw_image_prev, input_size=320)
+
+                raw_image_curr = cv2.cvtColor(augmented_curr[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
+                curr_depth_pred_map[channel] = depth_model.infer_image(raw_image_curr, input_size=320)
 
                 prev_depth_pred_map[channel] = torch.from_numpy(prev_depth_pred_map[channel])
                 curr_depth_pred_map[channel] = torch.from_numpy(curr_depth_pred_map[channel])
@@ -234,6 +267,11 @@ def main():
 
             prev_depths_pred_batch = prev_depths_pred_tensor.unsqueeze(0).to(device)
             curr_depths_pred_batch = curr_depths_pred_tensor.unsqueeze(0).to(device)
+
+            # end_event.record()
+            # torch.cuda.synchronize()
+            # elapsed_ms = start_event.elapsed_time(end_event)
+            # print(f"test：{elapsed_ms:.3f} ms")
 
             # 3) load 环视图像 uv 坐标与 range view uv 坐标之间的对应关系 (DepthAnythingV2)
             proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'sjtu', 'prev', affine_matrix, idx, H_r=40, W_r=480, visualize=False)
@@ -268,7 +306,7 @@ def main():
             normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
 
             risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
-            normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array)
+            normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
 
             # save prediction as .npy files for collision map generation
             if args.save_pred_npy:
@@ -285,9 +323,8 @@ def main():
             plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
                     -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
             plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
-                    normalized_pred_risk_image, cmap='seismic', vmin=-1, vmax=1)
+                    -normalized_pred_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
 
-            torch.cuda.empty_cache()
         
         # test on nuScenes dataset
         else: 
@@ -395,11 +432,12 @@ def main():
             normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
 
             gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
-            normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array)
+            gt_risk_mask_array = gt_risk_tensor[0,1].cpu().bool().numpy()
+            normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array, gt_risk_mask_array)
             # normalized_gt_risk_image = visual_risk_score_map_range_image_nonlinear(gt_risk_array)
 
             risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
-            normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array)
+            normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
             # normalized_pred_risk_image = visual_risk_score_map_range_image_nonlinear(risk_prediction_array)
 
             # save prediction as .npy files
@@ -415,14 +453,20 @@ def main():
                 np.save(os.path.join(pred_npy_subdir, f"scene_{scene_indice}_pred_{idx}.npy"), pred_data)
 
             # Save visuals
+            # 将 augmented_prev 中的图像按照channel顺序拼接，并保存为 concat_prev_{idx}.png
+            concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
+            concat_prev = concat_prev.astype(np.uint8)
+            concat_prev_img = Image.fromarray(concat_prev)
+            concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
+
             plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
                     -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
             plt.imsave(os.path.join(output_dir, f"gt_scale_{idx}.png"),
                     -normalized_gt_scale_image, cmap='seismic', vmin=-1, vmax=1)
             plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
-                    normalized_pred_risk_image, cmap='seismic', vmin=-1, vmax=1)
+                    -normalized_pred_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
             plt.imsave(os.path.join(output_dir, f"gt_risk_{idx}.png"),
-                    normalized_gt_risk_image, cmap='seismic', vmin=-1, vmax=1)
+                    -normalized_gt_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
 
             # Cleanup
             del prev_batch, curr_batch, scale_pred, risk_pred

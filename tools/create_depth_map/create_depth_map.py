@@ -102,7 +102,7 @@ def main(args):
     'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]}
     }
 
-    encoder = 'vitl' # or 'vits', 'vitb'
+    encoder = 'vitb' # or 'vits', 'vitb'
     dataset = 'vkitti' # 'hypersim' for indoor model, 'vkitti' for outdoor model
     max_depth = 80 # 20 for indoor model, 80 for outdoor model
 
@@ -224,8 +224,18 @@ def main(args):
             # 遍历每条 prev 数据
             for channel in channels:
                 raw_image = augmented_prev[channel]
-                raw_image = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR) 
-                depth = model.infer_image(raw_image)
+                raw_image = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
+
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event   = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+
+                depth = model.infer_image(raw_image, input_size=80)
+                
+                end_event.record()
+                torch.cuda.synchronize()
+                elapsed_ms = start_event.elapsed_time(end_event)
+                print(f"这段代码在 GPU 上运行耗时：{elapsed_ms:.3f} ms")
 
                 image_filename = info['prev_camera_data'][channel]['filename']
                 depth_filename = os.path.splitext(image_filename)[0] + ".npy"
@@ -269,13 +279,13 @@ def main(args):
                 # 将 depth 路径信息添加到 info 中
                 info['curr_camera_data'][channel]['depth_pred'] = depth_save_path
                 
-            data_new.append(info)
+        #     data_new.append(info)
         
-        # 保存处理后的数据到新的 pkl 文件
-        output_pkl_path = os.path.join('./Datasets/nuscenes/2_trainval_test_infos', 'nusc_trainval_infos_160_1920_fov_8_15_dpt.pkl')
-        with open(output_pkl_path, 'wb') as f:
-            pickle.dump(data_new, f)
-        print(f"处理完成，新的 pkl 文件已保存到: {output_pkl_path}")
+        # # 保存处理后的数据到新的 pkl 文件
+        # output_pkl_path = os.path.join('./Datasets/nuscenes/2_trainval_test_infos', 'nusc_trainval_infos_160_1920_fov_8_15_dpt.pkl')
+        # with open(output_pkl_path, 'wb') as f:
+        #     pickle.dump(data_new, f)
+        # print(f"处理完成，新的 pkl 文件已保存到: {output_pkl_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load a pkl file and print its content.")

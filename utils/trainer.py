@@ -263,8 +263,7 @@ class TTCTrainer(object):
                 normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np, gt_risk_score_valid_mask_np)
 
                 risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
-                pred_risk_score_valid_mask = (risk_score_np > (-np.pi/2)) & (risk_score_np < (np.pi/2))
-                normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np, pred_risk_score_valid_mask)
+                normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np, None)
 
                 # 保存可视化结果
                 plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)

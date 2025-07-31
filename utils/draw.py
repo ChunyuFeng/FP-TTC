@@ -416,6 +416,10 @@ def visual_scale_map_range_image(scale_map, valid_mask, colormap_name='seismic')
 def visual_risk_score_map_range_image(risk_score_map, valid_mask):
 
     risk_score_display = risk_score_map - np.pi/2  # 将风险分数从 [0, π] 映射到 [-π/2, π/2]
+
+    if valid_mask is None:
+        valid_mask = np.ones_like(risk_score_display, dtype=bool)
+    # 将风险分数裁切到 [-π/2, π/2] 范围
     risk_score_display[valid_mask] = np.clip(risk_score_display[valid_mask], -np.pi/2, np.pi/2)  # 限制范围
     risk_score_display[~valid_mask] = 0.0  # 将无效像素设为0
 

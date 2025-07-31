@@ -27,30 +27,37 @@ def make_video(input_folder, output_path, fps=10):
 
     # 视频写入器，帧大小为 (w, 3*h)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # writer = cv2.VideoWriter(output_path, fourcc, fps, (w, 5 * h))
     writer = cv2.VideoWriter(output_path, fourcc, fps, (w, 3 * h))
 
     for idx in idxs:
         prev_path  = os.path.join(input_folder, f"concat_prev_{idx}.png")
-        # gt_scale = os.path.join(input_folder, f"gt_scale_{idx}.png")
-        scale_path = os.path.join(input_folder, f"colli_scale_pred_{idx}.png")
-        risk_path  = os.path.join(input_folder, f"colli_risk_pred_{idx}.png")
+        # gt_scale_path = os.path.join(input_folder, f"gt_scale_{idx}.png")
+        pred_scale_path = os.path.join(input_folder, f"pred_scale_{idx}.png")
+        # gt_risk_path  = os.path.join(input_folder, f"gt_risk_{idx}.png")
+        pred_risk_path = os.path.join(input_folder, f"pred_risk_{idx}.png")
 
         # 逐张读取并检查
         prev_img  = cv2.imread(prev_path)
-        # gt_scale_img = cv2.imread(gt_scale)
-        scale_img = cv2.imread(scale_path)
-        risk_img  = cv2.imread(risk_path)
+        # gt_scale_img = cv2.imread(gt_scale_path)
+        pred_scale_img = cv2.imread(pred_scale_path)
+        # gt_risk_img  = cv2.imread(gt_risk_path)
+        pred_risk_img = cv2.imread(pred_risk_path)
         if prev_img is None:
             raise ValueError(f"无法读取图片: {prev_path}")
         # if gt_scale_img is None:
-        #     raise ValueError(f"无法读取图片: {gt_scale}")
-        if scale_img is None:
-            raise ValueError(f"无法读取图片: {scale_path}")
-        if risk_img is None:
-            raise ValueError(f"无法读取图片: {risk_path}")
+        #     raise ValueError(f"无法读取图片: {gt_scale_path}")
+        if pred_scale_img is None:
+            raise ValueError(f"无法读取图片: {pred_scale_path}")
+        # if gt_risk_img is None:
+        #     raise ValueError(f"无法读取图片: {gt_risk_path}")
+        if pred_risk_img is None:
+            raise ValueError(f"无法读取图片: {pred_risk_path}")
+
 
         # 拼接并写入
-        stacked = cv2.vconcat([prev_img, scale_img, risk_img])
+        # stacked = cv2.vconcat([prev_img, gt_scale_img, pred_scale_img, gt_risk_img, pred_risk_img])
+        stacked = cv2.vconcat([prev_img, pred_scale_img, pred_risk_img])
         writer.write(stacked)
 
     writer.release()
