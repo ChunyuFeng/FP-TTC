@@ -25,13 +25,14 @@ from .draw import visual_scale_map_range_image, visual_risk_score_map_range_imag
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
 
 class TTCTrainer(object):
-    def __init__(self, model, dataset, optimizer, args, device, model_path = None, 
-                start_epoch=0, parallel=False, time_stamp=None, max_lr=1e-4, 
-                neptune_run=None):
+    def __init__(self, model, dataset, optimizer, args, start_epoch, device,
+                parallel=False, time_stamp=None, 
+                neptune_run=None, scale_only=False):
         self.model = model
         self.parallel = parallel
         self.batch_size = args.batch_size
         self.train_sampler = None
+        self.scale_only = scale_only
         if not self.parallel:
             self.train_loader = DataLoader(dataset, 
                                            batch_size  = args.batch_size, 
@@ -48,7 +49,10 @@ class TTCTrainer(object):
                                            pin_memory  = True, 
                                            num_workers = args.num_workers)
 
-        self.epoch = args.epoch
+        if self.scale_only:
+            self.epoch = args.scale_epochs
+        else:
+            self.epoch = args.risk_epochs
         self.optimizer = optimizer
         self.start_epoch = start_epoch
         
@@ -58,9 +62,9 @@ class TTCTrainer(object):
         if self.start_epoch>0:
             starte = self.start_epoch - 1
         
-        self.lr_scheduler3 = torch.optim.lr_scheduler.OneCycleLR(
+        self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=max_lr,
+            max_lr=args.lr,
             epochs=self.epoch,
             steps_per_epoch=steps_per_epoch,
             pct_start=0.05,
@@ -74,13 +78,8 @@ class TTCTrainer(object):
         self.plt_train_epoch = []
         if time_stamp is None:
             self.time_stamp = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
-            out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
-            if not os.path.isdir(out_dir):
-                os.mkdir(out_dir)
         else:
-            self.time_stamp = time_stamp
-        self.model_path = model_path
-        
+            self.time_stamp = time_stamp  
         self.attn_type=args.attn_type
         self.attn_splits_list=args.attn_splits_list
         self.corr_radius_list=args.corr_radius_list
@@ -96,18 +95,10 @@ class TTCTrainer(object):
 
         self.neptune_run = neptune_run
 
-    def get_optimizer(self):
-        params = list(self.model.named_parameters())
-        param_group = [
-            {'params':[p for n,p in params if 'featnet' in n],'lr':1e-5},
-            {'params':[p for n,p in params if 'flownet' in n],'lr':1e-5},
-            {'params':[p for n,p in params if 'scalenet' in n],'lr':1e-4},
-        ]
-        optimizer = torch.optim.Adam(param_group,lr=1e-5)
-        return optimizer
 
     def train(self):
         out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
+        os.makedirs(out_dir, exist_ok=True)
 
         if is_main_process():
             for i, pg in enumerate(self.optimizer.param_groups):
@@ -122,7 +113,6 @@ class TTCTrainer(object):
             self.train_epoch(epoch)
 
             if is_main_process():
-
                 if (epoch < self.epoch and epoch % self.checkpoint_interval == 0):
                     checkpoint = {
                         "net": self.model.state_dict(),
@@ -130,12 +120,15 @@ class TTCTrainer(object):
                         "epoch": epoch + 1
                     }
                     # # 用当前的时间戳为模型保存路径命名
-                    temp_pth = os.path.join(out_dir, f'{epoch}y.pth.tar')
+                    if self.scale_only:
+                        temp_pth = os.path.join(out_dir, f'{epoch}_scale.pth.tar')
+                    else:
+                        temp_pth = os.path.join(out_dir, f'{epoch}.pth.tar')
                     torch.save(checkpoint, temp_pth)
-                if is_main_process():
-                    print("Loss in epoch", epoch, ":", self.loss_per_epoch / max(1, self.iters))
-                    for i, pg in enumerate(self.optimizer.param_groups):
-                        print(f"  param group {i} lr = {pg['lr']:.3e}")
+
+                print("Loss in epoch", epoch, ":", self.loss_per_epoch / max(1, self.iters))
+                for i, pg in enumerate(self.optimizer.param_groups):
+                    print(f"  param group {i} lr = {pg['lr']:.3e}")
 
     
     def train_epoch(self, epoch):
@@ -173,7 +166,7 @@ class TTCTrainer(object):
             self.optimizer.zero_grad()
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
             if hasattr(self.model, "module"):
-                scale, risk_score, loss_r = self.model.module.forward_with_loss(
+                scale, risk_score, loss_s, loss_r = self.model.module.forward_with_loss(
                     img_prev                      = prev_surr_view_imgs_tensor,
                     img_curr                      = curr_surr_view_imgs_tensor,
                     depth_prev                    = prev_surr_view_depths_tensor,
@@ -187,10 +180,10 @@ class TTCTrainer(object):
                     corr_radius_list              = self.corr_radius_list,
                     prop_radius_list              = self.prop_radius_list,
                     num_reg_refine                = self.num_reg_refine,
-                    testing                       = False
+                    scale_only                    = self.scale_only
                 )
             else:
-                scale, risk_score, loss_r = self.model.forward_with_loss(
+                scale, risk_score, loss_s, loss_r = self.model.forward_with_loss(
                     img_prev                      = prev_surr_view_imgs_tensor,
                     img_curr                      = curr_surr_view_imgs_tensor,
                     depth_prev                    = prev_surr_view_depths_tensor,
@@ -204,72 +197,54 @@ class TTCTrainer(object):
                     corr_radius_list              = self.corr_radius_list,
                     prop_radius_list              = self.prop_radius_list,
                     num_reg_refine                = self.num_reg_refine,
-                    testing                       = False
+                    scale_only                    = self.scale_only
                 )
             
-            # # 根据 scale 和 risk 分支的梯度范数，动态计算 loss 权重
-            # scale_keys = [
-            #     "featnet.",      # FeatureNet 主分支
-            #     "corrnet.",      # FlowNet 主分支
-            #     "conv_corr.",    # CorrEncoder 主分支
-            #     "scale_net."     # ScaleNet 主分支
-            # ]
-            # risk_keys = [
-            #     "featnet_risk.",   # FeatureNet 风险分支
-            #     "corrnet_risk.",   # FlowNet 风险分支
-            #     "conv_corr_risk.", # CorrEncoder 风险分支
-            #     "risk_net."        # RiskNet 分支
-            # ]
-            # model_ref = getattr(self.model, "module", self.model)
-            # loss, w_s, w_r = self._weighted_loss(
-            #     keys_s    = scale_keys,
-            #     keys_r    = risk_keys,
-            #     loss_s    = loss_s,
-            #     loss_r    = loss_r,
-            #     model_ref = model_ref
-            # )
-            loss = loss_r
+            loss = loss_s if self.scale_only else loss_r
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             self.optimizer.step()
-            self.lr_scheduler3.step()
+            self.lr_scheduler.step()
             epoch_loss += loss.item()
             steps += 1
 
             ### 可视化结果
-            gt_scale = gt_scale_map_with_mask[:,0,:,:]
-            gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]
-
-            gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
-            gt_risk_score_valid_mask = gt_risk_score_map_with_mask[:,1,:,:]
-
+            
             if type(scale) == list:
                 scale = scale[-1]
             if i%int(save_index)==0 and is_main_process():
 
-                # 可视化 prediction_scale 和 gt_scale
-                gt_scale_np = gt_scale[:1].detach().squeeze(0).cpu().numpy()
-                gt_scale_valid_mask_np = gt_scale_valid_mask[:1].squeeze(0).cpu().detach().bool()
-                normalized_gt = visual_scale_map_range_image(gt_scale_np, gt_scale_valid_mask_np)
+                if self.scale_only:
+                    gt_scale = gt_scale_map_with_mask[:,0,:,:]
+                    gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]
 
-                scale_np = scale[0].detach().squeeze(0).cpu().numpy()
-                pred_scale_valid_mask = scale_np > 0
-                normalized_pred = visual_scale_map_range_image(scale_np, pred_scale_valid_mask)
+                    # 可视化 prediction_scale 和 gt_scale
+                    gt_scale_np = gt_scale[:1].detach().squeeze(0).cpu().numpy()
+                    gt_scale_valid_mask_np = gt_scale_valid_mask[:1].squeeze(0).cpu().detach().bool()
+                    normalized_gt = visual_scale_map_range_image(gt_scale_np, gt_scale_valid_mask_np)
 
-                # 可视化 risk_score 和 gt_risk_score
-                gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
-                gt_risk_score_valid_mask_np = gt_risk_score_valid_mask[:1].squeeze(0).cpu().detach().bool()
-                normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np, gt_risk_score_valid_mask_np)
+                    scale_np = scale[0].detach().squeeze(0).cpu().numpy()
+                    pred_scale_valid_mask = scale_np > 0
+                    normalized_pred = visual_scale_map_range_image(scale_np, pred_scale_valid_mask)
 
-                risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
-                normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np, None)
+                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
+                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
 
-                # 保存可视化结果
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), -normalized_pred_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-                plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), -normalized_gt_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+                else: 
+                    gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
+                    gt_risk_score_valid_mask = gt_risk_score_map_with_mask[:,1,:,:]
+                    # 可视化 risk_score 和 gt_risk_score
+                    gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
+                    gt_risk_score_valid_mask_np = gt_risk_score_valid_mask[:1].squeeze(0).cpu().detach().bool()
+                    normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np, gt_risk_score_valid_mask_np)
+
+                    risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
+                    normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np, None)
+
+                    # 保存可视化结果
+                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), -normalized_pred_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), -normalized_gt_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
 
             loss_last = None
             # If an auxiliary loss (loss_last) is available, use it for reporting.
@@ -297,10 +272,10 @@ class TTCTrainer(object):
             # 记录每个 batch 的 loss 和全局步数
             global_step = epoch * len(self.train_loader) + i
             if self.neptune_run is not None and is_main_process():
-                self.neptune_run["train/batch_loss"].append(loss.item(), step=global_step)
-                self.neptune_run["train/batch_loss_scale"].append(loss_s.item(), step=global_step)
-                self.neptune_run["train/batch_loss_risk"].append(loss_r.item(), step=global_step)
-            if self.neptune_run is not None and is_main_process():
+                if self.scale_only:
+                    self.neptune_run["train/batch_loss_scale"].append(loss_s.item(), step=global_step)
+                else:
+                    self.neptune_run["train/batch_loss_risk"].append(loss_r.item(), step=global_step)
                 for group_idx, pg in enumerate(self.optimizer.param_groups):
                     tag = f"train/batch_learning_rate_group_{group_idx}"
                     self.neptune_run[tag].append(pg["lr"], step=global_step)

@@ -131,11 +131,17 @@ parser.add_argument('--distributed', action='store_true')
 parser.add_argument('--launcher', default='none', type=str, choices=['none', 'pytorch'])
 parser.add_argument('--gpu_ids', default=0, type=int, nargs='+')
 
-# misc
-parser.add_argument('--count_time', action='store_true',
-                    help='measure the inference time')
-
-parser.add_argument('--debug', action='store_true')
+# train 2 branch sequentially
+parser.add_argument('--train_stage', choices=['scale','risk','both'], default='both',
+                    help='which branch(s) to train: scale only, risk only, or both sequentially')
+parser.add_argument('--scale_epochs', type=int, default=1001,
+                    help='number of epochs to train the scale branch')
+parser.add_argument('--risk_epochs',  type=int, default=1001,
+                    help='number of epochs to train the risk branch')
+parser.add_argument('--scale_batch_size', type=int, default=1,
+                    help='batch size for scale-only stage')
+parser.add_argument('--risk_batch_size',  type=int, default=1,
+                    help='batch size for risk-only stage')
 
 # 加载预训练的单分支模型：
 parser.add_argument(
@@ -161,6 +167,30 @@ else:
     device = torch.device("cuda", 0)
     parallel = False
 
+def build_optimizer(model, args):
+    """
+    构造只作用于 requires_grad=True 参数的 AdamW 优化器
+
+    Args:
+      model:  FpTTC 模型实例
+      args:  包含 lr, weight_decay 等超参数的命令行 args
+    """
+    max_lr = args.lr
+    ini_lr = max_lr / 25
+    min_lr = ini_lr / 1e4
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": trainable_params,
+                "max_lr": max_lr,
+                "initial_lr": ini_lr,
+                "min_lr": min_lr
+            }
+        ],
+        lr=max_lr, weight_decay=args.weight_decay)
+    return optimizer
+
 def main():
 
     if args.neptune and ((not args.parallel) or dist.get_rank() == 0):
@@ -176,123 +206,17 @@ def main():
         ffn_dim_expansion      = args.ffn_dim_expansion,
         num_transformer_layers = args.num_transformer_layers,
         reg_refine             = args.reg_refine,
-        train                  = True
     ).cuda()
 
-    # —— 1) 加载 scale-only checkpoint —— 
-    if args.scale_pretrained_ckpt is not None:
-        ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
-        if 'model' in ckpt:
-            sd = ckpt['model']
-        elif 'net' in ckpt:
-            sd = {k.replace('module.', ''): v for k, v in ckpt['net'].items()}
-        elif 'state_dict' in ckpt:
-            sd = ckpt['state_dict']
-        else:
-            sd = ckpt
-        # ckpt = torch.load(args.scale_pretrained_ckpt, map_location='cpu')
-        # sd   = ckpt.get('state_dict', ckpt)
-        model_dict = model.state_dict()
-        # 只挑出 cnet/featnet/corrnet/conv_corr、scale_net 前缀
-        prefixes = (
-            'cnet.',
-            'featnet.',
-            'corrnet.',
-            'conv_corr.',
-            'scalenet_singlebranch.',  # 这里用的是 checkpoint 里的名字
-        )
-        new_sd = {}
-        for k, v in sd.items():
-            # 1) 直接复用 cnet/featnet/corrnet
-            if any(k.startswith(p) for p in ('cnet.', 'featnet.', 'corrnet.')):
-                new_sd[k] = v
+    start_epoch = 0
 
-            # 2) 把 checkpoint 里的 conv_corr 同时写入 scale 分支和 risk 分支
-            if k.startswith('conv_corr.'):
-                new_sd[k] = v
-                new_sd['conv_corr_risk.' + k[len('conv_corr.'):]] = v
-
-            # 3) 把 scalenet_singlebranch. 映射到新的 scale_net.
-            if k.startswith('scalenet_singlebranch.'):
-                new_key = 'scale_net.' + k[len('scalenet_singlebranch.'):]
-                new_sd[new_key] = v
-                
-        model_dict.update(new_sd)
-        load_info = model.load_state_dict(model_dict, strict=False)
-        if is_main_process():
-            # 成功匹配到的 keys = 原来 sd 里所有 keys，扣掉 “unexpected_keys”
-            loaded_keys = set(sd.keys()) - set(load_info.unexpected_keys)
-            print(f"[INFO] Loaded ({len(loaded_keys)}) keys:")
-            for k in sorted(loaded_keys):
-                print(f"    {k}")
-
-            print(f"[WARN] Missing ({len(load_info.missing_keys)}) keys (not found in checkpoint):")
-            for k in load_info.missing_keys:
-                print(f"    {k}")
-
-            print(f"[WARN] Unexpected ({len(load_info.unexpected_keys)}) keys (not used by model):")
-            for k in load_info.unexpected_keys:
-                print(f"    {k}")
-
-    # —— 2) 冻结 scale 分支 & 共享模块 —— 
-    freeze_prefixes = (
-        'cnet.',
-        'featnet.',
-        'corrnet.',
-        'conv_corr.',
-        'scale_net.'
-    )
-    for name, p in model.named_parameters():
-        if any(name.startswith(pref) for pref in freeze_prefixes):
-            p.requires_grad = False
-        else:
-            p.requires_grad = True   # 保留 risk 分支可训练
-
-    # —— 3) 仅用未冻结参数构造 optimizer —— 
-    max_lr = args.lr
-    ini_lr = max_lr / 25
-    min_lr = ini_lr / 1e4
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW([
-        {
-            "params": trainable,
-            "max_lr": max_lr,
-            "initial_lr": ini_lr,
-            "min_lr": min_lr
-        }
-    ],
-    lr=max_lr, weight_decay=args.weight_decay)
-
-    # model = FpTTC(num_scales             = args.num_scales,
-    #               feature_channels       = args.feature_channels,
-    #               upsample_factor        = args.upsample_factor,
-    #               num_head               = args.num_head,
-    #               ffn_dim_expansion      = args.ffn_dim_expansion,
-    #               num_transformer_layers = args.num_transformer_layers,
-    #               reg_refine             = args.reg_refine,
-    #               train                  = True).cuda()
-    
-    # max_lr = args.lr
-    # ini_lr = max_lr / 25
-    # min_lr = ini_lr / 1e4
-
-    # optimizer = torch.optim.AdamW([
-    #     {
-    #         "params":model.parameters(),
-    #         "max_lr":max_lr,
-    #         "initial_lr":ini_lr,
-    #         "min_lr":min_lr
-    #     }
-    # ],
-    # lr=max_lr, weight_decay=args.weight_decay)
-
-    epoch = 0
-
+    # 从预训练的模型加载参数
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device)
         if args.load_opt:
-            epoch = checkpoint.get('epoch', 0)
+            optimizer = build_optimizer(model, args)
             optimizer.load_state_dict(checkpoint['optimizer'])
+            start_epoch = checkpoint.get('epoch', 0)
 
         if 'model' in checkpoint:
             sd = checkpoint['model']
@@ -302,40 +226,9 @@ def main():
             sd = checkpoint['state_dict']
         else:
             sd = checkpoint
-        
-        # new_sd = {}
-        # for k, v in sd.items():
-        #     new_sd[k] = v
-        #     # 这一层的输入由 RGB 改为 RGBD
-        #     # 如果是 cnet.conv1.weight，就把它的第 4 个通道设置为原来 3 个通道的均值
-        #     if k == 'cnet.conv1.weight':
-        #         out, c, h, w = v.shape
-        #         new_w = torch.zeros(out, 4, h, w)
-        #         new_w[:, :3, :, :] = v                      # 复用原来那 3 个通道
-        #         new_w[:, 3:4, :, :] = v.mean(dim=1, keepdim=True)  # 第 4 通道取均值
-        #         new_sd[k] = new_w
-        #     # 如果是 featnet 的权重，就也复制到 featnet_risk
-        #     if k.startswith("featnet."):
-        #         new_sd["featnet_risk." + k[len("featnet."):]] = v
-        #     # corrnet → corrnet_risk
-        #     if k.startswith("corrnet."):
-        #         new_sd["corrnet_risk." + k[len("corrnet."):]] = v
-        #     # conv_corr → conv_corr_risk
-        #     if k.startswith("conv_corr."):
-        #         new_sd["conv_corr_risk." + k[len("conv_corr."):]] = v
-
-        new_sd = {}
-        for k, v in sd.items():
-            new_sd[k] = v
-            # conv_corr → conv_corr_risk
-            if k.startswith("conv_corr."):
-                new_sd["conv_corr_risk." + k[len("conv_corr."):]] = v
-            # scalenet_singlebranch → feat_net
-            if k.startswith("scalenet_singlebranch."):
-                new_sd["scale_net." + k[len("scalenet_singlebranch."):]] = v
 
         # 2) 载入并接收加载报告
-        load_info = model.load_state_dict(new_sd, strict=False)
+        load_info = model.load_state_dict(sd, strict=False)
 
         # 3) 打印一下各类 key
         if is_main_process():
@@ -357,45 +250,130 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
                         output_device=local_rank, find_unused_parameters=True)
 
-        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
-        #                 output_device=local_rank)
-        if torch.distributed.get_rank()==0:
-                # torch.distributed.barrier()
-                if not os.path.isdir(out_dir):
-                    os.mkdir(out_dir)
-                    loss_txt = out_dir + '/0.txt'
-                    file = open(loss_txt,'w')
-                    file.close()
-
+        if is_main_process():
+            if not os.path.isdir(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
     else:
-        if not os.path.isdir(out_dir):
-            os.makedirs(out_dir)  # 创建多层目录
-            loss_txt = os.path.join(out_dir, '0.txt')  # 构建文件路径
-            with open(loss_txt, 'w') as file:
-                file.close()
+        os.makedirs(out_dir, exist_ok=True)
 
-    
-    start = time.time()
     if is_main_process():
         print('Start Loading ...')
-    dataset = datasets.fetch_dataloader(args)
-    if is_main_process():
-        print('Done ', time.time()-start)
-        print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr'])        
 
-    trainer = TTCTrainer(model       = model,
-                         dataset     = dataset,
-                         optimizer   = optimizer, 
-                         args        = args, 
-                         start_epoch = epoch,
-                         device      = device, 
-                         model_path  = args.resume, 
-                         parallel    = parallel,
-                         time_stamp  = time_stamp, 
-                         max_lr      = max_lr,
-                         neptune_run = run)
+    dataset = datasets.fetch_dataloader(args) 
     
-    trainer.train()
+    # stage 1: train scale branch
+    if args.train_stage in ('scale', 'both'):
+        ########################### LOAD PRETRAINED SCALE MODEL ###########################
+        if args.scale_pretrained_ckpt is not None:
+            ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
+            # 提取 state_dict
+            if 'model' in ckpt:
+                sd = ckpt['model']
+            elif 'net' in ckpt:
+                # 去掉 DDP 的 module. 前缀
+                sd = {k.replace('module.', ''): v for k, v in ckpt['net'].items()}
+            elif 'state_dict' in ckpt:
+                sd = ckpt['state_dict']
+            else:
+                sd = ckpt
+
+            # 只挑出 cnet/featnet/corrnet 的参数
+            prefixes = ('cnet.', 'featnet.', 'corrnet.')
+            filtered = {}
+            for k, v in sd.items():
+                if any(k.startswith(pref) for pref in prefixes):
+                    filtered[k] = v
+
+            # 注入到当前模型里
+            model_dict = model.state_dict()
+            model_dict.update(filtered)
+            load_info = model.load_state_dict(model_dict, strict=False)
+            if is_main_process():
+                loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
+                print(f"[SCALE-INIT] Loaded {len(loaded)} keys for scale backbone:")
+                for k in sorted(loaded):
+                    print("   ", k)
+                if load_info.missing_keys:
+                    print(f"[SCALE-INIT] Missing keys: {load_info.missing_keys}")
+            ##########################################################################
+        # 1) freeze risk branch
+        freeze_prefixes = (
+            'conv_corr_risk.','risk_net.'
+        )
+
+        for name, p in model.named_parameters():
+            # remove "module." prefix if using DDP
+            bare_name = name
+            if bare_name.startswith('module.'):
+                bare_name = bare_name[len('module.'):]
+            
+            if any(bare_name.startswith(prefix) for prefix in freeze_prefixes):
+                p.requires_grad = False
+            else:
+                p.requires_grad = True
+
+        optimizer = build_optimizer(model, args)
+
+        if is_main_process():
+            print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr'])      
+
+        args.batch_size = args.scale_batch_size  # scale-only stage batch size
+
+        print(f"Training scale branch for {args.scale_epochs} epochs...")
+
+        # 2) compute scale loss
+        trainer = TTCTrainer(model       = model,
+                             dataset     = dataset,
+                             optimizer   = optimizer,
+                             args        = args,
+                             start_epoch = start_epoch,
+                             device      = device,
+                             parallel    = parallel,
+                             time_stamp  = time_stamp,
+                             neptune_run = run,
+                             scale_only  = True,
+                             )
+        trainer.train()
+
+    # stage 2: train risk branch
+    if args.train_stage in ('risk', 'both'):
+        # 1) freeze scale branch
+        freeze_prefixes = (
+            'cnet.','featnet.','corrnet.','conv_corr.','scale_net.'
+        )
+
+        for name, p in model.named_parameters():
+            bare_name = name
+            if bare_name.startswith('module.'):
+                bare_name = bare_name[len('module.'):]
+            
+            if any(bare_name.startswith(prefix) for prefix in freeze_prefixes):
+                p.requires_grad = False
+            else:
+                p.requires_grad = True
+
+        optimizer = build_optimizer(model, args)
+
+        if is_main_process():
+            print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr']) 
+
+        args.batch_size = args.risk_batch_size  # risk-only stage batch size
+
+        print(f"Training risk branch for {args.risk_epochs} epochs...")
+        # 2) compute risk loss
+        trainer = TTCTrainer(model       = model,
+                             dataset     = dataset,
+                             optimizer   = optimizer,
+                             args        = args,
+                             start_epoch = start_epoch,
+                             device      = device,
+                             parallel    = parallel,
+                             time_stamp  = time_stamp,
+                             neptune_run = run,
+                             scale_only  = False,
+                             )
+        trainer.train()
+
 
 if __name__ == "__main__":
     main()

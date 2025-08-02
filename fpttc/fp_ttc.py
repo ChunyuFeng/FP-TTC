@@ -35,11 +35,10 @@ class FpTTC(nn.Module):
                  num_head               = 1,
                  ffn_dim_expansion      = 4,
                  num_transformer_layers = 6,
-                 reg_refine             = False,
-                 train                  = True):
+                 reg_refine             = False
+                 ):
         super(FpTTC, self).__init__()
         self.num_scales = num_scales
-        self.is_trainning = train
 
         self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                                 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
@@ -89,7 +88,7 @@ class FpTTC(nn.Module):
                 corr_radius_list,
                 prop_radius_list,
                 num_reg_refine,
-                testing):
+                scale_only):
 
         ### 1）提取输入的多视角图像的底层特征
         img0, img1 = normalize_img(img_prev, img_curr)
@@ -182,6 +181,10 @@ class FpTTC(nn.Module):
             multi_level_ranges_curr,
             initial_scale
         )
+
+        if scale_only:
+            return scales, None
+        
         # risk 分支
         corr_encoded = self.conv_corr_risk(corr_range)
         initial_risk = corr_encoded[:, :1]
@@ -210,7 +213,7 @@ class FpTTC(nn.Module):
             corr_radius_list,              # List[int]
             prop_radius_list,              # List[int]
             num_reg_refine,                # int
-            testing                        # bool
+            scale_only
         ):
 
         scales, risks = self.forward(
@@ -225,11 +228,15 @@ class FpTTC(nn.Module):
             corr_radius_list = corr_radius_list,
             prop_radius_list = prop_radius_list,
             num_reg_refine   = num_reg_refine,
-            testing          = testing
+            scale_only       = scale_only,
         )
-        # loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
-        loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
-        return scales, risks, loss_r
+        if scale_only:
+            # 仅计算尺度分支的损失
+            loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
+            return scales, None, loss_s, None
+        else:
+            loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
+            return None, risks, None, loss_r
 
     def extract_feature(self, im0, im1, branch):
         x = torch.cat([im0, im1], dim=0)
