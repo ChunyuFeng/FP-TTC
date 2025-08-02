@@ -21,7 +21,9 @@ from tqdm import tqdm
 from tools.cyberrock.sjtu_test_info import undistort_image
 from PIL import ImageDraw
 from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
-
+import time
+from concurrent.futures import ThreadPoolExecutor
+import albumentations as A
 parser = argparse.ArgumentParser()
 
 # Dataset & evaluation parameters
@@ -169,60 +171,143 @@ def main():
     depth_model = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': max_depth})
     depth_model.load_state_dict(torch.load(f'pretrained/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
     depth_model.to('cuda').eval()
+    
+    if args.sjtu_test:
 
-    for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
-        if args.sjtu_test:
-            # if idx <= 180:
-            #     continue
-            # 1) Load input images
-            prev_images_undistorted = {}
-            curr_images_undistorted = {}
-
-            for ch in camera_channels:
-                # 对 prev 帧的图像去畸变，并且获取去畸变后的内参 K_undist
-                prev_path = test_entries[idx]['prev_camera_data'][ch]['filename']
-                prev_images_undistorted[ch] = cv2.imread(prev_path, cv2.IMREAD_COLOR)
-                prev_images_undistorted[ch], K_prev, _ = undistort_image(prev_images_undistorted[ch], 
-                                                                         test_entries[idx]['sensor_metas_prev'][ch]['K'],
-                                                                         test_entries[idx]['sensor_metas_prev'][ch]['dist'])
-                prev_images_undistorted[ch] = Image.fromarray(cv2.cvtColor(prev_images_undistorted[ch], cv2.COLOR_BGR2RGB))
-                test_entries[idx]['sensor_metas_prev'][ch]['K_undist'] = K_prev
-                # 将 相机 -> LiDAR 的 RT 转换为 LiDAR -> 相机 的 RT
-                R = test_entries[idx]['sensor_metas_prev'][ch]['R']
-                t = test_entries[idx]['sensor_metas_prev'][ch]['t']
-                R_inv = R.T
-                t_inv = -R_inv @ t
-                test_entries[idx]['sensor_metas_prev'][ch]['R_l2c'] = R_inv
-                test_entries[idx]['sensor_metas_prev'][ch]['t_l2c'] = t_inv
-
-                # 对 curr 帧的图像去畸变，并且获取去畸变后的内参 K_undist
-                curr_path = test_entries[idx]['curr_camera_data'][ch]['filename']
-                curr_images_undistorted[ch] = cv2.imread(curr_path, cv2.IMREAD_COLOR)
-                curr_images_undistorted[ch], K_curr, _ = undistort_image(curr_images_undistorted[ch],
-                                                                         test_entries[idx]['sensor_metas_curr'][ch]['K'],
-                                                                         test_entries[idx]['sensor_metas_curr'][ch]['dist'])
-                curr_images_undistorted[ch] = Image.fromarray(cv2.cvtColor(curr_images_undistorted[ch], cv2.COLOR_BGR2RGB))
-                test_entries[idx]['sensor_metas_curr'][ch]['K_undist'] = K_curr
-                # 将 相机 -> LiDAR 的 RT 转换为 LiDAR -> 相机 的 RT
-                R = test_entries[idx]['sensor_metas_curr'][ch]['R']
-                t = test_entries[idx]['sensor_metas_curr'][ch]['t']
-                R_inv = R.T
-                t_inv = -R_inv @ t
-                test_entries[idx]['sensor_metas_curr'][ch]['R_l2c'] = R_inv
-                test_entries[idx]['sensor_metas_curr'][ch]['t_l2c'] = t_inv       
-
-            # augment images
-            orig_size = next(iter(prev_images_undistorted.values())).size  # (W, H)
-            affine_params = augmentor.sample_params(orig_size)
-            augmented_prev, _ = augmentor(prev_images_undistorted.copy(), affine_params)
-            augmented_curr, _ = augmentor(curr_images_undistorted.copy(), affine_params)
-            affine_matrix = augmentor.get_affine_matrix(affine_params)
+        undistort_maps = {}
+        for ch in camera_channels:
+            # 任意一帧的 K/dist 都是固定的：
+            K = test_entries[0]['sensor_metas_prev'][ch]['K']
+            dist = test_entries[0]['sensor_metas_prev'][ch]['dist']
+            w, h = (1920, 1080)  # e.g. (1600, 900)
+            # 1) 计算去畸变映射表
+            newK, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0)
+            map1, map2 = cv2.initUndistortRectifyMap(K, dist, None, newK, (w, h), cv2.CV_32FC1)
+            undistort_maps[ch] = (map1, map2, newK)
+        
+        def load_remap(ch, frame_type):
+                # frame_type = 'prev' 或 'curr'
+                path = test_entries[idx][f'{frame_type}_camera_data'][ch]['filename']
+                img = cv2.imread(path, cv2.IMREAD_COLOR)
+                map1, map2, K_ud = undistort_maps[ch]
+                img_ud = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
+                # 更新内参
+                test_entries[idx][f'sensor_metas_{frame_type}'][ch]['K_undist'] = K_ud
+                # 计算 R_l2c, t_l2c
+                R = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['R']
+                t = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['t']
+                R_inv, t_inv = R.T, -R.T @ t
+                test_entries[idx][f'sensor_metas_{frame_type}'][ch].update({
+                    'R_l2c': R_inv, 't_l2c': t_inv
+                })
+                return ch, img_ud
             
-            # visualize RGB images
-            concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
-            concat_prev = concat_prev.astype(np.uint8)
-            concat_prev_img = Image.fromarray(concat_prev)
-            concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
+        # for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
+        #      # if idx <= 180:
+        #     #     continue
+        #     # 1) Load input images
+        #     prev_images_undistorted = {}
+        #     curr_images_undistorted = {}
+
+        #     for ch in camera_channels:
+        #         # 对 prev 帧的图像去畸变，并且获取去畸变后的内参 K_undist
+        #         prev_path = test_entries[idx]['prev_camera_data'][ch]['filename']
+        #         prev_images_undistorted[ch] = cv2.imread(prev_path, cv2.IMREAD_COLOR)
+        #         prev_images_undistorted[ch], K_prev, _ = undistort_image(prev_images_undistorted[ch], 
+        #                                                                  test_entries[idx]['sensor_metas_prev'][ch]['K'],
+        #                                                                  test_entries[idx]['sensor_metas_prev'][ch]['dist'])
+        #         prev_images_undistorted[ch] = Image.fromarray(cv2.cvtColor(prev_images_undistorted[ch], cv2.COLOR_BGR2RGB))
+        #         test_entries[idx]['sensor_metas_prev'][ch]['K_undist'] = K_prev
+        #         # 将 相机 -> LiDAR 的 RT 转换为 LiDAR -> 相机 的 RT
+        #         R = test_entries[idx]['sensor_metas_prev'][ch]['R']
+        #         t = test_entries[idx]['sensor_metas_prev'][ch]['t']
+        #         R_inv = R.T
+        #         t_inv = -R_inv @ t
+        #         test_entries[idx]['sensor_metas_prev'][ch]['R_l2c'] = R_inv
+        #         test_entries[idx]['sensor_metas_prev'][ch]['t_l2c'] = t_inv
+
+        #         # 对 curr 帧的图像去畸变，并且获取去畸变后的内参 K_undist
+        #         curr_path = test_entries[idx]['curr_camera_data'][ch]['filename']
+        #         curr_images_undistorted[ch] = cv2.imread(curr_path, cv2.IMREAD_COLOR)
+        #         curr_images_undistorted[ch], K_curr, _ = undistort_image(curr_images_undistorted[ch],
+        #                                                                  test_entries[idx]['sensor_metas_curr'][ch]['K'],
+        #                                                                  test_entries[idx]['sensor_metas_curr'][ch]['dist'])
+        #         curr_images_undistorted[ch] = Image.fromarray(cv2.cvtColor(curr_images_undistorted[ch], cv2.COLOR_BGR2RGB))
+        #         test_entries[idx]['sensor_metas_curr'][ch]['K_undist'] = K_curr
+        #         # 将 相机 -> LiDAR 的 RT 转换为 LiDAR -> 相机 的 RT
+        #         R = test_entries[idx]['sensor_metas_curr'][ch]['R']
+        #         t = test_entries[idx]['sensor_metas_curr'][ch]['t']
+        #         R_inv = R.T
+        #         t_inv = -R_inv @ t
+        #         test_entries[idx]['sensor_metas_curr'][ch]['R_l2c'] = R_inv
+        #         test_entries[idx]['sensor_metas_curr'][ch]['t_l2c'] = t_inv       
+
+        #     # augment images
+        #     orig_size = next(iter(prev_images_undistorted.values())).size  # (W, H)
+        #     affine_params = augmentor.sample_params(orig_size)
+        #     augmented_prev, _ = augmentor(prev_images_undistorted.copy(), affine_params)
+        #     augmented_curr, _ = augmentor(curr_images_undistorted.copy(), affine_params)
+        #     affine_matrix = augmentor.get_affine_matrix(affine_params)
+        for idx in tqdm(range(len(test_entries)), desc='Processing surround view'):
+
+            start = time.perf_counter()
+            # 1) 并行加载 + 去畸变
+
+            # 用线程池并行处理所有通道的 prev/curr
+            prev_raw, curr_raw = {}, {}
+            with ThreadPoolExecutor(max_workers=len(camera_channels)*2) as exe:
+                # prev futures
+                prev_futs = [exe.submit(load_remap, ch, 'prev') for ch in camera_channels]
+                curr_futs = [exe.submit(load_remap, ch, 'curr') for ch in camera_channels]
+                for fut in prev_futs:
+                    ch, img_ud = fut.result(); prev_raw[ch] = img_ud
+                for fut in curr_futs:
+                    ch, img_ud = fut.result(); curr_raw[ch] = img_ud
+
+            # 2) 批量仿射增强 —— 用 Albumentations 一次性处理所有视角
+            orig_h, orig_w = next(iter(prev_raw.values())).shape[:2]
+            params = augmentor.sample_params((orig_w, orig_h))
+            resize_w, resize_h = params['resize']      # (width, height)
+            crop_x, crop_y = params['crop']            # (x offset, y offset)
+            crop_h, crop_w = augmentor.crop_size       # from your class
+
+            # 2) 构造 Transform 列表
+            tfms = [
+                # 2.1 Resize 到 (resize_h, resize_w)
+                A.Resize(height=resize_h, width=resize_w, 
+                        interpolation=cv2.INTER_LINEAR),
+                # 2.2 Crop 出 (crop_h, crop_w) 大小的窗口
+                A.Crop(x_min=crop_x, y_min=crop_y,
+                    x_max=crop_x+crop_w, y_max=crop_y+crop_h),
+            ]
+            # 2.3 水平 / 垂直 翻转
+            if params['flip_h']:
+                tfms.append(A.HorizontalFlip(p=1.0))
+            if params['flip_v']:
+                tfms.append(A.VerticalFlip(p=1.0))
+            # 2.4 旋转
+            if params['rotate']:
+                # 固定 angle；border_mode 可根据你想要的背景填充方式调整
+                tfms.append(A.Rotate(limit=(params['angle'], params['angle']),
+                                    p=1.0,
+                                    border_mode=cv2.BORDER_CONSTANT))
+
+            # 3) 最终 Compose
+            alb_tf = A.Compose(tfms, p=1.0)
+
+            # 4) 对每张图像分别应用（用 dict comprehension 也行）
+            augmented_prev = {
+                ch: alb_tf(image=prev_raw[ch])['image']
+                for ch in camera_channels
+            }
+            augmented_curr = {
+                ch: alb_tf(image=curr_raw[ch])['image']
+                for ch in camera_channels
+            }
+            affine_matrix = augmentor.get_affine_matrix(params)
+
+            end1 = time.perf_counter()
+            print(f"Image loading and augmentation took {(end1 - start)*1000:.2f} ms")
 
             # Convert to tensors and stack
             prev_tensors = [torch.from_numpy(augmented_prev[ch]).permute(2,0,1).float() for ch in camera_channels]
@@ -299,8 +384,18 @@ def main():
                         num_reg_refine   = args.num_reg_refine,
                         testing          = False
                     )
-                
+            end2 = time.perf_counter()
+            print(f"Inference took {(end2 - end1)*1000:.2f} ms")
+
+            print(f"The whole process took {(end2 - start)*1000:.2f} ms")
+
             # Visualization
+            # visualize RGB images
+            concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
+            concat_prev = concat_prev.astype(np.uint8)
+            concat_prev_img = Image.fromarray(concat_prev)
+            concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
+
             scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
             scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
             normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
@@ -324,10 +419,9 @@ def main():
                     -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
             plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
                     -normalized_pred_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-
-        
-        # test on nuScenes dataset
-        else: 
+            
+    else:
+        for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
             if test_entries[idx]['scene_indice'] != '10':
                 continue
             scene_indice = test_entries[idx]['scene_indice']
