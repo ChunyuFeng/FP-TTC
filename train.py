@@ -150,6 +150,12 @@ parser.add_argument(
     help='path to pretrained scale‑only model (.pth or .pth.tar)'
 )
 
+parser.add_argument(
+    '--dinov2_pretrained_ckpt',
+    type=str, default=None,
+    help='path to pretrained risk‑only model (.pth or .pth.tar)'
+)
+
 # neptune
 parser.add_argument('--neptune', action='store_true',
                     help='use neptune for logging')
@@ -263,39 +269,39 @@ def main():
     
     # stage 1: train scale branch
     if args.train_stage in ('scale', 'both'):
-        ########################### LOAD PRETRAINED SCALE MODEL ###########################
-        if args.scale_pretrained_ckpt is not None:
-            ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
-            # 提取 state_dict
-            if 'model' in ckpt:
-                sd = ckpt['model']
-            elif 'net' in ckpt:
-                # 去掉 DDP 的 module. 前缀
-                sd = {k.replace('module.', ''): v for k, v in ckpt['net'].items()}
-            elif 'state_dict' in ckpt:
-                sd = ckpt['state_dict']
-            else:
-                sd = ckpt
+        # 1) load Dinov2 pretrained weights
+        dpt_ckpt = torch.load(args.dinov2_pretrained_ckpt, map_location=device)
+        dinov2_sd = {
+            k[len("pretrained."):]: v
+            for k, v in dpt_ckpt.items()
+            if k.startswith("pretrained.")
+        }
+        dinov2_load_info = model.dinov2.load_state_dict(dinov2_sd, strict=False)
+        print(f"[INFO] DINOv2 加载详情: {dinov2_load_info}")
+        model.dinov2.eval()
+        for p in model.dinov2.parameters():
+            p.requires_grad = False
+        
+        # 2) load scale pretrained weights
+        scale_ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
+        scale_sd = {k.replace('module.', ''): v for k, v in scale_ckpt['net'].items()}
+        scale_load_info = model.load_state_dict(scale_sd, strict=False)
 
-            # 只挑出 cnet/featnet/corrnet 的参数
-            prefixes = ('cnet.', 'featnet.', 'corrnet.')
-            filtered = {}
-            for k, v in sd.items():
-                if any(k.startswith(pref) for pref in prefixes):
-                    filtered[k] = v
+        if is_main_process():
+            # 成功匹配到的 keys = 原来 sd 里所有 keys，扣掉 “unexpected_keys”
+            loaded_keys = set(scale_sd.keys()) - set(scale_load_info.unexpected_keys)
+            print(f"[INFO] Loaded ({len(loaded_keys)}) keys:")
+            for k in sorted(loaded_keys):
+                print(f"    {k}")
 
-            # 注入到当前模型里
-            model_dict = model.state_dict()
-            model_dict.update(filtered)
-            load_info = model.load_state_dict(model_dict, strict=False)
-            if is_main_process():
-                loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
-                print(f"[SCALE-INIT] Loaded {len(loaded)} keys for scale backbone:")
-                for k in sorted(loaded):
-                    print("   ", k)
-                if load_info.missing_keys:
-                    print(f"[SCALE-INIT] Missing keys: {load_info.missing_keys}")
-            ##########################################################################
+            print(f"[WARN] Missing ({len(scale_load_info.missing_keys)}) keys (not found in checkpoint):")
+            for k in scale_load_info.missing_keys:
+                print(f"    {k}")
+
+            print(f"[WARN] Unexpected ({len(scale_load_info.unexpected_keys)}) keys (not used by model):")
+            for k in scale_load_info.unexpected_keys:
+                print(f"    {k}")
+
         # 1) freeze risk branch
         freeze_prefixes = (
             'conv_corr_risk.','risk_net.'

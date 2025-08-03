@@ -794,8 +794,14 @@ class nuScenes_range_image(data.Dataset):
 
             # 3. 环视图像 (cam_idx, u, v) 与 range image (u, v) 之间的映射关系
             #    通过 DepthAnything 预测的 Depth Pred Map + 内外参 计算得到
-            proj_range_prev, proj_pix_prev = build_frame_mapping(self.data, 'nusc', 'prev', self.affine_matrix, i, H_r=40, W_r=480)
-            proj_range_curr, proj_pix_curr = build_frame_mapping(self.data, 'nusc', 'curr', self.affine_matrix, i, H_r=40, W_r=480)
+            affine_matrix_280_to_160 = self.affine_matrix
+            affine_matrix_280_to_160[:2] /= 1.75
+            proj_range_prev, proj_pix_prev = build_frame_mapping(self.data, 'nusc', 'prev', 
+                                                                 affine_matrix_280_to_160, 
+                                                                 i, H_r=40, W_r=480)
+            proj_range_curr, proj_pix_curr = build_frame_mapping(self.data, 'nusc', 'curr', 
+                                                                 affine_matrix_280_to_160, 
+                                                                 i, H_r=40, W_r=480)
             self.proj_list.append([proj_pix_prev, proj_pix_curr])
 
     def __len__(self):

@@ -8,13 +8,11 @@ from .scale_net.backbone import CNNEncoder
 from .scale_net.feature_net.feature_net import FeatureNet
 from .scale_net.flow_net import FlowNet
 from .scale_net.scale_net import ScaleNet
-from .scale_net.multi_view_deformable_fusion import MultiViewDeformableFusion
-
-import torch.distributed as dist
-import numpy as np
+import math
 from utils.dist import is_main_process
 
-import matplotlib.pyplot as plt
+from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
+from depthanything.metric_depth.depth_anything_v2.dinov2 import DINOv2
 
 class CorrEncoder(nn.Module):
     def __init__(self, dim_in, dim_out):
@@ -42,6 +40,39 @@ class FpTTC(nn.Module):
 
         self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                                 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+        
+        # 1) DINOv2 Transformer: 提取多尺度特征
+        self.dinov2 = DINOv2(model_name='vitb')
+
+        # 2) Bridge: 将 DPTHead 输出的多尺度通道映射到统一 feature_channels
+        dpt_out_channels = [96, 384]
+        self.bridge_convs = nn.ModuleList([
+            nn.Conv2d(dpt_out_channels[i], feature_channels, kernel_size=1)
+            for i in range(len(dpt_out_channels))
+        ])
+
+        self.resize_layers = nn.ModuleList([
+            # upsample 2×
+            nn.ConvTranspose2d(
+            in_channels=dpt_out_channels[0],
+            out_channels=dpt_out_channels[0],
+            kernel_size=2,
+            stride=2,
+            padding=0
+            ),
+            # upsample 1×
+            nn.Identity(),
+        ])
+
+        self.projects = nn.ModuleList([
+            nn.Conv2d(
+                in_channels=self.dinov2.embed_dim,
+                out_channels=out_channel,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+            ) for out_channel in dpt_out_channels
+        ])
 
         self.cnet = CNNEncoder(output_dim        = feature_channels, 
                                num_output_scales = num_scales)
@@ -89,17 +120,57 @@ class FpTTC(nn.Module):
                 prop_radius_list,
                 num_reg_refine,
                 scale_only):
-
-        ### 1）提取输入的多视角图像的底层特征
-        img0, img1 = normalize_img(img_prev, img_curr)
-        rgbd0 = torch.cat([img0, depth_prev], dim=2)  # [B, V, 4, H, W]
-        rgbd1 = torch.cat([img1, depth_curr], dim=2)  # [B, V, 4, H, W]
-        B, V, C, H_img, W_img = img0.shape
+        
+        B, V, C, H, W = img_prev.shape
         shared_prev, shared_curr = [], []
-        for view in range(rgbd0.size(1)):
-            p, c = self.extract_feature(rgbd0[:, view], rgbd1[:, view], branch=None)
-            shared_prev.append(p)
-            shared_curr.append(c)
+
+        # 1) 多视角特征提取：从 DINOv2 Transformer 取 num_scales 层 token，再用 DPTHead 的 projects+resize_layers 得到多尺度特征
+        patch_size = self.dinov2.patch_size
+        patch_h, patch_w = H // patch_size, W // patch_size
+        # idxs = self.depth_model.intermediate_layer_idx[self.depth_model.encoder] # [2, 5, 8, 11] for vitb，取 2 8 两层
+        idxs = [2, 8]
+        for v in range(V):
+            # im0 = image_prev_resized[:, v]
+            # im1 = image_curr_resized[:, v]
+            im0 = img_prev[:, v]
+            im1 = img_curr[:, v]
+            with torch.no_grad():
+                tokens0 = self.dinov2.get_intermediate_layers(im0, idxs, return_class_token=False)
+                tokens1 = self.dinov2.get_intermediate_layers(im1, idxs, return_class_token=False)
+            p0, p1 = [], []
+            for i, (t0, t1) in enumerate(zip(tokens0, tokens1)):
+                # [B, N, 768] -> [B, 768, patch_h, patch_w]
+                Ce = t0.shape[-1]
+                fmap0 = t0.permute(0,2,1).reshape(B, Ce, patch_h, patch_w)
+                fmap1 = t1.permute(0,2,1).reshape(B, Ce, patch_h, patch_w)
+                # DPTHead projects: 768->out_channels[i]
+                proj = self.projects[i] # 1
+                fmap0 = proj(fmap0)
+                fmap1 = proj(fmap1)
+                # DPTHead resize_layers: 恢复到相同空间尺度
+                resize = self.resize_layers[i]
+                fmap0 = resize(fmap0)
+                fmap1 = resize(fmap1)
+                # Bridge conv: out_channels[i] -> feature_channels
+                fmap0 = self.bridge_convs[i](fmap0)
+                fmap1 = self.bridge_convs[i](fmap1)
+                p0.append(fmap0)
+                p1.append(fmap1)
+            p0.reverse()
+            p1.reverse()
+            shared_prev.append(p0)
+            shared_curr.append(p1)
+
+        # ### 1）提取输入的多视角图像的底层特征
+        # img0, img1 = normalize_img(img_prev, img_curr)
+        # rgbd0 = torch.cat([img0, depth_prev], dim=2)  # [B, V, 4, H, W]
+        # rgbd1 = torch.cat([img1, depth_curr], dim=2)  # [B, V, 4, H, W]
+        # B, V, C, H_img, W_img = img0.shape
+        # shared_prev, shared_curr = [], []
+        # for view in range(rgbd0.size(1)):
+        #     p, c = self.extract_feature(rgbd0[:, view], rgbd1[:, view], branch=None)
+        #     shared_prev.append(p)
+        #     shared_curr.append(c)
 
         corr_features = []
         multi_level_feats_prev = []
@@ -297,3 +368,53 @@ class FpTTC(nn.Module):
                             .permute(0,2,1) \
                             .reshape(B, C, H_r, W_r)
         return range_feat
+
+    def batch_resize_images_tensor(
+        self,
+        images: torch.Tensor,
+        input_size: int,
+        patch_multiple: int = 14
+    ):
+        """
+        Resize a batch of images (B, V, C, H, W) so that:
+        1) aspect ratio is preserved,
+        2) both height and width >= input_size,
+        3) final H and W are multiples of `patch_multiple`.
+
+        Args:
+            images: torch.Tensor of shape (B, V, C, H, W)
+            input_size: minimum target size for both H and W
+            patch_multiple: align factor (e.g. 14)
+
+        Returns:
+            resized: torch.Tensor of shape (B, V, C, H_new, W_new)
+            original_sizes: List[List[(H, W)]] of shape (B, V)
+        """
+        B, V, C, H, W = images.shape
+        # Record original sizes per view
+        original_sizes = [[(H, W) for _ in range(V)] for _ in range(B)]
+
+        # Flatten batch and view dims to N
+        x = images.view(B * V, C, H, W)
+
+        # 1. Compute scale to meet input_size
+        scale = max(input_size / H, input_size / W)
+        H_scaled = math.ceil(H * scale)
+        W_scaled = math.ceil(W * scale)
+
+        # 2. Align to patch_multiple
+        H_new = math.ceil(H_scaled / patch_multiple) * patch_multiple
+        W_new = math.ceil(W_scaled / patch_multiple) * patch_multiple
+
+        # 3. Batch interpolate
+        resized_flat = F.interpolate(
+            x,
+            size=(H_new, W_new),
+            mode='bilinear',
+            align_corners=True
+        )
+
+        # Reshape back to (B, V, C, H_new, W_new)
+        resized = resized_flat.view(B, V, C, H_new, W_new)
+
+        return resized, original_sizes
