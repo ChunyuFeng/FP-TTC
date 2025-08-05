@@ -5,14 +5,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=8 torchrun --standalone --nnodes=1 
 --attn_splits_list 2 8 \
 --corr_radius_list -1 4 \
 --prop_radius_list -1 1 \
---epoch 2400 \
+--epoch 1001 \
 --lr 4e-5 \
---batch_size 3 \
+--batch_size 1 \
 --stage 'nuscenes_range_image' \
---image_size 160 320 \
---finetune \
---ft_epoch_s1 0 \
---ft_epoch_s2 200 \
---resume ./pretrained/surroundttc_v1.pth.tar \
+--image_size 280 560 \
+--train_stage 'scale' \
+--scale_epochs 1001 \
+--scale_batch_size 9 \
+--dinov2_pretrained_ckpt './pretrained/depth_anything_v2_metric_vkitti_vitb.pth' \
+--scale_pretrained_ckpt  './pretrained/fpttc_mix.pth.tar' \
 --neptune \
 --parallel

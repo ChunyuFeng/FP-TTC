@@ -252,23 +252,7 @@ def main():
             for k in load_info.unexpected_keys:
                 print(f"    {k}")
     
-    if parallel:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
-                        output_device=local_rank, find_unused_parameters=True)
-
-        if is_main_process():
-            if not os.path.isdir(out_dir):
-                os.makedirs(out_dir, exist_ok=True)
-    else:
-        os.makedirs(out_dir, exist_ok=True)
-
-    if is_main_process():
-        print('Start Loading ...')
-
-    dataset = datasets.fetch_dataloader(args) 
-    
-    # stage 1: train scale branch
-    if args.train_stage in ('scale', 'both'):
+    if args.dinov2_pretrained_ckpt is not None:
         # 1) load Dinov2 pretrained weights
         dpt_ckpt = torch.load(args.dinov2_pretrained_ckpt, map_location=device)
         dinov2_sd = {
@@ -281,7 +265,8 @@ def main():
         model.dinov2.eval()
         for p in model.dinov2.parameters():
             p.requires_grad = False
-        
+
+    if args.scale_pretrained_ckpt is not None:    
         # 2) load scale pretrained weights
         scale_ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
         scale_sd = {k.replace('module.', ''): v for k, v in scale_ckpt['net'].items()}
@@ -301,6 +286,56 @@ def main():
             print(f"[WARN] Unexpected ({len(scale_load_info.unexpected_keys)}) keys (not used by model):")
             for k in scale_load_info.unexpected_keys:
                 print(f"    {k}")
+
+    if parallel:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
+                        output_device=local_rank, find_unused_parameters=True)
+
+        if is_main_process():
+            if not os.path.isdir(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+    else:
+        os.makedirs(out_dir, exist_ok=True)
+
+    if is_main_process():
+        print('Start Loading ...')
+
+    dataset = datasets.fetch_dataloader(args) 
+    
+    # stage 1: train scale branch
+    if args.train_stage in ('scale', 'both'):
+        # # 1) load Dinov2 pretrained weights
+        # dpt_ckpt = torch.load(args.dinov2_pretrained_ckpt, map_location=device)
+        # dinov2_sd = {
+        #     k[len("pretrained."):]: v
+        #     for k, v in dpt_ckpt.items()
+        #     if k.startswith("pretrained.")
+        # }
+        # dinov2_load_info = model.dinov2.load_state_dict(dinov2_sd, strict=False)
+        # print(f"[INFO] DINOv2 加载详情: {dinov2_load_info}")
+        # model.dinov2.eval()
+        # for p in model.dinov2.parameters():
+        #     p.requires_grad = False
+        
+        # # 2) load scale pretrained weights
+        # scale_ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
+        # scale_sd = {k.replace('module.', ''): v for k, v in scale_ckpt['net'].items()}
+        # scale_load_info = model.load_state_dict(scale_sd, strict=False)
+
+        # if is_main_process():
+        #     # 成功匹配到的 keys = 原来 sd 里所有 keys，扣掉 “unexpected_keys”
+        #     loaded_keys = set(scale_sd.keys()) - set(scale_load_info.unexpected_keys)
+        #     print(f"[INFO] Loaded ({len(loaded_keys)}) keys:")
+        #     for k in sorted(loaded_keys):
+        #         print(f"    {k}")
+
+        #     print(f"[WARN] Missing ({len(scale_load_info.missing_keys)}) keys (not found in checkpoint):")
+        #     for k in scale_load_info.missing_keys:
+        #         print(f"    {k}")
+
+        #     print(f"[WARN] Unexpected ({len(scale_load_info.unexpected_keys)}) keys (not used by model):")
+        #     for k in scale_load_info.unexpected_keys:
+        #         print(f"    {k}")
 
         # 1) freeze risk branch
         freeze_prefixes = (
