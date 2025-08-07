@@ -657,11 +657,11 @@ class NuscRangeImageAugmentor:
 
         # —— 第一步：在原图上预裁剪 —— 
         # 保留 15° 重叠区域
-        # pre_w, pre_h = 1440, 810
+        pre_w, pre_h = 1440, 810
         # 保留 5° 重叠区域
         # pre_w, pre_h = 1248, 702
         # 保留 0° 重叠区域
-        pre_w, pre_h = 1152, 648
+        # pre_w, pre_h = 1152, 648
         # 横向居中
         x0 = (w - pre_w) // 2
         # 底部对齐

@@ -33,9 +33,9 @@ def make_video(input_folder, output_path, fps=10):
     for idx in idxs:
         prev_path  = os.path.join(input_folder, f"concat_prev_{idx}.png")
         # gt_scale_path = os.path.join(input_folder, f"gt_scale_{idx}.png")
-        pred_scale_path = os.path.join(input_folder, f"pred_scale_{idx}.png")
+        pred_scale_path = os.path.join(input_folder, f"colli_scale_pred_{idx}.png")
         # gt_risk_path  = os.path.join(input_folder, f"gt_risk_{idx}.png")
-        pred_risk_path = os.path.join(input_folder, f"pred_risk_{idx}.png")
+        pred_risk_path = os.path.join(input_folder, f"colli_risk_pred_{idx}.png")
 
         # 逐张读取并检查
         prev_img  = cv2.imread(prev_path)
