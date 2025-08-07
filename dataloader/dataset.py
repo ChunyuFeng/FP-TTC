@@ -892,7 +892,8 @@ class nuScenes_range_image(data.Dataset):
         return self
 
 
-def build_frame_mapping(data, dataset_key, frame_key, affine_matrix, idx, H_r=40, W_r=480, visualize=False):
+def build_frame_mapping(data, dataset_key, frame_key, depth_map,
+                        affine_matrix, idx, H_r=40, W_r=480, visualize=False):
     """
     读取该帧的相机深度预测结果，以及内外参信息，将其反投影到 LiDAR 坐标系
     并进行 range projection，得到 range image 的投影坐标
@@ -905,10 +906,7 @@ def build_frame_mapping(data, dataset_key, frame_key, affine_matrix, idx, H_r=40
     all_pix    = []
 
     for cam_idx, channel in enumerate(camera_channels):
-        # 1) 读取 idx 帧、cam_idx 相机的 depth pred map
-        depth_pred_path = data[idx][f'{frame_key}_camera_data'][channel]['depth_pred']
-        depth_pred_map  = np.load(depth_pred_path)  # (H_img, W_img)
-
+        
         # 2) 将 nusc 提供的四元数内参转换为矩阵 K
         #    将 LiDAR --> Ego_LiDAR_Frame --> Global --> Ego_Camera_Frame --> Camera 的外参投影矩阵合并
         #    得到 LiDAR --> Camera 的旋转、平移矩阵
@@ -919,6 +917,7 @@ def build_frame_mapping(data, dataset_key, frame_key, affine_matrix, idx, H_r=40
             sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c}
 
             # 3) 根据深度图和相机内外参，将像素坐标转换为 LiDAR 坐标系下的 XYZ 坐标
+            depth_pred_map = depth_map[channel]
             coords = get_geometry(depth_pred_map, sensor_meta, affine_matrix)  # (H_img, W_img, 3)
             coords_n = coords.copy() 
             # 翻转 x、y
@@ -926,6 +925,9 @@ def build_frame_mapping(data, dataset_key, frame_key, affine_matrix, idx, H_r=40
             coords_n[:, :, 1] *= -1            # y_n = -y_local
 
         elif dataset_key == 'nusc':
+            # 读取 idx 帧、cam_idx 相机的 depth pred map
+            depth_pred_path = data[idx][f'{frame_key}_camera_data'][channel]['depth_pred']
+            depth_pred_map  = np.load(depth_pred_path)  # (H_img, W_img)
             proj_matrix, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
                 data[idx][f'sensor_metas_{frame_key}'],
                 data[idx][f'sensor_metas_{frame_key}']['camera']['calibrated_sensor'][channel],

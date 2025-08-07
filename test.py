@@ -249,8 +249,7 @@ def main():
         #     augmented_curr, _ = augmentor(curr_images_undistorted.copy(), affine_params)
         #     affine_matrix = augmentor.get_affine_matrix(affine_params)
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view'):
-
-            start = time.perf_counter()
+            # start = time.perf_counter()
             # 1) 并行加载 + 去畸变
 
             # 用线程池并行处理所有通道的 prev/curr
@@ -266,7 +265,7 @@ def main():
 
             # 2) 批量仿射增强 —— 用 Albumentations 一次性处理所有视角
             orig_h, orig_w = next(iter(prev_raw.values())).shape[:2]
-            params = augmentor.sample_params((orig_w, orig_h))
+            params = augmentor.sample_params_sjtu((orig_w, orig_h))
             resize_w, resize_h = params['resize']      # (width, height)
             crop_x, crop_y = params['crop']            # (x offset, y offset)
             crop_h, crop_w = augmentor.crop_size       # from your class
@@ -306,8 +305,8 @@ def main():
             }
             affine_matrix = augmentor.get_affine_matrix(params)
 
-            end1 = time.perf_counter()
-            print(f"Image loading and augmentation took {(end1 - start)*1000:.2f} ms")
+            # end1 = time.perf_counter()
+            # print(f"Image loading and augmentation took {(end1 - start)*1000:.2f} ms")
 
             # Convert to tensors and stack
             prev_tensors = [torch.from_numpy(augmented_prev[ch]).permute(2,0,1).float() for ch in camera_channels]
@@ -319,6 +318,8 @@ def main():
             # 2) Load Depth Pred Map (DepthAnythingV2)
             prev_depth_pred_map = {}
             curr_depth_pred_map = {}
+            prev_depth_pred_map_tensor = {}
+            curr_depth_pred_map_tensor = {}
 
             ######################### 从预先生成的 Depth Map 中加载 #########################
             # for channel in camera_channels:
@@ -344,14 +345,14 @@ def main():
                 raw_image_curr = cv2.cvtColor(augmented_curr[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
                 curr_depth_pred_map[channel] = depth_model.infer_image(raw_image_curr, input_size=320)
 
-                prev_depth_pred_map[channel] = torch.from_numpy(prev_depth_pred_map[channel])
-                curr_depth_pred_map[channel] = torch.from_numpy(curr_depth_pred_map[channel])
+                prev_depth_pred_map_tensor[channel] = torch.from_numpy(prev_depth_pred_map[channel])
+                curr_depth_pred_map_tensor[channel] = torch.from_numpy(curr_depth_pred_map[channel])
 
-            prev_depths_pred_tensor = torch.stack([prev_depth_pred_map[channel] for channel in camera_channels], dim=0).unsqueeze(1)
-            curr_depths_pred_tensor = torch.stack([curr_depth_pred_map[channel] for channel in camera_channels], dim=0).unsqueeze(1)
+            prev_depths_pred_tensor_stacked = torch.stack([prev_depth_pred_map_tensor[channel] for channel in camera_channels], dim=0).unsqueeze(1)
+            curr_depths_pred_tensor_stacked = torch.stack([curr_depth_pred_map_tensor[channel] for channel in camera_channels], dim=0).unsqueeze(1)
 
-            prev_depths_pred_batch = prev_depths_pred_tensor.unsqueeze(0).to(device)
-            curr_depths_pred_batch = curr_depths_pred_tensor.unsqueeze(0).to(device)
+            prev_depths_pred_batch = prev_depths_pred_tensor_stacked.unsqueeze(0).to(device)
+            curr_depths_pred_batch = curr_depths_pred_tensor_stacked.unsqueeze(0).to(device)
 
             # end_event.record()
             # torch.cuda.synchronize()
@@ -359,8 +360,10 @@ def main():
             # print(f"test：{elapsed_ms:.3f} ms")
 
             # 3) load 环视图像 uv 坐标与 range view uv 坐标之间的对应关系 (DepthAnythingV2)
-            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'sjtu', 'prev', affine_matrix, idx, H_r=40, W_r=480, visualize=False)
-            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'sjtu', 'curr', affine_matrix, idx, H_r=40, W_r=480, visualize=False)
+            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'sjtu', 'prev', prev_depth_pred_map,
+                                                                 affine_matrix, idx, H_r=40, W_r=480, visualize=False)
+            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'sjtu', 'curr', curr_depth_pred_map,
+                                                                 affine_matrix, idx, H_r=40, W_r=480, visualize=False)
             # 转换为 tensor
             proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
             proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
@@ -384,15 +387,16 @@ def main():
                         num_reg_refine   = args.num_reg_refine,
                         testing          = False
                     )
-            end2 = time.perf_counter()
-            print(f"Inference took {(end2 - end1)*1000:.2f} ms")
+            # end2 = time.perf_counter()
+            # print(f"Inference took {(end2 - end1)*1000:.2f} ms")
 
-            print(f"The whole process took {(end2 - start)*1000:.2f} ms")
+            # print(f"The whole process took {(end2 - start)*1000:.2f} ms")
 
             # Visualization
             # visualize RGB images
             concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
             concat_prev = concat_prev.astype(np.uint8)
+            concat_prev = cv2.cvtColor(concat_prev, cv2.COLOR_BGR2RGB)
             concat_prev_img = Image.fromarray(concat_prev)
             concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
 

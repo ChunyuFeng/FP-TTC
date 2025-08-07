@@ -9,19 +9,6 @@ import numpy as np
 import cv2
 from scipy.spatial.transform import Rotation
 
-# ====================== 畸变参数使用说明 ======================
-# 1. 从 YAML 中加载 distortion 系数后，可用于以下两种场景：
-#    a. 图像矫正：使用 undistort_image(...) 去除径向/切向畸变，获得校正图像。
-#    b. 像素点矫正：使用 undistort_points(...) 将像素点由畸变坐标转换为无畸变坐标。
-# 2. 示例：
-#    calib = load_camera_projections('calib.yaml')
-#    cam = calib['cam_front']
-#    K, dist = cam['K'], cam['dist']
-#    img = cv2.imread('img.jpg')
-#    und_img, new_K, roi = undistort_image(img, K, dist)
-#    pts = [[100,200], [150,250]]
-#    und_pts = undistort_points(pts, K, dist, new_K)
-# =============================================================
 
 def load_camera_projections(yaml_path):
     """
@@ -82,7 +69,6 @@ def load_camera_projections(yaml_path):
 
     return calib
 
-
 def undistort_image(image, K, dist):
     """
     使用相机内参和畸变系数对图像进行畸变矫正。
@@ -104,76 +90,20 @@ def undistort_image(image, K, dist):
     undistorted = cv2.undistort(image, K, dist, None, new_K)
     return undistorted, new_K, roi
 
-def intersect_rois(roi1, roi2):
-    """
-    计算两个 ROI 的最小交集，返回交集 ROI 或 None。
-    roi 格式 (x, y, w, h) - (left, top, width, height)
-    """
-    x1,y1,w1,h1 = roi1
-    x2,y2,w2,h2 = roi2
-    xi = max(x1,x2)
-    yi = max(y1,y2)
-    xe = min(x1+w1, x2+w2)
-    ye = min(y1+h1, y2+h2)
-    wi = xe - xi
-    hi = ye - yi
-    if wi<=0 or hi<=0:
-        return None
-    return (int(xi), int(yi), int(wi), int(hi))
-
-# def load_camera_projections(yaml_path):
-#     """
-#     读取包含多相机内外参的 YAML 文件，返回每个相机的投影矩阵 P（3x4）。
-
-#     Args:
-#         yaml_path (str): YAML 文件路径。
-
-#     Returns:
-#         dict: 键为相机名称，值为对应的 3x4 投影矩阵 P。
-#     """
-#     # 1. 读取 YAML
-#     with open(yaml_path, 'r') as f:
-#         config = yaml.safe_load(f)
-
-#     projections = {}
-#     R_ext = {}
-#     t_ext = {}
-#     cameras = config.get('cameras', {})
-
-#     for cam_name, cam_cfg in cameras.items():
-#         # 2. 构造内参矩阵 K
-#         intr = cam_cfg['intrinsics']
-#         fx, fy = intr['fx'], intr['fy']
-#         cx, cy = intr['cx'], intr['cy']
-#         K = np.array([
-#             [fx,  0, cx],
-#             [ 0, fy, cy],
-#             [ 0,  0,  1],
-#         ])
-
-#         # 3. 构造外参 [R|t]
-#         ext = cam_cfg['extrinsics']
-#         t = np.array(ext['translation']).reshape(3, 1)
-#         # 四元数格式： [x, y, z, w]
-#         q = ext['rotation']
-#         R = Rotation.from_quat(q).as_matrix()
-
-#         # 4. 合成投影矩阵 P = K * [R|t]
-#         RT = np.hstack((R, t))    # 3×4
-#         P = K.dot(RT)
-
-#         projections[cam_name] = P
-#         R_ext[cam_name] = R
-#         t_ext[cam_name] = t
-
-#     return projections, R_ext, t_ext
-
 def build_image_index(base_dir):
     """
     遍历 base_dir 下的每个子文件夹（channel），
-    收集其中所有 .jpg 文件，按文件名中的时间戳排序，
+    收集其中所有符合 `{channel}__seq_{seq}__{ts_usec}.jpg` 格式的文件，
+    按 seq（sequence）从小到大排序，
     返回结构：
-      { channel_name: { 'filename': [...], 'timestamp': [...] }, ... }
+      {
+        channel_name: {
+          'filename': [...],
+          'timestamp': [...],
+          'sequence': [...]
+        },
+        ...
+      }
     """
     if not os.path.isdir(base_dir):
         print(f"ERROR: 目录不存在: {base_dir}", file=sys.stderr)
@@ -189,19 +119,27 @@ def build_image_index(base_dir):
         for fn in os.listdir(channel_dir):
             if not fn.lower().endswith('.jpg'):
                 continue
-            try:
-                ts = int(fn.rsplit('__', 1)[1].split('.')[0])
-            except (IndexError, ValueError):
+            parts = fn.split('__')
+            # 期望格式：{channel}__seq_{seq}__{ts_usec}.jpg
+            if len(parts) < 3 or not parts[1].startswith('seq_'):
                 continue
-            items.append((ts, os.path.join(channel_dir, fn)))
+            try:
+                seq = int(parts[1].split('_', 1)[1])
+                ts  = int(parts[2].split('.')[0])
+            except ValueError:
+                continue
+            items.append((seq, ts, os.path.join(channel_dir, fn)))
 
         if not items:
             continue
 
+        # 只按 seq 排序
         items.sort(key=lambda x: x[0])
+
         img_dict[channel] = {
-            'filename':  [path for ts, path in items],
-            'timestamp': [ts   for ts, path in items]
+            'filename':  [path for seq, ts, path in items],
+            'timestamp': [ts   for seq, ts, path in items],
+            'sequence':  [seq  for seq, ts, path in items],
         }
 
     return img_dict
@@ -279,38 +217,35 @@ def main():
     parser.add_argument('--image_size', type=int, nargs=2, required=True,
                         metavar=('HEIGHT','WIDTH'),
                         help='单通道图像的高和宽')
-    parser.add_argument('--hz', type=int, default=10,
-                        help='同步采样的目标帧率 (Hz)')
+    parser.add_argument('--scene_idx', type=int, default=0,
+                        help='场景索引')
     parser.add_argument('--yaml_path', type=str, required=True,
                         help='包含相机内外参的 YAML 文件路径')
     args = parser.parse_args()
 
     # 构建和同步帧字典
-    img_dict    = build_image_index(args.base_dir)
-    synced      = sync_image_dict(img_dict, hz=args.hz)
-    calib       = load_camera_projections(args.yaml_path)
-    # projections = {"P": P, "R_ext": R_ext, "t_ext": t_ext}
-
-    max_diffs = compute_max_timestamp_diff(synced)
-    print(f"最大时间戳差值（微秒）- 最大: {max(max_diffs)}, 平均: {sum(max_diffs)/len(max_diffs):.2f}")
+    img_dict = build_image_index(args.base_dir)
+    calib    = load_camera_projections(args.yaml_path)
 
     # 生成测试信息列表
     sjtu_test_infos = []
-    channels = sorted(synced.keys())
-    frame_count = len(synced[channels[0]]['timestamp'])
+    channels = sorted(img_dict.keys())
+    frame_count = len(img_dict[channels[0]]['timestamp'])
 
     for i in range(1, frame_count):
+        seq = img_dict[channels[0]]['sequence'][i]
+        if seq < 1640 or seq > 10060:
+            continue
         prev_data, curr_data = {}, {}
         for ch in channels:
             prev_data[ch] = {
-                'filename':  synced[ch]['filename'][i-1],
-                'timestamp': synced[ch]['timestamp'][i-1]
+                'filename':  img_dict[ch]['filename'][i-1],
+                'timestamp': img_dict[ch]['timestamp'][i-1]
             }
             curr_data[ch] = {
-                'filename':  synced[ch]['filename'][i],
-                'timestamp': synced[ch]['timestamp'][i]
+                'filename':  img_dict[ch]['filename'][i],
+                'timestamp': img_dict[ch]['timestamp'][i]
             }
-
         info = {
             'prev_camera_data':  prev_data,
             'curr_camera_data':  curr_data,
@@ -321,12 +256,13 @@ def main():
             'gt_map_path':       None,
             'scene_flow_path':   None,
             'scene_indice':      None,
+            'ros_msg_seq':       seq
         }
         sjtu_test_infos.append(info)
 
     # 确保保存目录存在
     os.makedirs(args.pkl_save_path, exist_ok=True)
-    pkl_name = f"sjtu_test_infos_{args.image_size[0]}_{args.image_size[1]*len(channels)}.pkl"
+    pkl_name = f"scene_{args.scene_idx}_sjtu_test_infos_{args.image_size[0]}_{args.image_size[1]*len(channels)}.pkl"
     pkl_path = os.path.join(args.pkl_save_path, pkl_name)
     with open(pkl_path, 'wb') as f:
         pickle.dump(sjtu_test_infos, f)

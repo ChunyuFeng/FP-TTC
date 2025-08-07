@@ -176,7 +176,7 @@ def compute_and_save_percentile_masks_and_compose(
     disp0 = -visual_scale_map_range_image(scale_map, default_mask)
     disp1 = -visual_scale_map_range_image(scale_map, mask_scale_low3)
     disp2 = -visual_scale_map_range_image(scale_map, mask_intersect)
-    disp3 =  visual_risk_score_map_range_image(risk_map)
+    disp3 = -visual_risk_score_map_range_image(risk_map, None)
     tmp   = risk_map.copy()
     tmp[~mask_risk_high3] = 0.0
     disp4 =  visual_risk_score_map_range_image(tmp)
@@ -339,7 +339,7 @@ def extract_candidate_points(scale_map, norm_scale, valid_grad_mask, grid_map, g
 
     for kp in kps:
         x, y = int(kp.pt[0]), int(kp.pt[1])
-        if not (0.3*proc_h < y < 0.9*proc_h and 0.1*proc_w < x < 0.9*proc_w):
+        if not (0.3*proc_h < y < 0.8*proc_h and 0.1*proc_w < x < 0.9*proc_w):
             continue
         area = 9
         y0, y1 = max(y-area//2,0), min(y+area//2+1,proc_h)
@@ -436,104 +436,141 @@ def cluster_and_compute(scale_map, risk_map, candidates, delta_t, risk_time_thre
                 collisions.append([int(cx),int(cy),ctmin,scale_map[int(cy),int(cx)],risk_map[int(cy),int(cx)]])
     return collisions
 
-# def cluster_and_compute(scale_map, risk_map, candidates,
-#                         delta_t, risk_time_threshold,
-#                         save_dir=None, idx=None, visualize=False):
+
+# # 带有可视化功能的 cluster_and_compute
+# def cluster_and_compute(
+#     scale_map, risk_map, candidates,
+#     delta_t, risk_time_threshold,
+#     save_dir=None, idx=None, visualize=False
+# ):
+#     """
+#     对候选点做两步 DBSCAN 聚类并计算碰撞时间。
+#     如果 visualize=True 且给定 save_dir/idx，
+#     会在与 scale_map 同尺寸（H×W）的白底画布上渲染每个 cluster 点，并保存：
+#       - stage1_clusters_map_<idx>.png
+#       - stage2_clusters_map_<idx>.png
+#     噪声点不显示。
+#     """
 #     collisions = []
 #     if candidates.size == 0:
 #         return collisions
 
-#     # ———— 第一阶段聚类 ————
-#     clu1 = DBSCAN(eps=50, min_samples=5).fit(candidates)
-#     clusters1 = {}
-#     for i, label in enumerate(clu1.labels_):
-#         if label < 0: continue
-#         clusters1.setdefault(label, []).append(candidates[i])
+#     H, W = scale_map.shape  # 例如 160×1920
 
-#     # 如果需要可视化并保存第一阶段结果
+#     # ———— 第一步聚类 ————
+#     clu1    = DBSCAN(eps=50, min_samples=5).fit(candidates[:, :2])
+#     labels1 = clu1.labels_
+
+#     # 可视化第一步聚类：在 160×1920 白图上画彩色点
 #     if visualize and save_dir and idx is not None:
-#         fig1, ax1 = plt.subplots(figsize=(6,6))
-#         ax1.set_title(f'Stage1 Clusters (frame {idx})')
-#         ax1.invert_yaxis()
-#         for label, pts in clusters1.items():
-#             arr = np.array(pts)
-#             color = (random.random(), random.random(), random.random())
-#             ax1.scatter(arr[:,0], arr[:,1], s=10, c=[color], label=f'C{label}')
-#             (cx,cy), r = cv2.minEnclosingCircle(arr[:,:2].astype(np.int32))
-#             circle = plt.Circle((cx,cy), r, fill=False, color=color, linewidth=2)
-#             ax1.add_patch(circle)
-#         ax1.legend(loc='upper right', fontsize='small')
 #         os.makedirs(save_dir, exist_ok=True)
-#         fig1.savefig(os.path.join(save_dir, f'stage1_clusters_{idx}.png'),
-#                      dpi=150, bbox_inches='tight')
-#         plt.close(fig1)
+#         canvas1 = np.ones((H, W, 3), dtype=np.uint8) * 255  # 白底
+#         # 为每个簇分配随机颜色（噪声跳过）
+#         unique1 = set(labels1)
+#         colors1 = {
+#             lab: tuple((np.random.rand(3) * 255).astype(int))
+#             for lab in unique1 if lab != -1
+#         }
+#         # 渲染每个簇的点
+#         for lab, color in colors1.items():
+#             pts = candidates[labels1 == lab, :2].astype(int)
+#             for x, y in pts:
+#                 if 0 <= x < W and 0 <= y < H:
+#                     canvas1[y, x] = color
+#         # 保存图像
+#         cv2.imwrite(
+#             os.path.join(save_dir, f"stage1_clusters_map_{idx}.png"),
+#             canvas1
+#         )
 
-#     # 准备第二阶段的临时中心和区域
+#     # 构建第二步聚类输入：取非噪声簇的最小外接圆中心
 #     sec_centers, sec_regions = [], []
-#     for pts in clusters1.values():
-#         arr = np.array(pts)[:,:2].astype(int)
-#         (cx,cy), r = cv2.minEnclosingCircle(arr)
-#         ct = delta_t/(1-scale_map[int(cy),int(cx)]+1e-5)
-#         if r<6 and arr.shape[0]<4:
+#     for lab in set(labels1):
+#         if lab < 0:
 #             continue
-#         sec_centers.append([cx,cy,ct*200])
-#         sec_regions.append(arr)
+#         pts = candidates[labels1 == lab, :2].astype(int)
+#         (cx, cy), r = cv2.minEnclosingCircle(pts)
+#         if r < 6 and pts.shape[0] < 4:
+#             continue
+#         ttc = delta_t / (1 - scale_map[int(cy), int(cx)] + 1e-5)
+#         sec_centers.append([cx, cy, ttc * 200])
+#         sec_regions.append(pts)
 #     sec_centers = np.array(sec_centers)
+
 #     if sec_centers.size == 0:
 #         return collisions
 
-#     # ———— 第二阶段聚类 ————
-#     clu2 = DBSCAN(eps=100, min_samples=3).fit(sec_centers)
-#     regions = {}
-#     for i, label in enumerate(clu2.labels_):
-#         regions.setdefault(label, []).append(sec_regions[i])
+#     # ———— 第二步聚类 ————
+#     clu2    = DBSCAN(eps=100, min_samples=3).fit(sec_centers[:, :3])
+#     labels2 = clu2.labels_
 
-#     # 如果需要可视化并保存第二阶段结果
+#     # 可视化第二步聚类：同样在 160×1920 白图上渲染
 #     if visualize and save_dir and idx is not None:
-#         fig2, ax2 = plt.subplots(figsize=(6,6))
-#         ax2.set_title(f'Stage2 Clusters (frame {idx})')
-#         ax2.invert_yaxis()
-#         for label, regs in regions.items():
+#         canvas2 = np.ones((H, W, 3), dtype=np.uint8) * 255  # 白底
+#         # 根据 labels2 将 sec_regions 分类
+#         regions = {}
+#         for i, lab in enumerate(labels2):
+#             if lab < 0:
+#                 continue
+#             regions.setdefault(lab, []).append(sec_regions[i])
+#         # 为每个簇分配随机颜色
+#         colors2 = {
+#             lab: tuple((np.random.rand(3) * 255).astype(int))
+#             for lab in regions
+#         }
+#         # 渲染每个簇的所有点
+#         for lab, regs in regions.items():
+#             color = colors2[lab]
+#             for reg in regs:           # reg 是一个 (N,2) 数组
+#                 for x, y in reg:
+#                     if 0 <= x < W and 0 <= y < H:
+#                         canvas2[y, x] = color
+#         cv2.imwrite(
+#             os.path.join(save_dir, f"stage2_clusters_map_{idx}.png"),
+#             canvas2
+#         )
+
+#     # ———— 基于聚类结果计算最终 collisions 列表 ————
+#     regions2 = {}
+#     for i, lab in enumerate(labels2):
+#         regions2.setdefault(lab, []).append(sec_regions[i])
+
+#     for lab, regs in regions2.items():
+#         if lab < 0:
+#             # 噪声簇：将各 reg 单独计算
+#             for reg in regs:
+#                 (cx, cy), _ = cv2.minEnclosingCircle(reg)
+#                 ct = delta_t / (1 - scale_map[int(cy), int(cx)] + 1e-5)
+#                 if 0 < ct < risk_time_threshold:
+#                     collisions.append([
+#                         int(cx), int(cy), ct,
+#                         scale_map[int(cy), int(cx)],
+#                         risk_map[int(cy), int(cx)]
+#                     ])
+#         else:
+#             # 合并簇内所有点再计算最小 ttc
 #             merged = np.vstack(regs)
-#             color = (random.random(), random.random(), random.random())
-#             ax2.scatter(merged[:,0], merged[:,1], s=10, c=[color], label=f'C{label}')
-#             (cx,cy), r = cv2.minEnclosingCircle(merged)
-#             circle = plt.Circle((cx,cy), r, fill=False, color=color, linewidth=2)
-#             ax2.add_patch(circle)
-#         ax2.legend(loc='upper right', fontsize='small')
-#         os.makedirs(save_dir, exist_ok=True)
-#         fig2.savefig(os.path.join(save_dir, f'stage2_clusters_{idx}.png'),
-#                      dpi=150, bbox_inches='tight')
-#         plt.close(fig2)
+#             cts = [
+#                 delta_t / (1 - scale_map[int(y), int(x)] + 1e-5)
+#                 for x, y in merged
+#             ]
+#             ctmin = min(cts)
+#             (cx, cy), _ = cv2.minEnclosingCircle(merged)
+#             if 0 < ctmin < risk_time_threshold:
+#                 collisions.append([
+#                     int(cx), int(cy), ctmin,
+#                     scale_map[int(cy), int(cx)],
+#                     risk_map[int(cy), int(cx)]
+#                 ])
 
-    # ———— 后续原有的 collision 过滤逻辑 ————
-    for label, regs in regions.items():
-        if label < 0:
-            for reg in regs:
-                (cx,cy),_ = cv2.minEnclosingCircle(reg)
-                ct = delta_t/(1-scale_map[int(cy),int(cx)]+1e-5)
-                if 0<ct<risk_time_threshold:
-                    collisions.append([int(cx),int(cy),ct,
-                                       scale_map[int(cy),int(cx)],
-                                       risk_map[int(cy),int(cx)]])
-        else:
-            merged = np.vstack(regs)
-            cts = [delta_t/(1-scale_map[int(p[1]),int(p[0])]+1e-5) 
-                   for p in merged]
-            ctmin = min(cts)
-            (cx,cy),_ = cv2.minEnclosingCircle(merged)
-            if 0<ctmin<risk_time_threshold:
-                collisions.append([int(cx),int(cy),ctmin,
-                                   scale_map[int(cy),int(cx)],
-                                   risk_map[int(cy),int(cx)]])
+#     return collisions
 
-    return collisions
 
 def filter_by_risk(collisions, risk_pred_threshold):
     """
     根据 risk_pred_map 过滤碰撞点
     """
-    return [pt for pt in collisions if pt[-1] > risk_pred_threshold]
+    return [pt for pt in collisions if pt[-1] < risk_pred_threshold]
 
 
 def visualize_range_image(ax, map_to_vis, collisions, type='scale'):
@@ -548,8 +585,8 @@ def visualize_range_image(ax, map_to_vis, collisions, type='scale'):
         disp = visual_scale_map_range_image(map_to_vis, mask)
         ax.imshow(-disp, cmap='seismic', vmin=-1, vmax=1)
     elif type == 'risk':
-        disp = visual_risk_score_map_range_image(map_to_vis)
-        ax.imshow(disp, cmap='seismic', vmin=-1, vmax=1)
+        disp = visual_risk_score_map_range_image(map_to_vis, None)
+        ax.imshow(-disp, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
     else:
         raise ValueError("Invalid type. Use 'scale' or 'risk'.")
     # 绘制碰撞点，并添加文本标签：ttc 和 risk
@@ -794,18 +831,23 @@ def main():
 
     idx_offset = int(files[0].split('_')[-1].split('.')[0]) if files else 0
     for idx, fn in enumerate(tqdm(files)):
-        if idx > 190:
+        if idx < 1351:
             continue
         idx = idx + idx_offset
         pred_path = os.path.join(args.pred_npy_dir, fn)
         scale_map, risk_map = load_prediction(pred_path)
+        scale_thresh = 1 - delta_t / args.risk_time_threshold
+        # 保留小于阈值的值，其余置为0
+        scale_map_filtered = np.where(scale_map < scale_thresh, scale_map, 0.999)
+        # scale_map_filtered = np.where(risk_map < args.risk_pred_threshold, scale_map_filtered, 0.999)
         crop_scale, norm_scale = preprocess_scale_map(
-            scale_map, args.grid_size, args.approach_threshold
+            scale_map_filtered, args.grid_size, args.approach_threshold
         )
         valid_grad, grid_map = compute_valid_masks(
             crop_scale, args.grid_size, args.grad_step,
             args.risk_rate, args.approach_threshold
         )
+        # orientation_mask = np.where(risk_map < args.risk_pred_threshold, risk_map, np.pi)
         candidates = extract_candidate_points(
             crop_scale, norm_scale, valid_grad, grid_map,
             args.grid_size, args.grad_step,
@@ -815,9 +857,13 @@ def main():
             crop_scale, risk_map, candidates, delta_t, args.risk_time_threshold
         )
         # collisions = cluster_and_compute(
-        #     crop_scale, risk_map, candidates, delta_t, args.risk_time_threshold,
-        #     save_dir=args.vis_dir, idx=idx, visualize=args.save
+        #     crop_scale, risk_map, candidates,
+        #     delta_t, args.risk_time_threshold,
+        #     save_dir=args.vis_dir,   # 或者你想存图的目录
+        #     idx=idx,
+        #     visualize=True
         # )
+
         regions = extract_small_regions(
             args, crop_scale, risk_map, delta_t, args.risk_time_threshold
         )
@@ -895,11 +941,11 @@ def main():
                 #     save_dir=args.vis_dir,
                 #     idx=idx
                 # )
-                mask_lo3, mask_hi3, mask_int = compute_and_save_percentile_masks_and_compose(
-                    scale_map, risk_map,
-                    save_dir=args.vis_dir,
-                    idx=idx
-                )
+                # mask_lo3, mask_hi3, mask_int = compute_and_save_percentile_masks_and_compose(
+                #     scale_map, risk_map,
+                #     save_dir=args.vis_dir,
+                #     idx=idx
+                # )
 
         # 逐帧自动显示结果
         else:
