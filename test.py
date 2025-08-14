@@ -11,7 +11,9 @@ from fpttc.fp_ttc import FpTTC
 from utils.trainer import TTCTrainer
 from utils.draw import (
     visual_scale_map_range_image,
-    visual_risk_score_map_range_image
+    visual_risk_score_map_range_image,
+    scale2rgb,
+    orientation2rgb
 )
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
 from dataloader.dataset import build_frame_mapping
@@ -118,8 +120,7 @@ def main():
                   num_head               = args.num_head,
                   ffn_dim_expansion      = args.ffn_dim_expansion,
                   num_transformer_layers = args.num_transformer_layers,
-                  reg_refine             = args.reg_refine,
-                  train                  = False).cuda()
+                  reg_refine             = args.reg_refine).cuda()
 
     # Optionally resume checkpoint
     if args.resume:
@@ -249,6 +250,9 @@ def main():
         #     augmented_curr, _ = augmentor(curr_images_undistorted.copy(), affine_params)
         #     affine_matrix = augmentor.get_affine_matrix(affine_params)
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view'):
+
+            if idx < 4400 or idx > 4600:
+                continue
             # start = time.perf_counter()
             # 1) 并行加载 + 去畸变
 
@@ -385,7 +389,7 @@ def main():
                         corr_radius_list = args.corr_radius_list,
                         prop_radius_list = args.prop_radius_list,
                         num_reg_refine   = args.num_reg_refine,
-                        testing          = False
+                        scale_only       = False,
                     )
             # end2 = time.perf_counter()
             # print(f"Inference took {(end2 - end1)*1000:.2f} ms")
@@ -394,18 +398,29 @@ def main():
 
             # Visualization
             # visualize RGB images
-            concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
-            concat_prev = concat_prev.astype(np.uint8)
-            concat_prev = cv2.cvtColor(concat_prev, cv2.COLOR_BGR2RGB)
-            concat_prev_img = Image.fromarray(concat_prev)
-            concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
+            # concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
+            # concat_prev = concat_prev.astype(np.uint8)
+            # concat_prev = cv2.cvtColor(concat_prev, cv2.COLOR_BGR2RGB)
+            # concat_prev_img = Image.fromarray(concat_prev)
+            # concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
 
             scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
-            scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
-            normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
+            # scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
+            # normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
 
             risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
-            normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
+            # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
+
+            # new vis method
+            scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
+            vis = scale2rgb(scale_vis)
+            vis = vis*255.0
+            cv2.imwrite(os.path.join(output_dir, f"new_pred_scale_{idx}.png"), vis)
+
+            orien = np.clip(risk_prediction_array, 0.0, np.pi)
+            orien_vis = orientation2rgb(orien)
+            orien_vis = orien_vis * 255.0
+            cv2.imwrite(os.path.join(output_dir, f"new_pred_orien_{idx}.png"), orien_vis)
 
             # save prediction as .npy files for collision map generation
             if args.save_pred_npy:
@@ -419,14 +434,14 @@ def main():
                 np.save(os.path.join(pred_npy_subdir, f"pred_{idx}.npy"), pred_data)
 
             # Save visuals
-            plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
-                    -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
-            plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
-                    -normalized_pred_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+            # plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
+            #         -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
+            # plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
+            #         -normalized_pred_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
             
     else:
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
-            if test_entries[idx]['scene_indice'] != '10':
+            if test_entries[idx]['scene_indice'] != '7':
                 continue
             scene_indice = test_entries[idx]['scene_indice']
             # 1) load 相邻两帧的输入图像
@@ -494,8 +509,10 @@ def main():
                 gt_risk_tensor = torch.zeros((1, 2, prev_batch.shape[2], prev_batch.shape[3])).to(device)
 
             # 4) load 环视图像 uv 坐标与 range view uv 坐标之间的对应关系 (DepthAnythingV2)
-            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'nusc', 'prev', affine_matrix, idx, H_r=40, W_r=480)
-            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'nusc', 'curr', affine_matrix, idx, H_r=40, W_r=480)
+            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'nusc', 'prev', None, 
+                                                                 affine_matrix, idx, H_r=40, W_r=480)
+            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'nusc', 'curr', None, 
+                                                                 affine_matrix, idx, H_r=40, W_r=480)
             # 转换为 tensor
             proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
             proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
@@ -517,26 +534,55 @@ def main():
                         corr_radius_list = args.corr_radius_list,
                         prop_radius_list = args.prop_radius_list,
                         num_reg_refine   = args.num_reg_refine,
-                        testing          = False
+                        scale_only       = False,
                     )
 
-            # Visualization
+            # # Visualization
+            # gt_scale_array = gt_scale_tensor[0,0].cpu().numpy()
+            # gt_scale_mask_array = gt_scale_tensor[0,1].cpu().bool().numpy()
+            # normalized_gt_scale_image = visual_scale_map_range_image(gt_scale_array, gt_scale_mask_array)
+
+            # scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
+            # scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
+            # normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
+
+            # gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
+            # gt_risk_mask_array = gt_risk_tensor[0,1].cpu().bool().numpy()
+            # normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array, gt_risk_mask_array)
+
+            # risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
+            # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
+
             gt_scale_array = gt_scale_tensor[0,0].cpu().numpy()
-            gt_scale_mask_array = gt_scale_tensor[0,1].cpu().bool().numpy()
-            normalized_gt_scale_image = visual_scale_map_range_image(gt_scale_array, gt_scale_mask_array)
+            gt_scale_vis = np.clip(gt_scale_array, 0.0, 2.0)
+            gt_scale_vis = scale2rgb(gt_scale_vis)
+            gt_scale_vis = gt_scale_vis * 255.0
+            cv2.imwrite(os.path.join(output_dir, f"gt_scale_{idx}.png"), gt_scale_vis)
+            # gt_scale_mask_array = gt_scale_tensor[0,1].cpu().bool().numpy()
+            # normalized_gt_scale_image = visual_scale_map_range_image(gt_scale_array, gt_scale_mask_array)
 
             scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
-            scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
-            normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
+            scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
+            vis = scale2rgb(scale_vis)
+            vis = vis * 255.0
+            cv2.imwrite(os.path.join(output_dir, f"pred_scale_{idx}.png"), vis)
+            # scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
+            # normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
 
             gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
-            gt_risk_mask_array = gt_risk_tensor[0,1].cpu().bool().numpy()
-            normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array, gt_risk_mask_array)
-            # normalized_gt_risk_image = visual_risk_score_map_range_image_nonlinear(gt_risk_array)
+            gt_risk_vis = np.clip(gt_risk_array, 0.0, np.pi)
+            gt_risk_vis = orientation2rgb(gt_risk_vis)
+            gt_risk_vis = gt_risk_vis * 255.0
+            cv2.imwrite(os.path.join(output_dir, f"gt_risk_{idx}.png"), gt_risk_vis)
+            # gt_risk_mask_array = gt_risk_tensor[0,1].cpu().bool().numpy()
+            # normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array, gt_risk_mask_array)
 
             risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
-            normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
-            # normalized_pred_risk_image = visual_risk_score_map_range_image_nonlinear(risk_prediction_array)
+            risk_vis = np.clip(risk_prediction_array, 0.0, np.pi)
+            risk_vis = orientation2rgb(risk_vis)
+            risk_vis = risk_vis * 255.0
+            cv2.imwrite(os.path.join(output_dir, f"pred_risk_{idx}.png"), risk_vis)
+            # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
 
             # save prediction as .npy files
             # for collision map generation
@@ -557,14 +603,14 @@ def main():
             concat_prev_img = Image.fromarray(concat_prev)
             concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
 
-            plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
-                    -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
-            plt.imsave(os.path.join(output_dir, f"gt_scale_{idx}.png"),
-                    -normalized_gt_scale_image, cmap='seismic', vmin=-1, vmax=1)
-            plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
-                    -normalized_pred_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-            plt.imsave(os.path.join(output_dir, f"gt_risk_{idx}.png"),
-                    -normalized_gt_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+            # plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
+            #         -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
+            # plt.imsave(os.path.join(output_dir, f"gt_scale_{idx}.png"),
+            #         -normalized_gt_scale_image, cmap='seismic', vmin=-1, vmax=1)
+            # plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
+            #         -normalized_pred_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+            # plt.imsave(os.path.join(output_dir, f"gt_risk_{idx}.png"),
+            #         -normalized_gt_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
 
             # Cleanup
             del prev_batch, curr_batch, scale_pred, risk_pred

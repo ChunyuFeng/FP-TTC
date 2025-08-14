@@ -424,3 +424,147 @@ def visual_risk_score_map_range_image(risk_score_map, valid_mask):
     risk_score_display[~valid_mask] = 0.0  # 将无效像素设为0
 
     return risk_score_display
+
+def disp2rgb(disp):
+    H = disp.shape[0]
+    W = disp.shape[1]
+
+    I = disp.flatten()
+
+    map = np.array([[0, 0, 0, 114], [0, 0, 1, 185], [1, 0, 0, 114], [1, 0, 1, 174],
+                    [0, 1, 0, 114], [0, 1, 1, 185], [1, 1, 0, 114], [1, 1, 1, 0]])
+    bins = map[:-1,3]
+    cbins = np.cumsum(bins)
+    bins = bins/cbins[-1]
+    cbins = cbins[:-1]/cbins[-1]
+
+    ind = np.minimum(np.sum(np.repeat(I[None, :], 6, axis=0) > np.repeat(cbins[:, None],
+                                    I.shape[0], axis=1), axis=0), 6)
+    bins = np.reciprocal(bins)
+    cbins = np.append(np.array([[0]]), cbins[:, None])
+
+    I = np.multiply(I - cbins[ind], bins[ind])
+    I = np.minimum(np.maximum(np.multiply(map[ind,0:3], np.repeat(1-I[:,None], 3, axis=1)) \
+         + np.multiply(map[ind+1,0:3], np.repeat(I[:,None], 3, axis=1)),0),1)
+
+    I = np.reshape(I, [H, W, 3]).astype(np.float32)
+
+    return I
+
+import numpy as np
+
+def scale2rgb(disp):
+    """
+    disp: 已裁剪到 [0.0, 2.0] 的 2D numpy 数组
+    返回: (H, W, 3) 的 float32 RGB 图，每个区间内做线性渐变
+    """
+    H, W = disp.shape
+    # 1) 定义 9 个边界点
+    bounds = np.array([
+        0.0,     # 边界 0
+        0.9,     # 边界 1
+        0.9667,  # 边界 2
+        0.98,    # 边界 3
+        1.0,     # 边界 4
+        1.02,    # 边界 5
+        1.0333,  # 边界 6
+        1.1,     # 边界 7
+        2.0      # 边界 8
+    ], dtype=np.float32)
+
+    # 2) 为每个边界点指定一个 RGB 颜色
+    #    这样在区间 i=[bounds[i],bounds[i+1]] 内，颜色由 colors[i] → colors[i+1] 渐变
+    colors = np.array([
+        [0.0, 0.0, 0.0],   # 黑     @ 0.0
+        [0.0, 0.0, 1.0],   # 蓝     @ 0.9
+        [1.0, 0.0, 0.0],   # 红     @ 0.9667
+        [1.0, 0.0, 1.0],   # 品红   @ 0.98
+        [0.0, 1.0, 0.0],   # 绿     @ 1.0
+        [0.0, 1.0, 1.0],   # 青     @ 1.02
+        [1.0, 1.0, 0.0],   # 黄     @ 1.0333
+        [1.0, 1.0, 1.0],   # 白     @ 1.1
+        [1.0, 1.0, 1.0],   # 白     @ 2.0（最后一段保持白色）
+    ], dtype=np.float32)
+
+    # 3) 展平并为每个像素找到它属于哪个区间
+    I = disp.flatten()
+    # np.searchsorted 找到第一个 bounds[k] > I 的索引，减 1 就是区间编号
+    idx = np.searchsorted(bounds, I, side='right') - 1
+    # 限制在 [0, len(bounds)-2]，即 0…7 共 8 段
+    idx = np.clip(idx, 0, bounds.shape[0]-2)
+
+    # 4) 计算每个像素在所在区间内的归一化位置 t ∈ [0,1]
+    lo = bounds[idx]
+    hi = bounds[idx+1]
+    # 防止 /0
+    span = hi - lo
+    span[span==0] = 1e-6
+    t = (I - lo) / span
+    t = np.clip(t, 0.0, 1.0)
+
+    # 5) 插值：rgb = (1-t)*color_lo + t*color_hi
+    c_lo = colors[idx]       # shape (N,3)
+    c_hi = colors[idx+1]     # shape (N,3)
+    rgb_flat = (1-t)[:,None]*c_lo + t[:,None]*c_hi
+
+    # 6) 恢复 (H,W,3)
+    rgb = rgb_flat.reshape(H, W, 3)
+    return rgb.astype(np.float32)
+
+def orientation2rgb(disp):
+    """
+    disp: 已裁剪到 [0.0, pi] 的 2D numpy 数组
+    返回: (H, W, 3) 的 float32 RGB 图，每个区间内做线性渐变
+    """
+    H, W = disp.shape
+    # 1) 定义 9 个边界点
+    bounds = np.array([
+        0.0,         # 边界 0
+        np.pi/12,    # 边界 1
+        np.pi/8,     # 边界 2
+        np.pi/4,     # 边界 3
+        np.pi/2,     # 边界 4
+        np.pi*3/4,   # 边界 5
+        np.pi*7/8,   # 边界 6
+        np.pi*11/12, # 边界 7
+        np.pi        # 边界 8
+    ], dtype=np.float32)
+
+    # 2) 为每个边界点指定一个 RGB 颜色
+    #    这样在区间 i=[bounds[i],bounds[i+1]] 内，颜色由 colors[i] → colors[i+1] 渐变
+    colors = np.array([
+        [0.0, 0.0, 0.0],   # 黑     @ 0.0
+        [0.0, 0.0, 1.0],   # 蓝     @ 0.9
+        [1.0, 0.0, 0.0],   # 红     @ 0.9667
+        [1.0, 0.0, 1.0],   # 品红   @ 0.98
+        [0.0, 1.0, 0.0],   # 绿     @ 1.0
+        [0.0, 1.0, 1.0],   # 青     @ 1.02
+        [1.0, 1.0, 0.0],   # 黄     @ 1.0333
+        [1.0, 1.0, 1.0],   # 白     @ 1.1
+        [1.0, 1.0, 1.0],   # 白     @ 2.0（最后一段保持白色）
+    ], dtype=np.float32)
+
+    # 3) 展平并为每个像素找到它属于哪个区间
+    I = disp.flatten()
+    # np.searchsorted 找到第一个 bounds[k] > I 的索引，减 1 就是区间编号
+    idx = np.searchsorted(bounds, I, side='right') - 1
+    # 限制在 [0, len(bounds)-2]，即 0…7 共 8 段
+    idx = np.clip(idx, 0, bounds.shape[0]-2)
+
+    # 4) 计算每个像素在所在区间内的归一化位置 t ∈ [0,1]
+    lo = bounds[idx]
+    hi = bounds[idx+1]
+    # 防止 /0
+    span = hi - lo
+    span[span==0] = 1e-6
+    t = (I - lo) / span
+    t = np.clip(t, 0.0, 1.0)
+
+    # 5) 插值：rgb = (1-t)*color_lo + t*color_hi
+    c_lo = colors[idx]       # shape (N,3)
+    c_hi = colors[idx+1]     # shape (N,3)
+    rgb_flat = (1-t)[:,None]*c_lo + t[:,None]*c_hi
+
+    # 6) 恢复 (H,W,3)
+    rgb = rgb_flat.reshape(H, W, 3)
+    return rgb.astype(np.float32)
