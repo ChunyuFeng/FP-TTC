@@ -925,9 +925,9 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
             coords_n[:, :, 1] *= -1            # y_n = -y_local
 
         elif dataset_key == 'nusc':
-            # 读取 idx 帧、cam_idx 相机的 depth pred map
-            depth_pred_path = data[idx][f'{frame_key}_camera_data'][channel]['depth_pred']
-            depth_pred_map  = np.load(depth_pred_path)  # (H_img, W_img)
+            # # 读取 idx 帧、cam_idx 相机的 depth pred map
+            # depth_pred_path = data[idx][f'{frame_key}_camera_data'][channel]['depth_pred']
+            # depth_pred_map  = np.load(depth_pred_path)  # (H_img, W_img)
             proj_matrix, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
                 data[idx][f'sensor_metas_{frame_key}'],
                 data[idx][f'sensor_metas_{frame_key}']['camera']['calibrated_sensor'][channel],
@@ -936,7 +936,7 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
             sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c}
 
             # 3) 根据深度图和相机内外参，将像素坐标转换为 LiDAR 坐标系下的 XYZ 坐标
-            coords = get_geometry(depth_pred_map, sensor_meta, affine_matrix)  # (H_img, W_img, 3)
+            coords = get_geometry(depth_map, sensor_meta, affine_matrix)  # (H_img, W_img, 3)
             coords_n = coords.copy()   
 
         else:

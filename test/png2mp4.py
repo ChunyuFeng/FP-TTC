@@ -39,6 +39,7 @@ def make_video(input_folder, output_path, fps=10):
 
         # 逐张读取并检查
         prev_img  = cv2.imread(prev_path)
+        # prev_img = cv2.cvtColor(prev_img, cv2.COLOR_BGR2RGB)
         # gt_scale_img = cv2.imread(gt_scale_path)
         pred_scale_img = cv2.imread(pred_scale_path)
         # gt_risk_img  = cv2.imread(gt_risk_path)

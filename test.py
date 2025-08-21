@@ -251,8 +251,8 @@ def main():
         #     affine_matrix = augmentor.get_affine_matrix(affine_params)
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view'):
 
-            if idx < 4400 or idx > 4600:
-                continue
+            # if idx < 4400 or idx > 4600:
+            #     continue
             # start = time.perf_counter()
             # 1) 并行加载 + 去畸变
 
@@ -398,11 +398,11 @@ def main():
 
             # Visualization
             # visualize RGB images
-            # concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
-            # concat_prev = concat_prev.astype(np.uint8)
-            # concat_prev = cv2.cvtColor(concat_prev, cv2.COLOR_BGR2RGB)
-            # concat_prev_img = Image.fromarray(concat_prev)
-            # concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
+            concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
+            concat_prev = concat_prev.astype(np.uint8)
+            concat_prev = cv2.cvtColor(concat_prev, cv2.COLOR_BGR2RGB)
+            concat_prev_img = Image.fromarray(concat_prev)
+            concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
 
             scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
             # scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
@@ -412,15 +412,15 @@ def main():
             # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
 
             # new vis method
-            scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
-            vis = scale2rgb(scale_vis)
-            vis = vis*255.0
-            cv2.imwrite(os.path.join(output_dir, f"new_pred_scale_{idx}.png"), vis)
+            # scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
+            # vis = scale2rgb(scale_vis)
+            # vis = vis*255.0
+            # cv2.imwrite(os.path.join(output_dir, f"new_pred_scale_{idx}.png"), vis)
 
-            orien = np.clip(risk_prediction_array, 0.0, np.pi)
-            orien_vis = orientation2rgb(orien)
-            orien_vis = orien_vis * 255.0
-            cv2.imwrite(os.path.join(output_dir, f"new_pred_orien_{idx}.png"), orien_vis)
+            # orien = np.clip(risk_prediction_array, 0.0, np.pi)
+            # orien_vis = orientation2rgb(orien)
+            # orien_vis = orien_vis * 255.0
+            # cv2.imwrite(os.path.join(output_dir, f"new_pred_orien_{idx}.png"), orien_vis)
 
             # save prediction as .npy files for collision map generation
             if args.save_pred_npy:
@@ -441,8 +441,8 @@ def main():
             
     else:
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
-            if test_entries[idx]['scene_indice'] != '7':
-                continue
+            # if test_entries[idx]['scene_indice'] != '7':
+            #     continue
             scene_indice = test_entries[idx]['scene_indice']
             # 1) load 相邻两帧的输入图像
             # Load images
@@ -472,14 +472,20 @@ def main():
             prev_depth_pred_map = {}
             curr_depth_pred_map = {}
             for channel in camera_channels:
-                depth_pred_prev_path = test_entries[idx]['prev_camera_data'][channel]['depth_pred']
-                depth_pred_curr_path = test_entries[idx]['curr_camera_data'][channel]['depth_pred']
+                depth_pred_prev = depth_model.infer_image(augmented_prev[channel], input_size=320)
+                depth_pred_curr = depth_model.infer_image(augmented_curr[channel], input_size=320)
 
-                prev_depth_pred_map[channel] = np.load(depth_pred_prev_path)
-                curr_depth_pred_map[channel] = np.load(depth_pred_curr_path)
+                prev_depth_pred_map[channel] = torch.from_numpy(depth_pred_prev)
+                curr_depth_pred_map[channel] = torch.from_numpy(depth_pred_curr)
+            # for channel in camera_channels:
+            #     depth_pred_prev_path = test_entries[idx]['prev_camera_data'][channel]['depth_pred']
+            #     depth_pred_curr_path = test_entries[idx]['curr_camera_data'][channel]['depth_pred']
 
-                prev_depth_pred_map[channel] = torch.from_numpy(prev_depth_pred_map[channel])
-                curr_depth_pred_map[channel] = torch.from_numpy(curr_depth_pred_map[channel])
+            #     prev_depth_pred_map[channel] = np.load(depth_pred_prev_path)
+            #     curr_depth_pred_map[channel] = np.load(depth_pred_curr_path)
+
+            #     prev_depth_pred_map[channel] = torch.from_numpy(prev_depth_pred_map[channel])
+            #     curr_depth_pred_map[channel] = torch.from_numpy(curr_depth_pred_map[channel])
 
             prev_depths_pred_tensor = torch.stack([prev_depth_pred_map[channel] for channel in camera_channels], dim=0).unsqueeze(1)
             curr_depths_pred_tensor = torch.stack([curr_depth_pred_map[channel] for channel in camera_channels], dim=0).unsqueeze(1)
@@ -509,9 +515,9 @@ def main():
                 gt_risk_tensor = torch.zeros((1, 2, prev_batch.shape[2], prev_batch.shape[3])).to(device)
 
             # 4) load 环视图像 uv 坐标与 range view uv 坐标之间的对应关系 (DepthAnythingV2)
-            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'nusc', 'prev', None, 
+            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'nusc', 'prev', depth_pred_prev, 
                                                                  affine_matrix, idx, H_r=40, W_r=480)
-            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'nusc', 'curr', None, 
+            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'nusc', 'curr', depth_pred_curr,
                                                                  affine_matrix, idx, H_r=40, W_r=480)
             # 转换为 tensor
             proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
