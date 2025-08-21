@@ -364,32 +364,38 @@ def main():
             # print(f"test：{elapsed_ms:.3f} ms")
 
             # 3) load 环视图像 uv 坐标与 range view uv 坐标之间的对应关系 (DepthAnythingV2)
-            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'sjtu', 'prev', prev_depth_pred_map,
+            proj_range_prev, proj_pix_prev, proj_xy_prev = build_frame_mapping(test_entries, 'sjtu', 'prev', prev_depth_pred_map,
                                                                  affine_matrix, idx, H_r=40, W_r=480, visualize=False)
-            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'sjtu', 'curr', curr_depth_pred_map,
+            proj_range_curr, proj_pix_curr, proj_xy_curr = build_frame_mapping(test_entries, 'sjtu', 'curr', curr_depth_pred_map,
                                                                  affine_matrix, idx, H_r=40, W_r=480, visualize=False)
             # 转换为 tensor
             proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
             proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
+            proj_xy_prev = torch.from_numpy(proj_xy_prev.astype(np.float32))  # (M, 2)
+            proj_xy_curr = torch.from_numpy(proj_xy_curr.astype(np.float32))  # (M, 2)
             # 打包 batch
             proj_pix_prev_batch = proj_pix_prev_tensor.unsqueeze(0).to(device)
             proj_pix_curr_batch = proj_pix_curr_tensor.unsqueeze(0).to(device)
+            proj_xy_prev_batch = proj_xy_prev.unsqueeze(0).to(device)
+            proj_xy_curr_batch = proj_xy_curr.unsqueeze(0).to(device)
 
             # Inference
             with torch.no_grad():
-                scale_pred, risk_pred    = model.forward(
+                scale_pred, risk_pred, _, _    = model.forward(
                         img_prev         = prev_batch,
                         img_curr         = curr_batch,
                         depth_prev       = prev_depths_pred_batch,
                         depth_curr       = curr_depths_pred_batch,
                         proj_pix_prev    = proj_pix_prev_batch,
                         proj_pix_curr    = proj_pix_curr_batch,
+                        proj_xy_prev     = proj_xy_prev_batch,
+                        proj_xy_curr     = proj_xy_curr_batch,
                         attn_type        = args.attn_type,
                         attn_splits_list = args.attn_splits_list,
                         corr_radius_list = args.corr_radius_list,
                         prop_radius_list = args.prop_radius_list,
                         num_reg_refine   = args.num_reg_refine,
-                        scale_only       = False,
+                        scale_only       = True,
                     )
             # end2 = time.perf_counter()
             # print(f"Inference took {(end2 - end1)*1000:.2f} ms")
@@ -404,11 +410,11 @@ def main():
             # concat_prev_img = Image.fromarray(concat_prev)
             # concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
 
-            scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
+            scale_prediction_array = scale_pred[-1][0].squeeze(0).cpu().numpy()
             # scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
             # normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
 
-            risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
+            # risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
             # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
 
             # new vis method
@@ -417,10 +423,10 @@ def main():
             vis = vis*255.0
             cv2.imwrite(os.path.join(output_dir, f"new_pred_scale_{idx}.png"), vis)
 
-            orien = np.clip(risk_prediction_array, 0.0, np.pi)
-            orien_vis = orientation2rgb(orien)
-            orien_vis = orien_vis * 255.0
-            cv2.imwrite(os.path.join(output_dir, f"new_pred_orien_{idx}.png"), orien_vis)
+            # orien = np.clip(risk_prediction_array, 0.0, np.pi)
+            # orien_vis = orientation2rgb(orien)
+            # orien_vis = orien_vis * 255.0
+            # cv2.imwrite(os.path.join(output_dir, f"new_pred_orien_{idx}.png"), orien_vis)
 
             # save prediction as .npy files for collision map generation
             if args.save_pred_npy:
@@ -441,8 +447,8 @@ def main():
             
     else:
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
-            if test_entries[idx]['scene_indice'] != '7':
-                continue
+            # if test_entries[idx]['scene_indice'] != '7':
+            #     continue
             scene_indice = test_entries[idx]['scene_indice']
             # 1) load 相邻两帧的输入图像
             # Load images
