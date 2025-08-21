@@ -312,8 +312,6 @@ def range_projection_with_mapping(
     proj_idx   = np.full((H, W), -1, dtype=np.int32)
     proj_mask  = np.zeros((H, W), dtype=np.int32)
     proj_pix   = np.full((H, W, 3), -1, dtype=np.int32)  # 新增：存 cam_idx, u, v
-    # 连续球面坐标，浮点类型，不取整
-    proj_xy_float = np.full((H, W, 2), -1.0, dtype=np.float32)
 
     # 2. 角度计算
     fov_up_rad   = fov_up   /180.0 * np.pi
@@ -327,28 +325,25 @@ def range_projection_with_mapping(
     pitch = np.arcsin(z / depth)                  # (m,)
 
     # 4. 归一化到 [0,1] 并映射到像素
-    proj_xf = 0.5*( yaw/np.pi + 1.0 ) * W          # (m,)
-    proj_yf = (1.0 - (pitch + abs(fov_down_rad))/fov) * H
+    proj_x = 0.5*( yaw/np.pi + 1.0 ) * W          # (m,)
+    proj_y = (1.0 - (pitch + abs(fov_down_rad))/fov) * H
 
     # 5. 整数化 & clip
-    proj_x = np.floor(proj_xf).astype(np.int32)
+    proj_x = np.floor(proj_x).astype(np.int32)
     proj_x = np.clip(proj_x, 0, W-1)
-    proj_y = np.floor(proj_yf).astype(np.int32)
+    proj_y = np.floor(proj_y).astype(np.int32)
     proj_y = np.clip(proj_y, 0, H-1)
 
-    # 6. 按深度近到远排序
-    order = np.argsort(depth)
+    # 6. 按深度远到近排序
+    order = np.argsort(depth)[::-1]
     depth_s = depth[order]
     pts_s   = points[order]
     x_s     = proj_x[order]
     y_s     = proj_y[order]
     pix_s   = pix_coords[order]   # 对齐排序
-    # proj_xf, proj_yf 也按 order 排序
-    xf_s    = proj_xf[order]
-    yf_s    = proj_yf[order]
 
     # 7. 赋值
-    for d, (py, px, pt, pi, xff, yff) in enumerate(zip(y_s, x_s, pts_s, pix_s, xf_s, yf_s)):
+    for d, (py, px, pt, pi) in enumerate(zip(y_s, x_s, pts_s, pix_s)):
         # 如果该像素第一次被写入（idx=-1），就写入
         if proj_idx[py,px] == -1:
             proj_range[py,px] = depth_s[d]
@@ -356,7 +351,5 @@ def range_projection_with_mapping(
             proj_idx[py,px]   = order[d]
             proj_mask[py,px]  = 1
             proj_pix[py,px]   = pi.astype(np.int32)
-            proj_xy_float[py,px,0] = xff
-            proj_xy_float[py,px,1] = yff
 
-    return proj_range, proj_xyz, proj_idx, proj_mask, proj_pix, proj_xy_float
+    return proj_range, proj_xyz, proj_idx, proj_mask, proj_pix

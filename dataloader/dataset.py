@@ -774,7 +774,7 @@ class nuScenes_range_image(data.Dataset):
         # 在加载数据集时离线构建 spherical voxel grid
         # 结合 DepthAnything 预测的 Depth Pred Map，提前计算每一个像素坐标对应的 Range View 坐标
 
-        for i in tqdm(range(len(self.data)-1790), desc='Loading nuScenes Range Image Dataset'):
+        for i in tqdm(range(len(self.data)), desc='Loading nuScenes Range Image Dataset'):
 
             if self.data[i]['scene_indice'] == '10':
                 continue
@@ -794,12 +794,9 @@ class nuScenes_range_image(data.Dataset):
 
             # 3. 环视图像 (cam_idx, u, v) 与 range image (u, v) 之间的映射关系
             #    通过 DepthAnything 预测的 Depth Pred Map + 内外参 计算得到
-            proj_range_prev, proj_pix_prev, proj_xy_prev = build_frame_mapping(self.data, 'nusc', 'prev', None,
-                                                                               self.affine_matrix, i, H_r=40, W_r=480)
-            proj_range_curr, proj_pix_curr, proj_xy_curr = build_frame_mapping(self.data, 'nusc', 'curr', None, 
-                                                                               self.affine_matrix, i, H_r=40, W_r=480)
-            self.proj_list.append([proj_pix_prev, proj_pix_curr,
-                                   proj_xy_prev, proj_xy_curr])
+            proj_range_prev, proj_pix_prev = build_frame_mapping(self.data, 'nusc', 'prev', self.affine_matrix, i, H_r=40, W_r=480)
+            proj_range_curr, proj_pix_curr = build_frame_mapping(self.data, 'nusc', 'curr', self.affine_matrix, i, H_r=40, W_r=480)
+            self.proj_list.append([proj_pix_prev, proj_pix_curr])
 
     def __len__(self):
         return len(self.image_list)
@@ -837,7 +834,7 @@ class nuScenes_range_image(data.Dataset):
         gt_depth_map      = self.depth_map_list[index]
 
         # 3. 获取 (cam_idx, u, v) 到 range image (u, v) 的映射关系
-        proj_pix_prev, proj_pix_curr, proj_xy_prev, proj_xy_curr = self.proj_list[index]
+        proj_pix_prev, proj_pix_curr = self.proj_list[index]
 
         # 4. 对 input 图像进行数据增强
         orig_size = next(iter(prev_surr_view_imgs.values())).size  # (W, H)
@@ -873,9 +870,7 @@ class nuScenes_range_image(data.Dataset):
         # 3）将 (cam_idx, u, v) 到 range image (u, v) 的映射关系转换为 Tensor
         proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
         proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
-        # 投影点的连续坐标
-        proj_xy_prev_tensor = torch.from_numpy(proj_xy_prev.astype(np.float32))  # (M, 2)
-        proj_xy_curr_tensor = torch.from_numpy(proj_xy_curr.astype(np.float32))  # (M, 2)
+
         # 4) 将图像增强的仿射矩阵转换为 Tensor
         affine_matrix = torch.from_numpy(affine_matrix)
 
@@ -885,8 +880,6 @@ class nuScenes_range_image(data.Dataset):
                 curr_surr_view_depths_tensor,
                 proj_pix_prev_tensor,
                 proj_pix_curr_tensor,
-                proj_xy_prev_tensor,
-                proj_xy_curr_tensor,
                 gt_scale_map_with_mask,
                 gt_risk_map_with_mask)
 
@@ -970,7 +963,7 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
     pix    = np.vstack(all_pix)     # (M, 3)
 
     # 7) range 投影并保留 (idx, u_rgb, v_rgb) <-> (u_range, v_range) 映射关系
-    proj_range, proj_xyz, proj_idx, proj_mask, proj_pix, proj_xy_float = \
+    proj_range, proj_xyz, proj_idx, proj_mask, proj_pix = \
         range_projection_with_mapping(points, pix, H=H_r, W=W_r,
                                     fov_up=8.0, fov_down=-15.0)
     
@@ -984,8 +977,9 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
 
         # fill proj_pix: for each hole (h,w) copy from (i_near[h,w], j_near[h,w])
         proj_pix = proj_pix[i_near, j_near]
+
+        # 同理，将 proj_range 也补全：
         proj_range = proj_range[i_near, j_near]
-        proj_xy_float = proj_xy_float[i_near, j_near]
         proj_mask[:] = 1
     
   
@@ -1010,7 +1004,7 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
         plt.savefig(f"./Datasets/cyberrock/scene_7/depth_vis/{frame_key}_normalized_range_{idx}.png", bbox_inches='tight', pad_inches=0)
         plt.close()
 
-    return proj_range, proj_pix, proj_xy_float
+    return proj_range, proj_pix
 
 
 def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):

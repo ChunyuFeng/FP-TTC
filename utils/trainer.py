@@ -150,8 +150,6 @@ class TTCTrainer(object):
              curr_surr_view_depths_tensor,
              proj_pix_prev_tensor,
              proj_pix_curr_tensor,
-             proj_xy_prev_tensor,
-             proj_xy_curr_tensor,
              gt_scale_map_with_mask,
              gt_risk_score_map_with_mask) = data
             
@@ -161,8 +159,6 @@ class TTCTrainer(object):
             curr_surr_view_depths_tensor = curr_surr_view_depths_tensor.to(self.device)
             proj_pix_prev_tensor         = proj_pix_prev_tensor.to(self.device)
             proj_pix_curr_tensor         = proj_pix_curr_tensor.to(self.device)
-            proj_xy_prev_tensor          = proj_xy_prev_tensor.to(self.device)
-            proj_xy_curr_tensor          = proj_xy_curr_tensor.to(self.device)
             gt_scale_map_with_mask       = gt_scale_map_with_mask.to(self.device)
             gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
             # affine_matrix                = affine_matrix.to(self.device)
@@ -177,8 +173,6 @@ class TTCTrainer(object):
                     depth_curr                    = curr_surr_view_depths_tensor,
                     proj_pix_prev                 = proj_pix_prev_tensor,
                     proj_pix_curr                 = proj_pix_curr_tensor,
-                    proj_xy_prev                  = proj_xy_prev_tensor,
-                    proj_xy_curr                  = proj_xy_curr_tensor,  
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
                     gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
                     attn_type                     = self.attn_type,
@@ -196,8 +190,6 @@ class TTCTrainer(object):
                     depth_curr                    = curr_surr_view_depths_tensor,
                     proj_pix_prev                 = proj_pix_prev_tensor,
                     proj_pix_curr                 = proj_pix_curr_tensor,
-                    proj_xy_prev                  = proj_xy_prev_tensor,
-                    proj_xy_curr                  = proj_xy_curr_tensor,
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
                     gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
                     attn_type                     = self.attn_type,
@@ -221,10 +213,8 @@ class TTCTrainer(object):
             
             if type(scale) == list:
                 scale = scale[-1]
-            if type(risk_score) == list:
-                risk_score = risk_score[-1]
-
             if i%int(save_index)==0 and is_main_process():
+
                 if self.scale_only:
                     gt_scale = gt_scale_map_with_mask[:,0,:,:]
                     gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]

@@ -1,200 +1,342 @@
-# utils/loss.py
-import math
+
+from PIL import Image
+import os
+import time
+import numpy as np
 import torch
 import torch.nn.functional as F
 
-# ---------- 基础鲁棒项 ----------
-def charbonnier(x, eps=1e-3):
-    # 近似 L1：sqrt(x^2 + eps^2)
-    return torch.sqrt(x * x + eps * eps)
+def get_loss(scale, flow, dc_gt, flow_gt, valid, epoch):
 
-def huber(x, delta=0.03):
-    # 平滑 L1
-    absx = x.abs()
-    quad = 0.5 * (absx ** 2) / delta
-    lin  = absx - 0.5 * delta
-    return torch.where(absx <= delta, quad, lin)
+    gt_dchange = dc_gt[:,0:1,:,:]
+    valids = dc_gt[:, 1, :, :].unsqueeze(1).bool()
 
-# ---------- 球面等面积权（Equirectangular） ----------
-@torch.no_grad()
-def _equal_area_weights(H, device, fov_up_deg=8.0, fov_down_deg=-15.0):
+    mag = torch.sum(flow_gt**2, dim=1).sqrt()
+    valid = (valid >= 0.5) & (mag < 400)
+
+    gt_dchange[gt_dchange<=0] = 10
+    gt_dchange[gt_dchange>3] = 10
+
+    maskdc = ((gt_dchange < 3) & (gt_dchange > 0.3) & valids & (scale>0))
+
+    d_loss = (scale.log() - gt_dchange.log()).abs()
+    f_loss = (flow-flow_gt).abs()
+    #print(scale.log(), gt_dchange.log())
+    sloss = (maskdc * d_loss).sum()/maskdc.sum()
+    floss = (valid[:, None] * f_loss).sum()/valid.sum()
+
+    loss = 0.8*sloss + 0.2*floss
+
+    epe = torch.sum((flow - flow_gt)**2, dim=1).sqrt()
+    mag = torch.sum(flow_gt**2, dim=1).sqrt()
+    epe = epe.view(-1)
+    mag = mag.view(-1)
+    val = valid.view(-1) >= 0.5
+    out = ((epe > 3.0) & ((epe/mag) > 0.05)).float()
+    f1 = torch.mean(1-out[val])
+
+    return sloss, loss, gt_dchange, f1
+
+
+def get_loss_multi(scale_preds, valid, scale_gt, epoch, gamma=0.9):
+
+    n_predictions = len(scale_preds)
+    scale_loss = 0.0
+
+    gt_depth = scale_gt[:,0:1,:,:]
+    gt_depth[gt_depth<=0] = 1e6
+    gt_f3d =  scale_gt[:,1:,...].clone()
+    gt_dchange = (1+gt_f3d[:,2:,...]/gt_depth)
+
+    validx = ((gt_dchange < 3) & (gt_dchange > 0.2) & valid.unsqueeze(1).bool())
+
+    for i in range(n_predictions):
+        scale = scale_preds[i]
+        i_weight = gamma ** (n_predictions - i - 1)
+        # if i==0:
+        #     first = n_predictions//2
+        #     #print(first)
+        #     i_weight = gamma ** (n_predictions - first)
+        # else:
+        #     i_weight = gamma ** (n_predictions - i - 1)
+
+        mask_nan = ~torch.isnan(scale)
+        maskdc = validx & mask_nan
+        mask_minus0 = (scale<=0)
+
+        if mask_minus0.sum() == 0:    
+            loss1 =  ((((scale.abs()).log()-(gt_dchange.abs()).log()).abs())*maskdc).sum() / (maskdc.sum())
+            loss = loss1
+            if epoch < 5:
+                loss2 = (((scale.abs())*mask_minus0)).sum() / (mask_minus0.sum()+1e-4)
+                loss += loss2
+        else:
+            loss1 = (((scale-gt_dchange).abs())[mask_nan]).mean()
+            loss2 = (((scale.abs())*mask_minus0)).sum() / (mask_minus0.sum()+1e-4)
+            loss = loss1 + loss2
+
+        scale_loss += i_weight * loss.mean()
+        if i == n_predictions - 1:
+            loss_final = loss.mean()
+
+    return scale_loss, loss_final, gt_dchange, maskdc
+
+def ttc_smooth_loss(img, disp, mask):
     """
-    每一行按 cos(pitch) 加权。pitch 是仰角（由垂直像素 y 反投影得到）。
+        Computes the smoothness loss for a disparity image
+        The color image is used for edge-aware smoothness
     """
-    fov_up   = math.radians(fov_up_deg)
-    fov_down = math.radians(fov_down_deg)
-    fov      = abs(fov_down) + abs(fov_up)
-    # 行心位置 y_c = i + 0.5，更稳定
-    y = torch.arange(H, device=device, dtype=torch.float32) + 0.5
-    pitch = (1.0 - y / H) * fov - abs(fov_down)  # 与投影公式反向一致
-    w = torch.cos(pitch).clamp_min(1e-6)         # 防止除零
-    # 形状 [1,1,H,1] 便于广播
-    return w.view(1, 1, H, 1)
+    # normalize
+    mean_disp = disp.mean(2, True).mean(3, True)
+    norm_disp = disp / (mean_disp + 1e-7)
+    disp = norm_disp
 
-# ---------- 角度 wrap ----------
-def _angle_diff(a, b):
-    # wrap 到 (-pi, pi]
-    return torch.atan2(torch.sin(a - b), torch.cos(a - b))
+    grad_disp_x = torch.abs(disp - torch.roll(disp, 1, dims=3))
+    grad_disp_y = torch.abs(disp - torch.roll(disp, 1, dims=2))
+    grad_disp_x[:,:,:,0] = 0
+    grad_disp_y[:,:,0,:] = 0
 
-# ---------- 单尺度 scale 损失（log 域） ----------
-def _scale_loss_single(scale_pred, gt_scale_with_mask,
-                       w_conf=None, loss_kind='charbonnier',
-                       fov_up_deg=8.0, fov_down_deg=-15.0):
+    # grad_disp_xx = torch.abs(torch.roll(grad_disp_x, -1, dims=3) - grad_disp_x)
+    # grad_disp_yy = torch.abs(torch.roll(grad_disp_y, -1, dims=3) - grad_disp_y)
+    # grad_disp_xx[:,:,:,0] = 0
+    # grad_disp_yy[:,:,0,:] = 0
+    # grad_disp_xx[:,:,:,-1] = 0
+    # grad_disp_yy[:,:,-1,:] = 0
 
-    gt_scale = gt_scale_with_mask[:, 0:1]
-    mask     = gt_scale_with_mask[:, 1:2].bool()
+    grad_img_x = torch.mean(torch.abs(img - torch.roll(img, 1, dims=3)), 1, keepdim=True)
+    grad_img_y = torch.mean(torch.abs(img - torch.roll(img, 1, dims=2)), 1, keepdim=True)
+    grad_img_x[:,:,:,0] = 0
+    grad_img_y[:,:,0,:] = 0
+
+    grad_disp_x *= torch.exp(-grad_img_x)
+    grad_disp_y *= torch.exp(-grad_img_y)
+
+    return (grad_disp_x*mask).sum()/mask.sum() + (grad_disp_y*mask).sum()/mask.sum()
+
+
+def get_loss_selfsup(scale, valid, scale_gt):
+    return (scale.log()-scale_gt.log()).abs()[valid.bool()].mean()
+
+
+def self_supervised_gt_affine(flow):
+
+    b,_,lh,lw=flow.shape
+    bs, w,h = b, lw, lh
+    grid_H = torch.linspace(0, w-1, w).view(1, 1, 1, w).expand(bs, 1, h, w).to(device=flow.device, dtype=flow.dtype)
+    grid_V = torch.linspace(0, h-1, h).view(1, 1, h, 1).expand(bs, 1, h, w).to(device=flow.device, dtype=flow.dtype)
+    pref = torch.cat([grid_H, grid_V], dim=1)
+    ptar = pref + flow
+    pw = 1
+    pref = F.unfold(pref, (pw*2+1,pw*2+1), padding=(pw)).view(b,2,(pw*2+1)**2,lh,lw)-pref[:,:,np.newaxis]
+    ptar = F.unfold(ptar, (pw*2+1,pw*2+1), padding=(pw)).view(b,2,(pw*2+1)**2,lh,lw)-ptar[:,:,np.newaxis] # b, 2,9,h,w
+    pref = pref.permute(0,3,4,1,2).reshape(b*lh*lw,2,(pw*2+1)**2)
+    ptar = ptar.permute(0,3,4,1,2).reshape(b*lh*lw,2,(pw*2+1)**2)
+
+    prefprefT = pref.matmul(pref.permute(0,2,1))
+    ppdet = prefprefT[:,0,0]*prefprefT[:,1,1]-prefprefT[:,1,0]*prefprefT[:,0,1]
+    ppinv = torch.cat((prefprefT[:,1,1:],-prefprefT[:,0,1:], -prefprefT[:,1:,0], prefprefT[:,0:1,0]),1).view(-1,2,2)/ppdet.clamp(1e-10,np.inf)[:,np.newaxis,np.newaxis]
+
+    Affine = ptar.matmul(pref.permute(0,2,1)).matmul(ppinv)
+    Error = (Affine.matmul(pref)-ptar).norm(2,1).mean(1).view(b,1,lh,lw)
+
+    Avol = (Affine[:,0,0]*Affine[:,1,1]-Affine[:,1,0]*Affine[:,0,1]).view(b,1,lh,lw).abs().clamp(1e-10,np.inf)
+    exp = Avol.sqrt()
+    mask = (exp>0.5) & (exp<2)
+    mask = mask[:,0]
+
+    exp = exp.clamp(0.5,2)
+    # exp[Error>0.1]=1
+    return torch.reciprocal(exp)
+
+
+def self_supervised_gt(flow_f):
+
+    b,_,h,w = flow_f.size()
+    grid_H = torch.linspace(0, w-1, w).view(1, 1, 1, w).expand(b, 1, h, w).to(device=flow_f.device, dtype=flow_f.dtype)
+    grid_V = torch.linspace(0, h-1, h).view(1, 1, h, 1).expand(b, 1, h, w).to(device=flow_f.device, dtype=flow_f.dtype)
+    grids1_ = torch.cat([grid_H, grid_V], dim=1)
+
+    gw = 2
+    pad_dim = (gw,gw,gw,gw)
+    grids_pad = F.pad(grids1_, pad_dim, "replicate")
+    flow_f_pad = F.pad(flow_f, pad_dim, "replicate")
+    grids_w_f = grids_pad + flow_f_pad
+
+    # tm - m
+    len_ori = torch.abs(grids_pad[...,0:-2*gw,gw:-gw] - grids_pad[...,gw:-gw,gw:-gw]) 
+    len_scale_f = torch.abs(grids_w_f[...,0:-2*gw,gw:-gw] - grids_w_f[...,gw:-gw,gw:-gw]) 
+    len_ori_x, len_ori_y = torch.abs(len_ori[:,0:1,...]), torch.abs(len_ori[:,1:,...])
+    len_scale_f_x, len_scale_f_y = torch.abs(len_scale_f[:,0:1,...]), torch.abs(len_scale_f[:,1:,...])
+    exp_y_len1 = (len_ori_x**2+len_ori_y**2)**0.5 * torch.reciprocal((len_scale_f_x**2+len_scale_f_y**2)**0.5)
+    # bm - m
+    len_ori = torch.abs(grids_pad[...,2*gw:,gw:-gw] - grids_pad[...,gw:-gw,gw:-gw]) 
+    len_scale_f = torch.abs(grids_w_f[...,2*gw:,gw:-gw] - grids_w_f[...,gw:-gw,gw:-gw]) 
+    len_ori_x, len_ori_y = torch.abs(len_ori[:,0:1,...]), torch.abs(len_ori[:,1:,...])
+    len_scale_f_x, len_scale_f_y = torch.abs(len_scale_f[:,0:1,...]), torch.abs(len_scale_f[:,1:,...])
+    exp_y_len2 = (len_ori_x**2+len_ori_y**2)**0.5 * torch.reciprocal((len_scale_f_x**2+len_scale_f_y**2)**0.5)
+
+    # mr - m
+    len_ori = torch.abs(grids_pad[...,gw:-gw,2*gw:] - grids_pad[...,gw:-gw,gw:-gw]) 
+    len_scale_f = torch.abs(grids_w_f[...,gw:-gw,2*gw:] - grids_w_f[...,gw:-gw,gw:-gw]) 
+    len_ori_x, len_ori_y = torch.abs(len_ori[:,0:1,...]), torch.abs(len_ori[:,1:,...])
+    len_scale_f_x, len_scale_f_y = torch.abs(len_scale_f[:,0:1,...]), torch.abs(len_scale_f[:,1:,...])
+    exp_x_len1 = (len_ori_x**2+len_ori_y**2)**0.5 * torch.reciprocal((len_scale_f_x**2+len_scale_f_y**2)**0.5)
+    # ml - m
+    len_ori = torch.abs(grids_pad[...,gw:-gw,0:-2*gw] - grids_pad[...,gw:-gw,gw:-gw]) 
+    len_scale_f = torch.abs(grids_w_f[...,gw:-gw,0:-2*gw] - grids_w_f[...,gw:-gw,gw:-gw]) 
+    len_ori_x, len_ori_y = torch.abs(len_ori[:,0:1,...]), torch.abs(len_ori[:,1:,...])
+    len_scale_f_x, len_scale_f_y = torch.abs(len_scale_f[:,0:1,...]), torch.abs(len_scale_f[:,1:,...])
+    exp_x_len2 = (len_ori_x**2+len_ori_y**2)**0.5 * torch.reciprocal((len_scale_f_x**2+len_scale_f_y**2)**0.5)
+
+    # tm - mr
+    len_ori = torch.abs(grids_pad[...,0:-2*gw,gw:-gw] - grids_pad[...,gw:-gw,2*gw:]) 
+    len_scale_f = torch.abs(grids_w_f[...,0:-2*gw,gw:-gw] - grids_w_f[...,gw:-gw,2*gw:]) 
+    len_ori_x, len_ori_y = torch.abs(len_ori[:,0:1,...]), torch.abs(len_ori[:,1:,...])
+    len_scale_f_x, len_scale_f_y = torch.abs(len_scale_f[:,0:1,...]), torch.abs(len_scale_f[:,1:,...])
+    exp_l_len1 = (len_ori_x**2+len_ori_y**2)**0.5 * torch.reciprocal((len_scale_f_x**2+len_scale_f_y**2)**0.5)
+    # ml - bm
+    len_ori = torch.abs(grids_pad[...,gw:-gw,0:-2*gw] - grids_pad[...,2*gw:,gw:-gw]) 
+    len_scale_f = torch.abs(grids_w_f[...,gw:-gw,0:-2*gw] - grids_w_f[...,2*gw:,gw:-gw]) 
+    len_ori_x, len_ori_y = torch.abs(len_ori[:,0:1,...]), torch.abs(len_ori[:,1:,...])
+    len_scale_f_x, len_scale_f_y = torch.abs(len_scale_f[:,0:1,...]), torch.abs(len_scale_f[:,1:,...])
+    exp_l_len2 = (len_ori_x**2+len_ori_y**2)**0.5 * torch.reciprocal((len_scale_f_x**2+len_scale_f_y**2)**0.5)
+
+    # tm - ml
+    len_ori = torch.abs(grids_pad[...,0:-2*gw,gw:-gw] - grids_pad[...,gw:-gw,0:-2*gw]) 
+    len_scale_f = torch.abs(grids_w_f[...,0:-2*gw,gw:-gw] - grids_w_f[...,gw:-gw,0:-2*gw]) 
+    len_ori_x, len_ori_y = torch.abs(len_ori[:,0:1,...]), torch.abs(len_ori[:,1:,...])
+    len_scale_f_x, len_scale_f_y = torch.abs(len_scale_f[:,0:1,...]), torch.abs(len_scale_f[:,1:,...])
+    exp_r_len1 = (len_ori_x**2+len_ori_y**2)**0.5 * torch.reciprocal((len_scale_f_x**2+len_scale_f_y**2)**0.5)
+    # mr - bm
+    len_ori = torch.abs(grids_pad[...,gw:-gw,2*gw:] - grids_pad[...,2*gw:,gw:-gw]) 
+    len_scale_f = torch.abs(grids_w_f[...,gw:-gw,2*gw:] - grids_w_f[...,2*gw:,gw:-gw]) 
+    len_ori_x, len_ori_y = torch.abs(len_ori[:,0:1,...]), torch.abs(len_ori[:,1:,...])
+    len_scale_f_x, len_scale_f_y = torch.abs(len_scale_f[:,0:1,...]), torch.abs(len_scale_f[:,1:,...])
+    exp_r_len2 = (len_ori_x**2+len_ori_y**2)**0.5 * torch.reciprocal((len_scale_f_x**2+len_scale_f_y**2)**0.5)
+
+
+    exp_x_len = torch.min(torch.stack([exp_x_len1,exp_x_len2],dim=1),dim=1)[0]
+    exp_y_len = torch.min(torch.stack([exp_y_len1,exp_y_len2],dim=1),dim=1)[0]
+    exp_l_len = torch.min(torch.stack([exp_l_len1,exp_l_len2],dim=1),dim=1)[0]
+    exp_r_len = torch.min(torch.stack([exp_r_len1,exp_r_len2],dim=1),dim=1)[0]
+
+    exp_corner_len = torch.max(torch.stack([exp_l_len,exp_r_len],dim=1),dim=1)[0]
+    exp_f_xy_len = torch.max(exp_x_len,exp_y_len)
+
+    threshold = 0.15
+    ttc_range = 0.95
+    mask_exp1 = torch.logical_and(exp_corner_len<1. ,(exp_corner_len/exp_f_xy_len)>1)
+    mask_exp2 = torch.logical_and((exp_x_len/exp_y_len)>(1-threshold),(exp_x_len/exp_y_len)<(1+threshold))
+    mask_exp2 = torch.logical_and(mask_exp2,exp_f_xy_len<ttc_range*torch.mean(exp_f_xy_len))
+    mask_exp = torch.logical_and(mask_exp1, mask_exp2)
+
+    scale_gt = mask_exp*exp_corner_len+ ~mask_exp*exp_f_xy_len
+    scale_gt[...,0:1,:] = 1
+    scale_gt[...,-1:,:] = 1
+    scale_gt[...,:,0:1] = 1
+    scale_gt[...,:,-1:] = 1
+
+    return scale_gt
+
+def get_loss_nusc(scale, gt_scale, valid):
+    # 移除单个维度，使所有张量形状为 (320, 640)
+    scale = scale.squeeze(1)  # 将形状从 [1, 1, 320, 640] 压缩为 [320, 640]
+    gt_scale = gt_scale.squeeze(0)       # 将形状从 [1, 320, 640] 压缩为 [320, 640]
+    valid = valid.squeeze(0)             # 将形状从 [1, 320, 640] 压缩为 [320, 640]
+
+    gt_scale = torch.nan_to_num(gt_scale, nan=10)
+
+    # 处理 gt_scale 的有效范围
+    gt_scale[gt_scale <= 0] = 10
+    gt_scale[gt_scale > 3] = 10
+
+    # 创建有效的深度变化掩膜
+    maskdc = (gt_scale < 3) & (gt_scale > 0.3) & valid & (scale > 0)
+
+    if maskdc.sum() == 0:
+        return torch.tensor(0.0, device=scale.device)  # 返回 0 作为损失
+
+    # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
+    epsilon = 1e-6  # 预防性的小值
+    scale = torch.clamp(scale, min=epsilon)
+    gt_scale = torch.clamp(gt_scale, min=epsilon)
+
+    # 计算 scale loss
+    d_loss = (scale.log() - gt_scale.log()).abs()
+
+    sloss = (maskdc * d_loss).sum() / maskdc.sum()
+
+    # 返回 sloss 作为最终的损失
+    return sloss
+
+def get_loss_mix(scale, gt_scale_with_mask):
+    # 移除单个维度，使所有张量形状为 (320, 640)
+    scale = scale.squeeze(1)  # 将形状从 [batch_size, 1, 320, 640] 压缩为 [batch_size, 320, 640]
+    gt_scale = gt_scale_with_mask[:,0,:,:]
+    valid = gt_scale_with_mask[:,1,:,:].bool()
+
+    gt_scale = torch.nan_to_num(gt_scale, nan=10)
+
+    # 处理 gt_scale 的有效范围
+    gt_scale[gt_scale <= 0] = 10
+    gt_scale[gt_scale > 3] = 10
+
+    # 创建有效的深度变化掩膜
+    maskdc = (gt_scale < 3) & (gt_scale > 0.3) & valid & (scale > 0)
+
+    if maskdc.sum() == 0:
+        return torch.tensor(0.0, device=scale.device)  # 返回 0 作为损失
+
+    # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
+    epsilon = 1e-6  # 预防性的小值
+    scale = torch.clamp(scale, min=epsilon)
+    gt_scale = torch.clamp(gt_scale, min=epsilon)
+
+    # 计算 scale loss
+    d_loss = (scale.log() - gt_scale.log()).abs()
+
+    # sloss = (maskdc * d_loss).sum() / maskdc.sum()
+    sloss = d_loss[maskdc].mean()
+    # 返回 sloss 作为最终的损失
+    return sloss, valid
+
+def get_loss_scale_map(scale, gt_scale_with_mask):
+    # 移除单个维度，使所有张量形状为 (320, 640)
+    scale = scale.squeeze(1)  # 将形状从 [batch_size, 1, H, W] 压缩为 [batch_size, H, W]
+    gt_scale = gt_scale_with_mask[:,0,:,:]
+    mask = gt_scale_with_mask[:,1,:,:].bool()
 
     if mask.sum() == 0:
-        return scale_pred.sum() * 0.0
+        return scale.sum() * 0.0
+        print("[WARN]:Scale branch no valid area, return 0 loss")
+    
+    # with torch.no_grad():
+    #     print("scale before clamp:", scale.min().item(), scale.max().item())
 
-    B, _, H, W = scale_pred.shape
-    eps = 1e-6
+    # mask = mask & (scale>0)   
+    # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
+    epsilon = 1e-12  # 预防性的小值
+    log_scale = torch.log(scale + epsilon)
+    log_gt_scale = torch.log(gt_scale + epsilon)
 
-    # 只取有效像素；并确保对数输入为正
-    pred_v = scale_pred[mask].clamp_min(eps)    # [N]
-    gt_v   = gt_scale[mask].clamp_min(eps)      # [N]
+    # 计算 scale loss
+    loss = (log_scale - log_gt_scale).abs()
+    loss = loss[mask].mean()
 
-    err = torch.log(pred_v) - torch.log(gt_v)   # [N]
-
-    if loss_kind == 'charbonnier':
-        ell = charbonnier(err)
-    elif loss_kind == 'huber':
-        ell = huber(err, delta=0.03)
-    elif loss_kind == 'l1':
-        ell = err.abs()
-    else:
-        raise ValueError(f"Unknown loss_kind: {loss_kind}")
-
-    # 等面积权
-    w_area = _equal_area_weights(H, device=scale_pred.device,
-                                 fov_up_deg=fov_up_deg, fov_down_deg=fov_down_deg
-                                 ).expand(B, 1, H, W)[mask]                 # [N]
-
-    # 置信度（若无则全 1）
-    if w_conf is None:
-        w_conf_v = torch.ones_like(pred_v)
-    else:
-        w_conf_v = w_conf.to(scale_pred.dtype)[mask]
-
-    w = (w_area * w_conf_v).detach()            # [N]
-    denom = w.sum().clamp_min(1e-6)
-
-    loss = (ell * w).sum() / denom
     return loss
 
+def get_loss_risk_score_map(risk_score, gt_risk_score_with_mask):
+    # 移除单个维度，使所有张量形状为 (B, H, W)
+    risk_score = risk_score.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
+    gt_risk_score = gt_risk_score_with_mask[:, 0, :, :]
+    mask = gt_risk_score_with_mask[:, 1, :, :].bool()
 
-# ---------- 单尺度 风险角度损失 ----------
-def _risk_loss_single(risk_pred, gt_risk_with_mask,
-                      w_conf=None,
-                      loss_kind='charbonnier',   # 'charbonnier' | 'huber' | 'l2'
-                      fov_up_deg=8.0, fov_down_deg=-15.0):
-    """
-    risk_pred: [B,1,H,W]（角度，弧度）
-    gt_risk_with_mask: [B,2,H,W]，[0]=gt_angle, [1]=valid_mask
-    """
-    gt   = gt_risk_with_mask[:, 0:1, :, :]
-    mask = gt_risk_with_mask[:, 1:2, :, :].bool()
-
+    # 如果没有有效区域，则返回可导的 0（避免断梯度）
     if mask.sum() == 0:
-        # 返回可导的 0，避免断梯度
-        return risk_pred.sum() * 0.0
+        return risk_score.sum() * 0.0
+        print("[WARN]:Risk score branch no valid area, return 0 loss")
 
-    B, _, H, W = risk_pred.shape
-
-    # 只在有效像素上计算 wrap 后的角度残差
-    err = _angle_diff(risk_pred, gt)[mask]          # [N]
-
-    # 鲁棒项
-    if loss_kind == 'charbonnier':
-        ell = charbonnier(err)                      # [N]
-    elif loss_kind == 'huber':
-        ell = huber(err, delta=0.05)
-    elif loss_kind == 'l2':
-        ell = err * err
-    else:
-        raise ValueError(f"Unknown loss_kind: {loss_kind}")
-
-    # 等面积权（按行 cos(pitch)）
-    w_area = _equal_area_weights(H, device=risk_pred.device,
-                                 fov_up_deg=fov_up_deg, fov_down_deg=fov_down_deg
-                                 ).expand(B, 1, H, W)[mask].view(-1)  # [N]
-
-    # 置信度（若无则全 1）
-    if w_conf is None:
-        w_conf_v = torch.ones_like(w_area)          # [N]
-    else:
-        w_conf_v = w_conf.to(risk_pred.dtype)[mask].view(-1)  # [N]
-
-    # 总权重（不反传）
-    w = (w_area * w_conf_v).detach()                # [N]
-    denom = w.sum().clamp_min(1e-6)
-
-    loss = (ell.view(-1) * w).sum() / denom
-    return loss
-
-# ---------- 多阶段/多尺度深监督：支持 list 或 Tensor ----------
-def get_loss_scale_map(scale_preds,
-                       gt_scale_with_mask,
-                       w_conf=None,            # 可为 None 或 list[Tensor]/Tensor（与 scale_preds 对齐）
-                       gamma: float = 0.9,     # 后期阶段权重大
-                       loss_kind='charbonnier',
-                       fov_up_deg=8.0, fov_down_deg=-15.0):
-    """
-    scale_preds: Tensor[B,1,H,W] 或 list[Tensor]（每个 [B,1,H,W]）
-    w_conf: 与 scale_preds 对齐的 Tensor 或 list（若无传 None）
-    """
-    # 统一成 list
-    if not isinstance(scale_preds, (list, tuple)):
-        scale_preds = [scale_preds]
-    if w_conf is None:
-        w_conf_list = [None] * len(scale_preds)
-    elif isinstance(w_conf, (list, tuple)):
-        w_conf_list = list(w_conf)
-    else:
-        w_conf_list = [w_conf] * len(scale_preds)
-
-    L = len(scale_preds)
-    # 指数衰减：后面阶段权重大
-    ws = [gamma ** (L - 1 - i) for i in range(L)]
-    s = sum(ws) + 1e-8
-    ws = [w / s for w in ws]
-
-    loss = 0.0
-    for w, sp, wc in zip(ws, scale_preds, w_conf_list):
-        loss = loss + w * _scale_loss_single(sp, gt_scale_with_mask,
-                                             w_conf=wc,
-                                             loss_kind=loss_kind,
-                                             fov_up_deg=fov_up_deg, fov_down_deg=fov_down_deg)
-    return loss
-
-
-def get_loss_risk_score_map(risk_preds,
-                            gt_risk_with_mask,
-                            w_conf=None,
-                            gamma: float = 0.9,
-                            loss_kind='charbonnier',
-                            fov_up_deg=8.0, fov_down_deg=-15.0):
-    """
-    同上，支持多阶段 list
-    """
-    if not isinstance(risk_preds, (list, tuple)):
-        risk_preds = [risk_preds]
-    if w_conf is None:
-        w_conf_list = [None] * len(risk_preds)
-    elif isinstance(w_conf, (list, tuple)):
-        w_conf_list = list(w_conf)
-    else:
-        w_conf_list = [w_conf] * len(risk_preds)
-
-    L = len(risk_preds)
-    ws = [gamma ** (L - 1 - i) for i in range(L)]
-    s = sum(ws) + 1e-8
-    ws = [w / s for w in ws]
-
-    loss = 0.0
-    for w, rp, wc in zip(ws, risk_preds, w_conf_list):
-        loss = loss + w * _risk_loss_single(rp, gt_risk_with_mask,
-                                            w_conf=wc,
-                                            loss_kind=loss_kind,
-                                            fov_up_deg=fov_up_deg, fov_down_deg=fov_down_deg)
+    criterion = torch.nn.MSELoss(reduction='mean')
+    
+    loss = criterion(risk_score[mask], gt_risk_score[mask])
     return loss
