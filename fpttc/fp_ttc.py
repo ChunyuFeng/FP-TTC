@@ -8,7 +8,8 @@ from .scale_net.backbone import CNNEncoder
 from .scale_net.feature_net.feature_net import FeatureNet
 from .scale_net.flow_net import FlowNet
 from .scale_net.scale_net import ScaleNet
-from .scale_net.multi_view_deformable_fusion import MultiViewDeformableFusion
+from .scale_net.utils.spherical_ops import gaussian_splat_to_sphere
+from .scale_net.spherical_align import SphericalAlignment
 
 import torch.distributed as dist
 import numpy as np
@@ -78,11 +79,14 @@ class FpTTC(nn.Module):
                                  reg_refine       = reg_refine, 
                                  head_type        = 'risk')
         
-
+        # 球面对齐模块
+        self.sph_align = SphericalAlignment(in_ch=feature_channels, hidden=128, max_shift=2.0)
+        
     def forward(self,
                 img_prev, img_curr,
                 depth_prev, depth_curr,
                 proj_pix_prev, proj_pix_curr,
+                proj_xy_prev, proj_xy_curr,
                 attn_type,
                 attn_splits_list,
                 corr_radius_list,
@@ -92,12 +96,12 @@ class FpTTC(nn.Module):
 
         ### 1）提取输入的多视角图像的底层特征
         img0, img1 = normalize_img(img_prev, img_curr)
-        rgbd0 = torch.cat([img0, depth_prev], dim=2)  # [B, V, 4, H, W]
-        rgbd1 = torch.cat([img1, depth_curr], dim=2)  # [B, V, 4, H, W]
+        # rgbd0 = torch.cat([img0, depth_prev], dim=2)  # [B, V, 4, H, W]
+        # rgbd1 = torch.cat([img1, depth_curr], dim=2)  # [B, V, 4, H, W]
         B, V, C, H_img, W_img = img0.shape
         shared_prev, shared_curr = [], []
-        for view in range(rgbd0.size(1)):
-            p, c = self.extract_feature(rgbd0[:, view], rgbd1[:, view], branch=None)
+        for view in range(img0.size(1)):
+            p, c = self.extract_feature(img0[:, view], img1[:, view], branch=None)
             shared_prev.append(p)
             shared_curr.append(c)
 
@@ -136,14 +140,18 @@ class FpTTC(nn.Module):
             corr_features.append(corr)
             multi_level_feats_prev.append(lvl_feats_prev)
             multi_level_feats_curr.append(lvl_feats_curr)
+        
+        # === (A) corr 特征 → range（用 curr 的映射） ===
+        # 注意：这里需要 Hr/Wr 做到与 proj_xy_* 一致；proj_xy_curr 的 shape 即可拿到 Hr/Wr
+        Hr, Wr = proj_xy_curr.shape[1], proj_xy_curr.shape[2]
+        corr_range = gaussian_splat_to_sphere(
+            corr_features,                     # list(V) of [B,Cc,Hf,Wf]
+            proj_pix_curr, proj_xy_curr,       # [B,Hr,Wr,3], [B,Hr,Wr,2]
+            H_img=160, W_img=320,              # <- 你原先的标定缩放因子，保持一致
+            wrap_horizontal=True
+        )   # [B,Cc,Hr,Wr]
 
-        # 1) 投影 corr 特征到 range-view（risk）
-        corr_range = self.project_views_to_range(
-            corr_features, proj_pix_curr,
-            H_img=160, W_img=320
-        )
-
-        # 2) multi-lvl、multi-view 特征投影
+        # === (B) multi-level 特征 → range，并做“球面对齐” ===
         multi_level_ranges_prev = []
         multi_level_ranges_curr = []
         for lvl in range(self.num_scales):
@@ -151,24 +159,66 @@ class FpTTC(nn.Module):
             if scale > 1:
                 proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
                 proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
+                proj_xy_prev_l = proj_xy_prev[:, ::scale, ::scale, :]
+                proj_xy_curr_l = proj_xy_curr[:, ::scale, ::scale, :]
             else:
                 proj_prev_lvl = proj_pix_prev
                 proj_curr_lvl = proj_pix_curr
+                proj_xy_prev_l = proj_xy_prev
+                proj_xy_curr_l = proj_xy_curr
 
-            prev_feats = [feats[lvl] for feats in multi_level_feats_prev]
+            prev_feats = [feats[lvl] for feats in multi_level_feats_prev]  # list(V) of [B,C,Hf,Wf]
             curr_feats = [feats[lvl] for feats in multi_level_feats_curr]
 
-            range_prev = self.project_views_to_range(
-                prev_feats, proj_prev_lvl,
-                H_img=160, W_img=320
-            )
-            range_curr = self.project_views_to_range(
-                curr_feats, proj_curr_lvl,
-                H_img=160, W_img=320
+            range_prev, conf_prev, _ = gaussian_splat_to_sphere(
+                prev_feats, proj_prev_lvl, proj_xy_prev_l,
+                H_img=160, W_img=320, wrap_horizontal=True,
+                return_conf=True, conf_norm='max', var_alpha=10.0
+            )   # [B,C,Hr_l,Wr_l]
+            range_curr, conf_curr, _ = gaussian_splat_to_sphere(
+                curr_feats, proj_curr_lvl, proj_xy_curr_l,
+                H_img=160, W_img=320, wrap_horizontal=True,
+                return_conf=True, conf_norm='max', var_alpha=10.0
             )
 
-            multi_level_ranges_prev.append(range_prev)
-            multi_level_ranges_curr.append(range_curr)
+            # === 球面对齐：把 curr 对齐到 prev ===
+            range_prev_aligned, range_curr_aligned, _ = self.sph_align(range_prev, range_curr)
+
+            multi_level_ranges_prev.append(range_prev_aligned)
+            multi_level_ranges_curr.append(range_curr_aligned)
+
+        # # 1) 投影 corr 特征到 range-view（risk）
+        # corr_range = self.project_views_to_range(
+        #     corr_features, proj_pix_curr,
+        #     H_img=160, W_img=320
+        # )
+
+        # # 2) multi-lvl、multi-view 特征投影
+        # multi_level_ranges_prev = []
+        # multi_level_ranges_curr = []
+        # for lvl in range(self.num_scales):
+        #     scale = 2 ** (self.num_scales - 1 - lvl)
+        #     if scale > 1:
+        #         proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
+        #         proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
+        #     else:
+        #         proj_prev_lvl = proj_pix_prev
+        #         proj_curr_lvl = proj_pix_curr
+
+        #     prev_feats = [feats[lvl] for feats in multi_level_feats_prev]
+        #     curr_feats = [feats[lvl] for feats in multi_level_feats_curr]
+
+        #     range_prev = self.project_views_to_range(
+        #         prev_feats, proj_prev_lvl,
+        #         H_img=160, W_img=320
+        #     )
+        #     range_curr = self.project_views_to_range(
+        #         curr_feats, proj_curr_lvl,
+        #         H_img=160, W_img=320
+        #     )
+
+        #     multi_level_ranges_prev.append(range_prev)
+        #     multi_level_ranges_curr.append(range_curr)
 
         # 3) 编码并预测风险分支输出
         # scale 分支
@@ -183,7 +233,7 @@ class FpTTC(nn.Module):
         )
 
         if scale_only:
-            return scales, None
+            return scales, None, conf_prev, conf_curr
         
         # risk 分支
         corr_encoded = self.conv_corr_risk(corr_range)
@@ -196,7 +246,7 @@ class FpTTC(nn.Module):
             initial_risk
         )
 
-        return scales, risk_score
+        return scales, risk_score, conf_prev, conf_curr
 
     def forward_with_loss( 
             self,
@@ -205,7 +255,9 @@ class FpTTC(nn.Module):
             depth_prev,                    # Tensor[B, V, 1, H, W]
             depth_curr,                    # Tensor[B, V, 1, H, W]
             proj_pix_prev,                 
-            proj_pix_curr,                 
+            proj_pix_curr,
+            proj_xy_prev,
+            proj_xy_curr, 
             gt_scale_map_with_mask,        # Tensor[B, 2, H_sph, W_sph]
             gt_risk_score_map_with_mask,   # Tensor[B, 2, H_sph, W_sph]
             attn_type,                     # str
@@ -216,13 +268,15 @@ class FpTTC(nn.Module):
             scale_only
         ):
 
-        scales, risks = self.forward(
+        scales, risks, conf_prev, conf_curr = self.forward(
             img_prev         = img_prev,
             img_curr         = img_curr,
             depth_prev       = depth_prev,
             depth_curr       = depth_curr,
             proj_pix_prev    = proj_pix_prev,
             proj_pix_curr    = proj_pix_curr,
+            proj_xy_prev     = proj_xy_prev,
+            proj_xy_curr     = proj_xy_curr,
             attn_type        = attn_type,
             attn_splits_list = attn_splits_list,
             corr_radius_list = corr_radius_list,
@@ -230,12 +284,27 @@ class FpTTC(nn.Module):
             num_reg_refine   = num_reg_refine,
             scale_only       = scale_only,
         )
+
+        # 将 conf_curr 调整到与 scales/risk_score 相同的分辨率
+        if isinstance(scales, (list, tuple)):
+            conf_for_loss = [self._resize_conf_to(s, conf_curr) for s in scales]
+        else:
+            conf_for_loss = self._resize_conf_to(scales, conf_curr)
+
         if scale_only:
             # 仅计算尺度分支的损失
-            loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
+            loss_s = get_loss_scale_map(scales, 
+                                        gt_scale_map_with_mask,
+                                        w_conf=conf_for_loss,
+                                        gamma=0.9,
+                                        loss_kind='charbonnier')
             return scales, None, loss_s, None
         else:
-            loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
+            loss_r = get_loss_risk_score_map(risks, 
+                                             gt_risk_score_map_with_mask,
+                                             w_conf=conf_for_loss,
+                                             gamma=0.9,
+                                             loss_kind='charbonnier')
             return None, risks, None, loss_r
 
     def extract_feature(self, im0, im1, branch):
@@ -297,3 +366,10 @@ class FpTTC(nn.Module):
                             .permute(0,2,1) \
                             .reshape(B, C, H_r, W_r)
         return range_feat
+    
+    def _resize_conf_to(self, pred, conf):
+        # pred: [B,1,H_out,W_out], conf: [B,1,H_in,W_in]
+        if pred.shape[-2:] == conf.shape[-2:]:
+            return conf
+        # 置信度不做平滑，避免“被平均变大/变小”，最近邻更稳
+        return F.interpolate(conf, size=pred.shape[-2:], mode='nearest')

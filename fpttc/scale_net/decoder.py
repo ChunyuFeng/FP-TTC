@@ -130,7 +130,6 @@ class ScaleDecoder(nn.Module):
             nn.Conv2d(256, upsample_factor ** 2 * 9, 1, 1, 0)
             )
 
-
     def forward(self, scale_feature, cfeat0, agg_corr, ini_scale):
         b, _, h, w = scale_feature.shape
         proj = self.refine_proj(torch.cat([scale_feature, cfeat0], dim=1))
@@ -139,15 +138,36 @@ class ScaleDecoder(nn.Module):
         inp = torch.relu(inp)
 
         scale = ini_scale
+        scales_low = []  # 收集每个阶段的累计预测（decoder 内部分辨率）
         for l in range(self.num_blocks):
             net, scale_out = self.scale_estimator[l](net, inp, agg_corr, scale)
             if l == 0:
                 scale = scale_out
             else:
                 scale = scale + scale_out
+            scales_low.append(scale)
 
-        scale_f = self.upsample_scale(scale, cfeat0)
-        return scale_f
+        # 上采样到最终分辨率：多阶段深监督
+        scales_full = [self.upsample_scale(s, cfeat0) for s in scales_low]
+        return scales_full
+    
+    # def forward(self, scale_feature, cfeat0, agg_corr, ini_scale):
+    #     b, _, h, w = scale_feature.shape
+    #     proj = self.refine_proj(torch.cat([scale_feature, cfeat0], dim=1))
+    #     net, inp = torch.chunk(proj, chunks=2, dim=1)
+    #     net = torch.tanh(net)
+    #     inp = torch.relu(inp)
+
+    #     scale = ini_scale
+    #     for l in range(self.num_blocks):
+    #         net, scale_out = self.scale_estimator[l](net, inp, agg_corr, scale)
+    #         if l == 0:
+    #             scale = scale_out
+    #         else:
+    #             scale = scale + scale_out
+
+    #     scale_f = self.upsample_scale(scale, cfeat0)
+    #     return scale_f
 
     def upsample_flow_with_mask(self, flow, up_mask, upsample_factor):
         # convex upsampling following raft
