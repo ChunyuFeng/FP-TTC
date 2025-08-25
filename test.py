@@ -187,21 +187,21 @@ def main():
             undistort_maps[ch] = (map1, map2, newK)
         
         def load_remap(ch, frame_type):
-                # frame_type = 'prev' 或 'curr'
-                path = test_entries[idx][f'{frame_type}_camera_data'][ch]['filename']
-                img = cv2.imread(path, cv2.IMREAD_COLOR)
-                map1, map2, K_ud = undistort_maps[ch]
-                img_ud = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
-                # 更新内参
-                test_entries[idx][f'sensor_metas_{frame_type}'][ch]['K_undist'] = K_ud
-                # 计算 R_l2c, t_l2c
-                R = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['R']
-                t = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['t']
-                R_inv, t_inv = R.T, -R.T @ t
-                test_entries[idx][f'sensor_metas_{frame_type}'][ch].update({
-                    'R_l2c': R_inv, 't_l2c': t_inv
-                })
-                return ch, img_ud
+            # frame_type = 'prev' 或 'curr'
+            path = test_entries[idx][f'{frame_type}_camera_data'][ch]['filename']
+            img = cv2.imread(path, cv2.IMREAD_COLOR)
+            map1, map2, K_ud = undistort_maps[ch]
+            img_ud = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
+            # 更新内参
+            test_entries[idx][f'sensor_metas_{frame_type}'][ch]['K_undist'] = K_ud
+            # 计算 R_l2c, t_l2c
+            R = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['R']
+            t = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['t']
+            R_inv, t_inv = R.T, -R.T @ t
+            test_entries[idx][f'sensor_metas_{frame_type}'][ch].update({
+                'R_l2c': R_inv, 't_l2c': t_inv
+            })
+            return ch, img_ud
             
         # for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
         #      # if idx <= 180:
@@ -251,7 +251,7 @@ def main():
         #     affine_matrix = augmentor.get_affine_matrix(affine_params)
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view'):
 
-            # if idx < 4400 or idx > 4600:
+            # if idx > 100:
             #     continue
             # start = time.perf_counter()
             # 1) 并行加载 + 去畸变
@@ -344,10 +344,10 @@ def main():
 
             for channel in camera_channels:
                 raw_image_prev = cv2.cvtColor(augmented_prev[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
-                prev_depth_pred_map[channel] = depth_model.infer_image(raw_image_prev, input_size=320)
+                prev_depth_pred_map[channel] = depth_model.infer_image(raw_image_prev)
 
                 raw_image_curr = cv2.cvtColor(augmented_curr[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
-                curr_depth_pred_map[channel] = depth_model.infer_image(raw_image_curr, input_size=320)
+                curr_depth_pred_map[channel] = depth_model.infer_image(raw_image_curr)
 
                 prev_depth_pred_map_tensor[channel] = torch.from_numpy(prev_depth_pred_map[channel])
                 curr_depth_pred_map_tensor[channel] = torch.from_numpy(curr_depth_pred_map[channel])
@@ -412,15 +412,15 @@ def main():
             # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
 
             # new vis method
-            # scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
-            # vis = scale2rgb(scale_vis)
-            # vis = vis*255.0
-            # cv2.imwrite(os.path.join(output_dir, f"new_pred_scale_{idx}.png"), vis)
+            scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
+            vis = scale2rgb(scale_vis)
+            vis = vis*255.0
+            cv2.imwrite(os.path.join(output_dir, f"new_pred_scale_{idx}.png"), vis)
 
-            # orien = np.clip(risk_prediction_array, 0.0, np.pi)
-            # orien_vis = orientation2rgb(orien)
-            # orien_vis = orien_vis * 255.0
-            # cv2.imwrite(os.path.join(output_dir, f"new_pred_orien_{idx}.png"), orien_vis)
+            orien = np.clip(risk_prediction_array, 0.0, np.pi)
+            orien_vis = orientation2rgb(orien)
+            orien_vis = orien_vis * 255.0
+            cv2.imwrite(os.path.join(output_dir, f"new_pred_orien_{idx}.png"), orien_vis)
 
             # save prediction as .npy files for collision map generation
             if args.save_pred_npy:

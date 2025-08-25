@@ -335,7 +335,7 @@ def range_projection_with_mapping(
     proj_y = np.clip(proj_y, 0, H-1)
 
     # 6. 按深度远到近排序
-    order = np.argsort(depth)[::-1]
+    order = np.argsort(depth)
     depth_s = depth[order]
     pts_s   = points[order]
     x_s     = proj_x[order]

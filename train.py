@@ -12,7 +12,7 @@ import dataloader.dataset as datasets
 from fpttc.fp_ttc import FpTTC
 from utils.trainer import TTCTrainer
 from utils.dist import is_main_process
-
+from utils.checkpoint import load_scale_only_weights
 import neptune
 
 time_stamp = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
@@ -143,6 +143,30 @@ parser.add_argument('--scale_batch_size', type=int, default=1,
 parser.add_argument('--risk_batch_size',  type=int, default=1,
                     help='batch size for risk-only stage')
 
+# depth-anything & consistency options
+parser.add_argument('--use_da_head', action='store_true', help='use DepthAnythingV2 head online and finetune it')
+parser.add_argument('--da_encoder', default='vitl', type=str, choices=['vits','vitb','vitl','vitg'])
+parser.add_argument('--da_max_depth', default=80.0, type=float)
+parser.add_argument('--online_proj', action='store_true', help='rebuild proj_pix from current depth each iteration')
+parser.add_argument('--detach_depth_for_proj', action='store_true', help='use depth.detach() when building proj_pix')
+
+# DDCL & MVRCL weights
+parser.add_argument('--ddcl_w', default=0.10, type=float)
+parser.add_argument('--mvrcl_w', default=0.20, type=float)
+parser.add_argument('--smooth_scale_w', default=0.01, type=float)
+parser.add_argument('--smooth_risk_w',  default=0.01, type=float)
+
+# FOV for online spherical projection (range-view)
+parser.add_argument('--rv_fov_up', default=8.0, type=float)
+parser.add_argument('--rv_fov_down', default=-15.0, type=float)
+parser.add_argument('--rv_size', default=[40, 480], type=int, nargs='+')  # [H_r, W_r]
+
+parser.add_argument(
+    '--depthanything_pretrained_ckpt',
+    type=str, default=None,
+    help='path to pretrained scale‑only model (.pth or .pth.tar)'
+)
+
 # 加载预训练的单分支模型：
 parser.add_argument(
     '--scale_pretrained_ckpt',
@@ -206,6 +230,19 @@ def main():
         ffn_dim_expansion      = args.ffn_dim_expansion,
         num_transformer_layers = args.num_transformer_layers,
         reg_refine             = args.reg_refine,
+        # NEW: consistency & DA
+        use_da_head            = args.use_da_head,
+        da_encoder             = args.da_encoder,
+        da_max_depth           = args.da_max_depth,
+        online_proj            = args.online_proj,
+        detach_depth_for_proj  = args.detach_depth_for_proj,
+        ddcl_w                 = args.ddcl_w,
+        mvrcl_w                = args.mvrcl_w,
+        smooth_scale_w         = args.smooth_scale_w,
+        smooth_risk_w          = args.smooth_risk_w,
+        rv_size                = tuple(args.rv_size),
+        rv_fov_up              = args.rv_fov_up,
+        rv_fov_down            = args.rv_fov_down,
     ).cuda()
 
     start_epoch = 0
@@ -246,6 +283,17 @@ def main():
             for k in load_info.unexpected_keys:
                 print(f"    {k}")
     
+    # ---- load DepthAnythingV2 pretrained weights (optional) ----
+    if args.depthanything_pretrained_ckpt is not None:
+        if hasattr(model, "load_depthanything_ckpt"):
+            model.load_depthanything_ckpt(args.depthanything_pretrained_ckpt)
+        else:
+            print("[WARN] FpTTC has no `load_depthanything_ckpt` method; skip loading DA weights.")
+    # ------------------------------------------------------------
+
+    if args.scale_pretrained_ckpt:
+        load_scale_only_weights(model, args.scale_pretrained_ckpt, map_location="cpu", verbose=True)
+
     if parallel:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
                         output_device=local_rank, find_unused_parameters=True)
@@ -263,38 +311,38 @@ def main():
     
     # stage 1: train scale branch
     if args.train_stage in ('scale', 'both'):
-        ########################### LOAD PRETRAINED SCALE MODEL ###########################
-        if args.scale_pretrained_ckpt is not None:
-            ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
-            # 提取 state_dict
-            if 'model' in ckpt:
-                sd = ckpt['model']
-            elif 'net' in ckpt:
-                # 去掉 DDP 的 module. 前缀
-                sd = {k.replace('module.', ''): v for k, v in ckpt['net'].items()}
-            elif 'state_dict' in ckpt:
-                sd = ckpt['state_dict']
-            else:
-                sd = ckpt
+        # ########################### LOAD PRETRAINED SCALE MODEL ###########################
+        # if args.scale_pretrained_ckpt is not None:
+        #     ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
+        #     # 提取 state_dict
+        #     if 'model' in ckpt:
+        #         sd = ckpt['model']
+        #     elif 'net' in ckpt:
+        #         # 去掉 DDP 的 module. 前缀
+        #         sd = {k.replace('module.', ''): v for k, v in ckpt['net'].items()}
+        #     elif 'state_dict' in ckpt:
+        #         sd = ckpt['state_dict']
+        #     else:
+        #         sd = ckpt
 
-            # 只挑出 cnet/featnet/corrnet 的参数
-            prefixes = ('cnet.', 'featnet.', 'corrnet.')
-            filtered = {}
-            for k, v in sd.items():
-                if any(k.startswith(pref) for pref in prefixes):
-                    filtered[k] = v
+        #     # 只挑出 cnet/featnet/corrnet 的参数
+        #     prefixes = ('cnet.', 'featnet.', 'corrnet.')
+        #     filtered = {}
+        #     for k, v in sd.items():
+        #         if any(k.startswith(pref) for pref in prefixes):
+        #             filtered[k] = v
 
-            # 注入到当前模型里
-            model_dict = model.state_dict()
-            model_dict.update(filtered)
-            load_info = model.load_state_dict(model_dict, strict=False)
-            if is_main_process():
-                loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
-                print(f"[SCALE-INIT] Loaded {len(loaded)} keys for scale backbone:")
-                for k in sorted(loaded):
-                    print("   ", k)
-                if load_info.missing_keys:
-                    print(f"[SCALE-INIT] Missing keys: {load_info.missing_keys}")
+        #     # 注入到当前模型里
+        #     model_dict = model.state_dict()
+        #     model_dict.update(filtered)
+        #     load_info = model.load_state_dict(model_dict, strict=False)
+        #     if is_main_process():
+        #         loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
+        #         print(f"[SCALE-INIT] Loaded {len(loaded)} keys for scale backbone:")
+        #         for k in sorted(loaded):
+        #             print("   ", k)
+        #         if load_info.missing_keys:
+        #             print(f"[SCALE-INIT] Missing keys: {load_info.missing_keys}")
             ##########################################################################
         # 1) freeze risk branch
         freeze_prefixes = (

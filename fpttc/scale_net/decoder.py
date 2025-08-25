@@ -72,7 +72,6 @@ class SepConvGRU(nn.Module):
 
         return h
 
-
 # class BasicUpdateBlock(nn.Module):
 #     def __init__(self, hidden_dim=128, input_dim=128):
 #         super(BasicUpdateBlock, self).__init__()

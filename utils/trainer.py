@@ -53,24 +53,37 @@ class TTCTrainer(object):
             self.epoch = args.scale_epochs
         else:
             self.epoch = args.risk_epochs
-        self.optimizer = optimizer
+        # self.optimizer = optimizer
         self.start_epoch = start_epoch
         
         steps_per_epoch = int(len(self.train_loader))
-        #print(self.epoch, len(self.train_loader), self.batch_size, steps_per_epoch)
         starte = -1
         if self.start_epoch>0:
             starte = self.start_epoch - 1
         
+        # self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        #     self.optimizer,
+        #     max_lr=args.lr,
+        #     epochs=self.epoch,
+        #     steps_per_epoch=steps_per_epoch,
+        #     pct_start=0.05,
+        #     cycle_momentum=False,
+        #     anneal_strategy='cos',
+        #     last_epoch=max(steps_per_epoch*starte,-1),
+        # )
+
+        from utils.optim_finetune import build_optimizer_finetune
+        self.optimizer, max_lrs = build_optimizer_finetune(self.model, args)
+
         self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=args.lr,
-            epochs=self.epoch,
+            max_lr=max_lrs,                 # 注意：与 param_groups 个数一致
+            epochs=self.epoch,              # 你 fine-tune 的 epoch 数（建议 60 左右）
             steps_per_epoch=steps_per_epoch,
-            pct_start=0.05,
+            pct_start=0.1,                  # 微调阶段warmup稍长
             cycle_momentum=False,
             anneal_strategy='cos',
-            last_epoch=max(steps_per_epoch*starte,-1),
+            last_epoch=max(steps_per_epoch*starte, -1),
         )
 
         self.device = device
@@ -151,7 +164,12 @@ class TTCTrainer(object):
              proj_pix_prev_tensor,
              proj_pix_curr_tensor,
              gt_scale_map_with_mask,
-             gt_risk_score_map_with_mask) = data
+             gt_risk_score_map_with_mask,
+             gt_depth_map,
+             K_curr,
+             affine_matrix,
+             T_E_from_C_curr,
+             T_Ecurr_from_Eprev) = data
             
             prev_surr_view_imgs_tensor   = prev_surr_view_imgs_tensor.to(self.device)
             curr_surr_view_imgs_tensor   = curr_surr_view_imgs_tensor.to(self.device)
@@ -161,7 +179,11 @@ class TTCTrainer(object):
             proj_pix_curr_tensor         = proj_pix_curr_tensor.to(self.device)
             gt_scale_map_with_mask       = gt_scale_map_with_mask.to(self.device)
             gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
-            # affine_matrix                = affine_matrix.to(self.device)
+            gt_depth_map                 = gt_depth_map.to(self.device)
+            K_curr                       = K_curr.to(self.device)
+            T_E_from_C_curr              = T_E_from_C_curr.to(self.device)
+            T_Ecurr_from_Eprev           = T_Ecurr_from_Eprev.to(self.device)
+            affine_matrix                = affine_matrix.to(self.device)
 
             self.optimizer.zero_grad()
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
@@ -176,11 +198,16 @@ class TTCTrainer(object):
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
                     gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
                     attn_type                     = self.attn_type,
+                    gt_depth_map                  = gt_depth_map,
                     attn_splits_list              = self.attn_splits_list,
                     corr_radius_list              = self.corr_radius_list,
                     prop_radius_list              = self.prop_radius_list,
                     num_reg_refine                = self.num_reg_refine,
-                    scale_only                    = self.scale_only
+                    scale_only                    = self.scale_only,
+                    K_curr                        = K_curr,
+                    affine_matrix                 = affine_matrix,
+                    T_E_from_C_curr               = T_E_from_C_curr,
+                    T_Ecurr_from_Eprev            = T_Ecurr_from_Eprev,
                 )
             else:
                 scale, risk_score, loss_s, loss_r = self.model.forward_with_loss(
@@ -192,12 +219,17 @@ class TTCTrainer(object):
                     proj_pix_curr                 = proj_pix_curr_tensor,
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
                     gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
+                    gt_depth_map                  = gt_depth_map,
                     attn_type                     = self.attn_type,
                     attn_splits_list              = self.attn_splits_list,
                     corr_radius_list              = self.corr_radius_list,
                     prop_radius_list              = self.prop_radius_list,
                     num_reg_refine                = self.num_reg_refine,
-                    scale_only                    = self.scale_only
+                    scale_only                    = self.scale_only,
+                    K_curr                        = K_curr,
+                    affine_matrix                 = affine_matrix,
+                    T_E_from_C_curr               = T_E_from_C_curr,
+                    T_Ecurr_from_Eprev            = T_Ecurr_from_Eprev,
                 )
             
             loss = loss_s if self.scale_only else loss_r
