@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=8 torchrun --standalone --nnodes=1 --nproc_per_node=4 train.py \
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 OMP_NUM_THREADS=8 torchrun --standalone --nnodes=1 --nproc_per_node=6 train.py \
 --padding_factor 32 \
 --upsample_factor 4 \
 --num_scales 2 \
@@ -7,12 +7,20 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=8 torchrun --standalone --nnodes=1 
 --prop_radius_list -1 1 \
 --epoch 2400 \
 --lr 4e-5 \
---batch_size 3 \
+--batch_size 1 \
 --stage 'nuscenes_range_image' \
 --image_size 160 320 \
---finetune \
---ft_epoch_s1 0 \
---ft_epoch_s2 200 \
---resume ./pretrained/surroundttc_v1.pth.tar \
---neptune \
+--train_stage scale \
+--scale_epochs 200 \
+--scale_batch_size 2 \
+--use_da_head \
+--online_proj \
+--da_encoder "vitl" \
+--detach_depth_for_proj \
+--ddcl_w 0.1 \
+--mvrcl_w 0.0 \
+--smooth_scale_w 0.01 \
+--smooth_risk_w 0.01 \
+--depthanything_pretrained_ckpt "./pretrained/new/depth_anything_v2_metric_vkitti_vitl.pth" \
+--scale_pretrained_ckpt "./pretrained/new/1000y.pth.tar" \
 --parallel

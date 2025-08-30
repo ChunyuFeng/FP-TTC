@@ -16,7 +16,7 @@ from utils.draw import (
     orientation2rgb
 )
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
-from dataloader.dataset import build_frame_mapping
+from dataloader.dataset import build_frame_mapping, pack_geocalib_tensors_per_cam_to_lidar, lidar2cam_to_cam2lidar
 import pickle
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -101,6 +101,24 @@ parser.add_argument('--pred_npy_dir', default='./Datasets/nuscenes/3_visualizati
 parser.add_argument('--test_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/nusc_trainval_infos_160_1920.pkl',
                     type=str, help='Path to test info file (e.g., nusc_trainval_infos_160_1920.pkl)')
 
+# depth-anything & consistency options
+parser.add_argument('--use_da_head', action='store_true', help='use DepthAnythingV2 head online and finetune it')
+parser.add_argument('--da_encoder', default='vitl', type=str, choices=['vits','vitb','vitl','vitg'])
+parser.add_argument('--da_max_depth', default=80.0, type=float)
+parser.add_argument('--online_proj', action='store_true', help='rebuild proj_pix from current depth each iteration')
+parser.add_argument('--detach_depth_for_proj', action='store_true', help='use depth.detach() when building proj_pix')
+
+# DDCL & MVRCL weights
+parser.add_argument('--ddcl_w', default=0.10, type=float)
+parser.add_argument('--mvrcl_w', default=0.20, type=float)
+parser.add_argument('--smooth_scale_w', default=0.01, type=float)
+parser.add_argument('--smooth_risk_w',  default=0.01, type=float)
+
+# FOV for online spherical projection (range-view)
+parser.add_argument('--rv_fov_up', default=8.0, type=float)
+parser.add_argument('--rv_fov_down', default=-15.0, type=float)
+parser.add_argument('--rv_size', default=[40, 480], type=int, nargs='+')  # [H_r, W_r]
+
 args = parser.parse_args()
 
 torch.cuda.set_device(0)
@@ -120,7 +138,20 @@ def main():
                   num_head               = args.num_head,
                   ffn_dim_expansion      = args.ffn_dim_expansion,
                   num_transformer_layers = args.num_transformer_layers,
-                  reg_refine             = args.reg_refine).cuda()
+                  reg_refine             = args.reg_refine,
+                  # NEW: consistency & DA
+                  use_da_head            = args.use_da_head,
+                  da_encoder             = args.da_encoder,
+                  da_max_depth           = args.da_max_depth,
+                  online_proj            = args.online_proj,
+                  detach_depth_for_proj  = args.detach_depth_for_proj,
+                  ddcl_w                 = args.ddcl_w,
+                  mvrcl_w                = args.mvrcl_w,
+                  smooth_scale_w         = args.smooth_scale_w,
+                  smooth_risk_w          = args.smooth_risk_w,
+                  rv_size                = tuple(args.rv_size),
+                  rv_fov_up              = args.rv_fov_up,
+                  rv_fov_down            = args.rv_fov_down,).cuda()
 
     # Optionally resume checkpoint
     if args.resume:
@@ -170,7 +201,7 @@ def main():
     max_depth = 80 # 20 for indoor model, 80 for outdoor model
 
     depth_model = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': max_depth})
-    depth_model.load_state_dict(torch.load(f'pretrained/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
+    depth_model.load_state_dict(torch.load(f'pretrained/new/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
     depth_model.to('cuda').eval()
     
     if args.sjtu_test:
@@ -364,16 +395,40 @@ def main():
             # print(f"test：{elapsed_ms:.3f} ms")
 
             # 3) load 环视图像 uv 坐标与 range view uv 坐标之间的对应关系 (DepthAnythingV2)
-            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'sjtu', 'prev', prev_depth_pred_map,
-                                                                 affine_matrix, idx, H_r=40, W_r=480, visualize=False)
-            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'sjtu', 'curr', curr_depth_pred_map,
-                                                                 affine_matrix, idx, H_r=40, W_r=480, visualize=False)
+            # proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'sjtu', 'prev', prev_depth_pred_map,
+            #                                                      affine_matrix, idx, H_r=40, W_r=480, visualize=False)
+            # proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'sjtu', 'curr', curr_depth_pred_map,
+            #                                                      affine_matrix, idx, H_r=40, W_r=480, visualize=False)
+            proj_pix_prev = np.zeros((1,3), dtype=np.int64)   # (M, 3)
+            proj_pix_curr = np.zeros((1,3), dtype=np.int64)   # (M, 3)
             # 转换为 tensor
             proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
             proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
             # 打包 batch
             proj_pix_prev_batch = proj_pix_prev_tensor.unsqueeze(0).to(device)
             proj_pix_curr_batch = proj_pix_curr_tensor.unsqueeze(0).to(device)
+
+            affine_matrix = torch.from_numpy(affine_matrix).unsqueeze(0).to(device)
+
+            K_ = []
+            T_Cam2Lidar = []
+            flip_xy_matrix = np.array([[-1, 0, 0],
+                                        [0, -1, 0],
+                                        [0, 0, 1]], dtype=np.float32)
+            for channel in camera_channels:
+                k = test_entries[idx]['sensor_metas_prev'][channel]['K_undist']
+                k = k.astype(np.float32)
+                K_.append(k)
+                t_cam2lidar = lidar2cam_to_cam2lidar(
+                    test_entries[idx]['sensor_metas_prev'][channel]['R_l2c'],
+                    test_entries[idx]['sensor_metas_prev'][channel]['t_l2c']
+                )
+                t_cam2lidar = t_cam2lidar.astype(np.float32)
+                # 乘以 flip_xy_matrix 来修正坐标系
+                t_cam2lidar[:3, :3] = flip_xy_matrix @ t_cam2lidar[:3, :3]
+                T_Cam2Lidar.append(t_cam2lidar)
+            K_curr = torch.stack([torch.from_numpy(k) for k in K_], dim=0).unsqueeze(0).to(device)  # (1, 6, 3, 3)
+            T_Camera2Lidar = torch.stack([torch.from_numpy(t) for t in T_Cam2Lidar], dim=0).unsqueeze(0).to(device)  # (1, 6, 4, 4)
 
             # Inference
             with torch.no_grad():
@@ -390,6 +445,9 @@ def main():
                         prop_radius_list = args.prop_radius_list,
                         num_reg_refine   = args.num_reg_refine,
                         scale_only       = False,
+                        affine_matrix    = affine_matrix,
+                        K_curr           = K_curr,
+                        T_E_from_C_curr  = T_Camera2Lidar
                     )
             # end2 = time.perf_counter()
             # print(f"Inference took {(end2 - end1)*1000:.2f} ms")
@@ -515,16 +573,29 @@ def main():
                 gt_risk_tensor = torch.zeros((1, 2, prev_batch.shape[2], prev_batch.shape[3])).to(device)
 
             # 4) load 环视图像 uv 坐标与 range view uv 坐标之间的对应关系 (DepthAnythingV2)
-            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'nusc', 'prev', depth_pred_prev, 
-                                                                 affine_matrix, idx, H_r=40, W_r=480)
-            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'nusc', 'curr', depth_pred_curr,
-                                                                 affine_matrix, idx, H_r=40, W_r=480)
+            # proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'nusc', 'prev', depth_pred_prev, 
+            #                                                      affine_matrix, idx, H_r=40, W_r=480)
+            # proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'nusc', 'curr', depth_pred_curr,
+            #                                                      affine_matrix, idx, H_r=40, W_r=480)
+            proj_pix_prev = np.zeros((1,3), dtype=np.int64)   # (M, 3)
+            proj_pix_curr = np.zeros((1,3), dtype=np.int64)   # (M, 3)
             # 转换为 tensor
             proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
             proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
             # 打包 batch
             proj_pix_prev_batch = proj_pix_prev_tensor.unsqueeze(0).to(device)
             proj_pix_curr_batch = proj_pix_curr_tensor.unsqueeze(0).to(device)
+
+            affine_matrix = torch.from_numpy(affine_matrix).unsqueeze(0).to(device)
+
+            sensor_metas_prev = test_entries[idx]['sensor_metas_prev']
+            sensor_metas_curr = test_entries[idx]['sensor_metas_curr']
+            K_curr, T_E_from_C_curr, _ = pack_geocalib_tensors_per_cam_to_lidar(
+                sensor_metas_prev = sensor_metas_prev, 
+                sensor_metas_curr = sensor_metas_curr, 
+                camera_channels   = camera_channels)
+            K_curr = K_curr.unsqueeze(0).to(device)
+            T_E_from_C_curr = T_E_from_C_curr.unsqueeze(0).to(device)
 
             # Inference
             with torch.no_grad():
@@ -541,6 +612,9 @@ def main():
                         prop_radius_list = args.prop_radius_list,
                         num_reg_refine   = args.num_reg_refine,
                         scale_only       = False,
+                        affine_matrix    = affine_matrix,
+                        K_curr           = K_curr,
+                        T_E_from_C_curr  = T_E_from_C_curr  
                     )
 
             # # Visualization

@@ -25,7 +25,7 @@ from .draw import visual_scale_map_range_image, visual_risk_score_map_range_imag
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
 
 class TTCTrainer(object):
-    def __init__(self, model, dataset, optimizer, args, start_epoch, device,
+    def __init__(self, model, dataset, optimizer, max_lr, args, start_epoch, device,
                 parallel=False, time_stamp=None, 
                 neptune_run=None, scale_only=False):
         self.model = model
@@ -53,7 +53,7 @@ class TTCTrainer(object):
             self.epoch = args.scale_epochs
         else:
             self.epoch = args.risk_epochs
-        # self.optimizer = optimizer
+        self.optimizer = optimizer
         self.start_epoch = start_epoch
         
         steps_per_epoch = int(len(self.train_loader))
@@ -72,12 +72,12 @@ class TTCTrainer(object):
         #     last_epoch=max(steps_per_epoch*starte,-1),
         # )
 
-        from utils.optim_finetune import build_optimizer_finetune
-        self.optimizer, max_lrs = build_optimizer_finetune(self.model, args)
+        # from utils.optim_finetune import build_optimizer_finetune
+        # self.optimizer, max_lrs = build_optimizer_finetune(self.model, args)
 
         self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=max_lrs,                 # 注意：与 param_groups 个数一致
+            max_lr=max_lr,                 # 注意：与 param_groups 个数一致
             epochs=self.epoch,              # 你 fine-tune 的 epoch 数（建议 60 左右）
             steps_per_epoch=steps_per_epoch,
             pct_start=0.1,                  # 微调阶段warmup稍长

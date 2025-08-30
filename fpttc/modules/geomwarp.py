@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import math
 from torch_scatter import scatter_min
-import open3d as o3d
+# import open3d as o3d
 import numpy as np
 
 # ----------------------------

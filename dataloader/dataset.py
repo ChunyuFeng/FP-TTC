@@ -331,6 +331,22 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
 
     return proj_range, proj_pix
 
+def lidar2cam_to_cam2lidar(R_l2c: np.ndarray, t_l2c: np.ndarray):
+    """
+    输入:
+      R_l2c: [3,3] 或 [...,3,3]
+      t_l2c: [3]   或 [...,3]
+    返回:
+      T_c2l: [4,4] 或 [...,4,4]
+    """
+    Rt = np.swapaxes(R_l2c, -1, -2)              # R^T
+    t  = - Rt @ t_l2c[..., None]                 # -R^T t
+    # 组 4x4
+    T = np.zeros(R_l2c.shape[:-2] + (4, 4), dtype=R_l2c.dtype)
+    T[..., :3, :3] = Rt
+    T[..., :3,  3] = t[..., 0]
+    T[...,  3,  3] = 1.0
+    return T
 
 def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
     """ Create the data loader for the corresponding trainign set """

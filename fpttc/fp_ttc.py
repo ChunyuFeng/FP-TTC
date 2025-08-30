@@ -141,7 +141,9 @@ class FpTTC(nn.Module):
                 prop_radius_list,
                 num_reg_refine,
                 scale_only,
-                affine_matrix):
+                affine_matrix,
+                K_curr,
+                T_E_from_C_curr):
 
     
         # 保留原图 (0..1) 给 photometric/warping
@@ -164,8 +166,8 @@ class FpTTC(nn.Module):
 
             # 需要 K_curr / T_E_from_C_curr，从 forward 的参数携带
             # 为了兼容旧接口，我们把它们缓存进 self.tmp_calib（在 forward_with_loss 里赋值）
-            K = self.tmp_K_curr        # [B,V,3,3]
-            T = self.tmp_T_E_from_C    # [B,V,4,4]
+            K = K_curr        # [B,V,3,3]
+            T = T_E_from_C_curr    # [B,V,4,4]
 
             proj_pix_prev, _, _ = build_proj_pix_from_depth_torch(
                 depth_for_proj_prev, K, T, self.rv_H, self.rv_W, self.rv_fov_up, self.rv_fov_down, affine_matrix
@@ -324,6 +326,8 @@ class FpTTC(nn.Module):
             num_reg_refine   = num_reg_refine,
             scale_only       = scale_only,
             affine_matrix    = affine_matrix,
+            K_curr           = K_curr,
+            T_E_from_C_curr  = T_E_from_C_curr,
         )
         
         if not hasattr(self, "mag_aligner"):
@@ -372,7 +376,7 @@ class FpTTC(nn.Module):
             total_loss = loss_s
             if ddcl   is not None: total_loss = total_loss + ddcl_w   * ddcl
             if smooth is not None: total_loss = total_loss + smooth_w * smooth
-            
+
             return scales, None, total_loss, None
 
         else:
@@ -406,63 +410,129 @@ class FpTTC(nn.Module):
             a, b = torch.chunk(f, 2, dim=0)
             p0.append(a); p1.append(b)
         return p0, p1
-
+    
     def project_views_to_range(
         self,
-        features_list,   # list长度 = V，每个 [B, C, Hf, Wf]
-        proj_pix,        # [B, H_r, W_r, 3]  (cam_idx, u_img, v_img), 允许 -1 表示无效
-        H_img, W_img               # 相机图像分辨率（增强后）
+        features_list,        # list 长度 = V，每个 [B, C, Hf, Wf]
+        proj_pix,             # [B, H_r, W_r, 3]  (cam_idx, u_img, v_img)，允许 -1 表示无效
+        H_img, W_img          # 相机图像分辨率（增强后）
     ):
         """
         从多视角特征提取 range-view 特征，安全处理无效映射（cam=-1 或 u/v=-1）。
-        等价于你 numpy 版思路，但不会在 GPU 上越界。
         """
+        device = proj_pix.device
         B, H_r, W_r, _ = proj_pix.shape
         V = len(features_list)
-        device = proj_pix.device
-        dtype  = proj_pix.dtype
 
-        # [B,V,C,Hf,Wf] -> [B*V, C, Hf*Wf]
-        feats = torch.stack(features_list, dim=1)                # [B,V,C,Hf,Wf]
+        # [B,V,C,Hf,Wf] -> 合并视角到 batch: [B*V, C, Hf*Wf]
+        feats = torch.stack(features_list, dim=1)     # [B,V,C,Hf,Wf]
         B_, V_, C, Hf, Wf = feats.shape
         assert B_ == B and V_ == V
-        feats_flat = feats.view(B*V, C, Hf*Wf).contiguous()
+        feats_flat = feats.view(B * V, C, Hf * Wf).contiguous()
 
-        # 下采样比例（从图像像素到特征像素）
+        # 像素 -> 特征图的缩放
         s_u = Wf / float(W_img)
         s_v = Hf / float(H_img)
 
-        cam = proj_pix[..., 0].long()                            # [B,Hr,Wr]
+        # 取出 (cam,u,v)
+        cam = proj_pix[..., 0].long()                 # [B,Hr,Wr]
         u   = proj_pix[..., 1].float()
         v   = proj_pix[..., 2].float()
 
-        # 有效位置：cam>=0 且 u/v>=0
-        valid = (cam >= 0) & (u >= 0) & (v >= 0)                # [B,Hr,Wr]
+        # 有效掩码（-1 无效）
+        valid = (cam >= 0) & (u >= 0) & (v >= 0)      # [B,Hr,Wr]
 
-        # 安全索引（无效位置先用 0 占位，后续再用 valid 清零）
+        # 安全索引（无效的先占位 0，最后用 valid 清零）
         cam_safe = torch.where(valid, cam, torch.zeros_like(cam))
         u_safe   = torch.where(valid, u,   torch.zeros_like(u))
         v_safe   = torch.where(valid, v,   torch.zeros_like(v))
 
-        # 映射到特征分辨率并裁剪
-        uf = (u_safe * s_u).long().clamp(0, Wf-1)               # [B,Hr,Wr]
-        vf = (v_safe * s_v).long().clamp(0, Hf-1)
+        # 映射到特征分辨率（显式 floor 再 clamp）
+        uf = torch.floor(u_safe * s_u).long().clamp(0, Wf - 1)   # [B,Hr,Wr]
+        vf = torch.floor(v_safe * s_v).long().clamp(0, Hf - 1)   # [B,Hr,Wr]
 
-        # 线性化 index
-        pix_idx = (vf * Wf + uf).view(B, -1)                    # [B, Hr*Wr]
-        # batch 维
-        batch_idx = torch.arange(B, device=device).unsqueeze(1).repeat(1, H_r*W_r).view(-1)  # [B*Hr*Wr]
-        # 视角合并：view_idx = batch*V + cam
-        view_idx = (batch_idx * V + cam_safe.view(B, -1)).view(-1)                           # [B*Hr*Wr]
-        pix_idx  = pix_idx.view(-1)
+        # 展平（**长度从数据推导**，不要手写 H_r*W_r）
+        cam_flat   = cam_safe.view(B, -1)            # [B, Npix]
+        uf_flat    = uf.view(B, -1)                  # [B, Npix]
+        vf_flat    = vf.view(B, -1)                  # [B, Npix]
+        valid_flat = valid.view(B, -1)               # [B, Npix]
+        Npix       = cam_flat.size(1)                # = H_r * W_r
 
-        # gather
-        selected = feats_flat[view_idx, :, pix_idx]             # [B*Hr*Wr, C]
-        selected = selected * valid.view(-1, 1).float()         # 无效像素清零
+        # 源特征的线性像素索引
+        pix_idx = (vf_flat * Wf + uf_flat).view(-1)  # [B*Npix]
 
-        # reshape 回 [B,C,Hr,Wr]
-        range_feat = selected.view(B, H_r*W_r, C).permute(0, 2, 1).contiguous().view(B, C, H_r, W_r)
-        return range_feat
+        # 视角索引：把视角合并到 batch 维 => view_idx ∈ [0, B*V-1]
+        batch_idx = torch.arange(B, device=device).view(B, 1).expand(B, Npix)   # [B,Npix]
+        view_idx  = (batch_idx * V + cam_flat).view(-1)                         # [B*Npix]
+
+        # 只对有效位置取值
+        sel = valid_flat.view(-1)                                               # [B*Npix] bool
+
+        # 目标画布
+        out = torch.zeros(B * Npix, C, device=device, dtype=feats.dtype)        # [B*Npix, C]
+        if sel.any():
+            out[sel] = feats_flat[view_idx[sel], :, pix_idx[sel]]               # gather 有效位置
+
+        # 复原成 [B, C, H_r, W_r]
+        out = out.view(B, Npix, C).permute(0, 2, 1).contiguous().view(B, C, H_r, W_r)
+        return out
+
+    # def project_views_to_range(
+    #     self,
+    #     features_list,   # list长度 = V，每个 [B, C, Hf, Wf]
+    #     proj_pix,        # [B, H_r, W_r, 3]  (cam_idx, u_img, v_img), 允许 -1 表示无效
+    #     H_img, W_img               # 相机图像分辨率（增强后）
+    # ):
+    #     """
+    #     从多视角特征提取 range-view 特征，安全处理无效映射（cam=-1 或 u/v=-1）。
+    #     等价于你 numpy 版思路，但不会在 GPU 上越界。
+    #     """
+    #     B, H_r, W_r, _ = proj_pix.shape
+    #     V = len(features_list)
+    #     device = proj_pix.device
+    #     dtype  = proj_pix.dtype
+
+    #     # [B,V,C,Hf,Wf] -> [B*V, C, Hf*Wf]
+    #     feats = torch.stack(features_list, dim=1)                # [B,V,C,Hf,Wf]
+    #     B_, V_, C, Hf, Wf = feats.shape
+    #     assert B_ == B and V_ == V
+    #     feats_flat = feats.view(B*V, C, Hf*Wf).contiguous()
+
+    #     # 下采样比例（从图像像素到特征像素）
+    #     s_u = Wf / float(W_img)
+    #     s_v = Hf / float(H_img)
+
+    #     cam = proj_pix[..., 0].long()                            # [B,Hr,Wr]
+    #     u   = proj_pix[..., 1].float()
+    #     v   = proj_pix[..., 2].float()
+
+    #     # 有效位置：cam>=0 且 u/v>=0
+    #     valid = (cam >= 0) & (u >= 0) & (v >= 0)                # [B,Hr,Wr]
+
+    #     # 安全索引（无效位置先用 0 占位，后续再用 valid 清零）
+    #     cam_safe = torch.where(valid, cam, torch.zeros_like(cam))
+    #     u_safe   = torch.where(valid, u,   torch.zeros_like(u))
+    #     v_safe   = torch.where(valid, v,   torch.zeros_like(v))
+
+    #     # 映射到特征分辨率并裁剪
+    #     uf = (u_safe * s_u).long().clamp(0, Wf-1)               # [B,Hr,Wr]
+    #     vf = (v_safe * s_v).long().clamp(0, Hf-1)
+
+    #     # 线性化 index
+    #     pix_idx = (vf * Wf + uf).view(B, -1)                    # [B, Hr*Wr]
+    #     # batch 维
+    #     batch_idx = torch.arange(B, device=device).unsqueeze(1).repeat(1, H_r*W_r).view(-1)  # [B*Hr*Wr]
+    #     # 视角合并：view_idx = batch*V + cam
+    #     view_idx = (batch_idx * V + cam_safe.view(B, -1)).view(-1)                           # [B*Hr*Wr]
+    #     pix_idx  = pix_idx.view(-1)
+
+    #     # gather
+    #     selected = feats_flat[view_idx, :, pix_idx]             # [B*Hr*Wr, C]
+    #     selected = selected * valid.view(-1, 1).float()         # 无效像素清零
+
+    #     # reshape 回 [B,C,Hr,Wr]
+    #     range_feat = selected.view(B, H_r*W_r, C).permute(0, 2, 1).contiguous().view(B, C, H_r, W_r)
+    #     return range_feat
 
     
     # def project_views_to_range(

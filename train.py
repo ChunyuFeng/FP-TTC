@@ -14,6 +14,7 @@ from utils.trainer import TTCTrainer
 from utils.dist import is_main_process
 from utils.checkpoint import load_scale_only_weights
 import neptune
+from utils.optim_finetune import build_optimizer_finetune
 
 time_stamp = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
 out_dir = "./log/%s_surround_ttc"%(time_stamp)
@@ -294,6 +295,8 @@ def main():
     if args.scale_pretrained_ckpt:
         load_scale_only_weights(model, args.scale_pretrained_ckpt, map_location="cpu", verbose=True)
 
+    optimizer, max_lrs = build_optimizer_finetune(model, args)
+
     if parallel:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
                         output_device=local_rank, find_unused_parameters=True)
@@ -360,10 +363,10 @@ def main():
             else:
                 p.requires_grad = True
 
-        optimizer = build_optimizer(model, args)
+        # optimizer = build_optimizer(model, args)
 
-        if is_main_process():
-            print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr'])      
+        # if is_main_process():
+        #     print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr'])      
 
         args.batch_size = args.scale_batch_size  # scale-only stage batch size
 
@@ -373,6 +376,7 @@ def main():
         trainer = TTCTrainer(model       = model,
                              dataset     = dataset,
                              optimizer   = optimizer,
+                             max_lr      = max_lrs,
                              args        = args,
                              start_epoch = start_epoch,
                              device      = device,
