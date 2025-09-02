@@ -1007,6 +1007,260 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
     return proj_range, proj_pix
 
 
+
+CAMERA_CHANNELS = [
+    'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+    'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT'
+]
+
+def _precompute_pix_orig(H_img: int, W_img: int, affine_matrix: np.ndarray) -> np.ndarray:
+    """
+    计算处理后像素坐标经 A^{-1} 映射回“原图”像素坐标（齐次），并做归一化。
+    返回 shape = (3, N)，N = H_img * W_img
+    """
+    us = np.arange(W_img); vs = np.arange(H_img)
+    u_grid, v_grid = np.meshgrid(us, vs)                    # (H, W)
+    ones = np.ones_like(u_grid, dtype=np.float32)
+    pix_proc = np.stack([u_grid, v_grid, ones], axis=-1).reshape(-1, 3).T  # (3, N)
+    invA = np.linalg.inv(affine_matrix).astype(np.float32)
+    pix_orig = invA @ pix_proc                               # (3, N)
+    pix_orig /= pix_orig[2:3, :]                             # 归一化
+    return pix_orig.astype(np.float32)
+
+def _geometry_cam2lidar_from_depth(
+    depth_map: np.ndarray,
+    K_inv: np.ndarray,
+    R_c2l: np.ndarray,
+    t_c2l: np.ndarray,
+    pix_orig: np.ndarray,          # (3, N') 对应下采样后的像素
+    *,
+    flip_xy: bool = False,
+    ds: np.ndarray = None,         # (N',) 与 pix_orig 列数严格一致
+    pick_lin: np.ndarray = None    # 若 ds=None，可用 pick_lin 从 depth_map 内部索引
+) -> np.ndarray:
+    """
+    返回 (N', 3) LiDAR 坐标。确保 pix_orig 与 ds 对齐！
+    """
+    if ds is None:
+        flat = depth_map.reshape(-1).astype(np.float32)
+        ds = flat[pick_lin] if pick_lin is not None else flat
+    else:
+        ds = ds.astype(np.float32)
+
+    Xc = (K_inv @ pix_orig).astype(np.float32)               # (3, N')
+    Xc *= ds[np.newaxis, :]                                  # (3, N')
+    Xl = (R_c2l @ Xc) + t_c2l.reshape(3, 1).astype(np.float32)
+    pts = Xl.T                                               # (N', 3)
+
+    if flip_xy:
+        pts[:, 0] *= -1.0
+        pts[:, 1] *= -1.0
+    return pts
+
+def _range_projection_with_mapping_np_fast(
+    points: np.ndarray,
+    pix_coords: np.ndarray,
+    H: int = 160, W: int = 1920,
+    fov_up: float = 8.0, fov_down: float = -15.0
+):
+    """
+    矢量化 z-buffer：对每个 (py,px) 仅保留最近点（最小 depth）。
+    返回：
+      proj_range: (H,W) float32
+      proj_xyz:   (H,W,3) float32
+      proj_idx:   (H,W)   int32
+      proj_mask:  (H,W)   int32
+      proj_pix:   (H,W,3) int32
+    """
+    assert points.ndim == 2 and points.shape[1] == 3
+    assert pix_coords.ndim == 2 and pix_coords.shape[1] == 3
+
+    depth = np.linalg.norm(points, axis=1).astype(np.float32)  # (M,)
+    safe = np.maximum(depth, 1e-9)
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    yaw   = -np.arctan2(y, x)
+    pitch = np.arcsin(np.clip(z / safe, -1.0, 1.0))
+
+    fov_up_rad   = np.deg2rad(fov_up)
+    fov_down_rad = np.deg2rad(fov_down)
+    fov = abs(fov_down_rad) + abs(fov_up_rad)
+
+    proj_x = np.floor(0.5 * (yaw / np.pi + 1.0) * W).astype(np.int32)
+    proj_y = np.floor((1.0 - (pitch + abs(fov_down_rad)) / fov) * H).astype(np.int32)
+    np.clip(proj_x, 0, W - 1, out=proj_x)
+    np.clip(proj_y, 0, H - 1, out=proj_y)
+
+    lin = (proj_y.astype(np.int64) * W + proj_x.astype(np.int64))  # (M,)
+
+    # 按 (lin, depth) 升序排序，每组第一个即最近点
+    order = np.lexsort((depth, lin))
+    lin_s = lin[order]
+
+    first = np.empty_like(lin_s, dtype=bool)
+    if first.size:
+        first[0] = True
+        first[1:] = lin_s[1:] != lin_s[:-1]
+
+    sel = order[first]                            # 源点索引
+    lin_unique = lin[sel]
+    y_unique = (lin_unique // W).astype(np.int32)
+    x_unique = (lin_unique %  W).astype(np.int32)
+
+    proj_range = np.full((H, W), -1, np.float32)
+    proj_xyz   = np.full((H, W, 3), -1, np.float32)
+    proj_idx   = np.full((H, W), -1, np.int32)
+    proj_mask  = np.zeros((H, W), np.int32)
+    proj_pix   = np.full((H, W, 3), -1, np.int32)
+
+    proj_range[y_unique, x_unique] = depth[sel]
+    proj_xyz[y_unique, x_unique]   = points[sel].astype(np.float32)
+    proj_idx[y_unique, x_unique]   = sel.astype(np.int32)
+    proj_mask[y_unique, x_unique]  = 1
+    proj_pix[y_unique, x_unique]   = pix_coords[sel].astype(np.int32)
+
+    return proj_range, proj_xyz, proj_idx, proj_mask, proj_pix
+
+def build_frame_mapping_fast(
+    data,
+    dataset_key: str,
+    frame_key: str,
+    depth_map_dict: dict,
+    affine_matrix: np.ndarray,
+    idx: int,
+    H_r: int = 40, W_r: int = 480,
+    visualize: bool = False,
+    pixel_stride: int = 1
+):
+    """
+    读取该帧 6 个相机的深度与标定，反投影到 LiDAR，再做 range 投影，返回：
+      proj_range: (H_r, W_r) float32
+      proj_pix:   (H_r, W_r, 3) int32   # (cam_idx, u, v)
+    - dataset_key ∈ {'sjtu', 'nusc'}
+    - depth_map_dict[channel] -> (H_img, W_img) ndarray
+    - pixel_stride >= 1（>1 会对像素网格均匀下采样）
+    """
+    assert dataset_key in ('sjtu', 'nusc')
+    camera_channels = CAMERA_CHANNELS
+
+    # 1) 帧级像素网格逆仿射（一次计算，所有相机复用）
+    any_ch = camera_channels[0]
+    H_img, W_img = depth_map_dict[any_ch].shape
+    pix_orig_full = _precompute_pix_orig(H_img, W_img, affine_matrix)          # (3, N)
+
+    if pixel_stride > 1:
+        us = np.arange(0, W_img, pixel_stride)
+        vs = np.arange(0, H_img, pixel_stride)
+        u_grid_s, v_grid_s = np.meshgrid(us, vs)
+        pick_lin = (v_grid_s * W_img + u_grid_s).reshape(-1)                   # (N')
+        pix_orig = pix_orig_full[:, pick_lin]                                   # (3, N')
+        # 下采样后的 (u,v) 基网格（后续各相机按有效掩膜过滤）
+        uu_sub = u_grid_s.reshape(-1)
+        vv_sub = v_grid_s.reshape(-1)
+    else:
+        pick_lin = None
+        pix_orig = pix_orig_full                                               # (3, N)
+        # 全量 (u,v)
+        uu_full, vv_full = np.meshgrid(np.arange(W_img), np.arange(H_img))
+        uu_full = uu_full.reshape(-1)
+        vv_full = vv_full.reshape(-1)
+
+    # 2) 相机级缓存（K_inv/R_c2l/t_c2l/flip_xy）
+    cam_cache = {}
+    if dataset_key == 'sjtu':
+        for ch in camera_channels:
+            K     = np.asarray(data[idx][f'sensor_metas_{frame_key}'][ch]['K_undist'], dtype=np.float32)
+            R_l2c = np.asarray(data[idx][f'sensor_metas_{frame_key}'][ch]['R_l2c'], dtype=np.float32)
+            t_l2c = np.asarray(data[idx][f'sensor_metas_{frame_key}'][ch]['t_l2c'], dtype=np.float32).reshape(3, 1)
+
+            K_inv = np.linalg.inv(K).astype(np.float32)
+            R_c2l = R_l2c.T.astype(np.float32)
+            t_c2l = (-R_c2l @ t_l2c).astype(np.float32)
+            cam_cache[ch] = (K_inv, R_c2l, t_c2l, True)  # SJTU: flip_xy=True
+
+    else:  # 'nusc'
+        # 采用你工程里的 build_lidar_to_camera_projection 来得到 K, R_l2c, t_l2c
+        # 注意：该函数应已在你的项目里定义；若命名不同，请改这里的调用。
+        from dataloader.dataset import build_lidar_to_camera_projection  # 若路径不同，请调整导入
+
+        sensor_metas = data[idx][f'sensor_metas_{frame_key}']
+        for ch in camera_channels:
+            proj_matrix, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
+                sensor_metas,
+                sensor_metas['camera']['calibrated_sensor'][ch],
+                sensor_metas['camera']['ego_pose'][ch]
+            )
+            K     = np.asarray(K, dtype=np.float32)
+            R_l2c = np.asarray(R_l2c, dtype=np.float32)
+            t_l2c = np.asarray(t_l2c, dtype=np.float32).reshape(3, 1)
+
+            K_inv = np.linalg.inv(K).astype(np.float32)
+            R_c2l = R_l2c.T.astype(np.float32)
+            t_c2l = (-R_c2l @ t_l2c).astype(np.float32)
+            cam_cache[ch] = (K_inv, R_c2l, t_c2l, False)  # NuScenes: flip_xy=False
+
+    # 3) 各相机反投影 + 像素坐标收集
+    all_points = []
+    all_pix    = []
+
+    for cam_idx, ch in enumerate(camera_channels):
+        depth_map = np.asarray(depth_map_dict[ch], dtype=np.float32)
+
+        # 与 pix_orig 对齐的深度向量 ds
+        if pixel_stride > 1:
+            ds = depth_map.reshape(-1)[pick_lin]            # (N',)
+            uu_base, vv_base = uu_sub, vv_sub              # 下采样 (u,v) 基
+        else:
+            ds = depth_map.reshape(-1)                      # (N,)
+            uu_base, vv_base = uu_full, vv_full            # 全量 (u,v)
+
+        valid = ds > 0
+        if not np.any(valid):
+            continue
+
+        # 对应地裁切 pix_orig 与 ds
+        pix_orig_use = pix_orig[:, valid]                  # (3, N_valid)
+        ds_use = ds[valid]                                 # (N_valid,)
+
+        K_inv, R_c2l, t_c2l, flip_xy = cam_cache[ch]
+        pts = _geometry_cam2lidar_from_depth(
+            depth_map, K_inv, R_c2l, t_c2l, pix_orig_use,
+            flip_xy=flip_xy, ds=ds_use
+        ).astype(np.float32)                               # (N_valid, 3)
+
+        uu = uu_base[valid].astype(np.int32)
+        vv = vv_base[valid].astype(np.int32)
+        cam_col = np.full_like(uu, cam_idx, dtype=np.int32)
+        pix = np.stack([cam_col, uu, vv], axis=1).astype(np.int32)  # (N_valid, 3)
+
+        all_points.append(pts)
+        all_pix.append(pix)
+
+    # 若所有相机都无有效点，返回空图
+    if not all_points:
+        proj_range = np.full((H_r, W_r), -1, np.float32)
+        proj_pix   = np.full((H_r, W_r, 3), -1, np.int32)
+        return proj_range, proj_pix
+
+    points = np.concatenate(all_points, axis=0)
+    pix    = np.concatenate(all_pix,    axis=0)
+
+    # 4) 矢量化 range 投影 + 最近点选择
+    proj_range, proj_xyz, proj_idx, proj_mask, proj_pix = _range_projection_with_mapping_np_fast(
+        points, pix, H=H_r, W=W_r, fov_up=8.0, fov_down=-15.0
+    )
+
+    # 5) 小图补洞（40×480 开销很低）
+    valid_im = proj_mask.astype(bool)
+    if not valid_im.all():
+        _, inds = distance_transform_edt(~valid_im, return_distances=True, return_indices=True)
+        i_near, j_near = inds
+        proj_pix   = proj_pix[i_near, j_near]
+        proj_range = proj_range[i_near, j_near]
+        proj_mask[:] = 1
+
+    # 可选可视化（略）
+    return proj_range, proj_pix
+
 def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
     """ Create the data loader for the corresponding trainign set """
     train_dataset = None

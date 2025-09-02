@@ -16,7 +16,7 @@ from utils.draw import (
     orientation2rgb
 )
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
-from dataloader.dataset import build_frame_mapping
+from dataloader.dataset import build_frame_mapping, build_frame_mapping_fast
 import pickle
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -26,6 +26,7 @@ from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
 import time
 from concurrent.futures import ThreadPoolExecutor
 import albumentations as A
+from typing import Dict, List, Tuple
 parser = argparse.ArgumentParser()
 
 # Dataset & evaluation parameters
@@ -140,6 +141,9 @@ def main():
             processed_state_dict[new_key] = value
         # Load into model
         model.load_state_dict(processed_state_dict)
+        # missing, unexpected = model.load_state_dict(processed_state_dict, strict=False)
+        # print("missing:", missing)        # 会看到 init_scale / init_risk / corr_enc_shared 相关
+        # print("unexpected:", unexpected)  # 会看到旧的 conv_corr / conv_corr_risk 相关
 
     model.eval()
 
@@ -165,12 +169,12 @@ def main():
     'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]}
     }
 
-    encoder = 'vitl' # or 'vits', 'vitb'
+    encoder = 'vits' # or 'vits', 'vitb'
     dataset = 'vkitti' # 'hypersim' for indoor model, 'vkitti' for outdoor model
     max_depth = 80 # 20 for indoor model, 80 for outdoor model
 
     depth_model = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': max_depth})
-    depth_model.load_state_dict(torch.load(f'pretrained/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
+    depth_model.load_state_dict(torch.load(f'pretrained/new/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
     depth_model.to('cuda').eval()
     
     if args.sjtu_test:
@@ -185,23 +189,74 @@ def main():
             newK, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0)
             map1, map2 = cv2.initUndistortRectifyMap(K, dist, None, newK, (w, h), cv2.CV_32FC1)
             undistort_maps[ch] = (map1, map2, newK)
-        
-        def load_remap(ch, frame_type):
-                # frame_type = 'prev' 或 'curr'
-                path = test_entries[idx][f'{frame_type}_camera_data'][ch]['filename']
-                img = cv2.imread(path, cv2.IMREAD_COLOR)
-                map1, map2, K_ud = undistort_maps[ch]
-                img_ud = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
-                # 更新内参
-                test_entries[idx][f'sensor_metas_{frame_type}'][ch]['K_undist'] = K_ud
-                # 计算 R_l2c, t_l2c
-                R = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['R']
-                t = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['t']
-                R_inv, t_inv = R.T, -R.T @ t
-                test_entries[idx][f'sensor_metas_{frame_type}'][ch].update({
-                    'R_l2c': R_inv, 't_l2c': t_inv
-                })
-                return ch, img_ud
+
+        def load_and_undistort(ch: str, frame_type: str, idx: int,
+                       test_entries: list, undistort_maps: dict) -> Tuple[str, np.ndarray]:
+            """
+            读取磁盘 -> 去畸变 -> 回写 K_undist / R_l2c / t_l2c 到 test_entries，并返回图像。
+            返回: (channel, img_ud[BGR, HxW x3])
+            """
+            path = test_entries[idx][f'{frame_type}_camera_data'][ch]['filename']
+            img  = cv2.imread(path, cv2.IMREAD_COLOR)  # BGR
+            map1, map2, K_ud = undistort_maps[ch]
+            img_ud = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
+
+            # 同步元数据（K_undist, R_l2c, t_l2c）
+            meta = test_entries[idx][f'sensor_metas_{frame_type}'][ch]
+            meta['K_undist'] = K_ud
+            R = meta['R']; t = meta['t']
+            R_inv = R.T
+            t_inv = -R_inv @ t
+            meta['R_l2c'] = R_inv
+            meta['t_l2c'] = t_inv
+
+            return ch, img_ud
+
+
+        def make_sjtu_albu_transform(params: dict, crop_size: Tuple[int, int]):
+            """
+            根据 augmentor.sample_params_sjtu 的输出，构造一次性的 Albumentations 变换。
+            """
+            resize_w, resize_h = params['resize']    # (W, H)
+            crop_x, crop_y     = params['crop']      # 左上角 (x, y)
+            crop_h, crop_w     = crop_size           # augmentor.crop_size = (H, W)
+
+            tfms = [
+                A.Resize(height=resize_h, width=resize_w, interpolation=cv2.INTER_LINEAR),
+                A.Crop(x_min=crop_x, y_min=crop_y, x_max=crop_x + crop_w, y_max=crop_y + crop_h),
+            ]
+            if params.get('flip_h'): tfms.append(A.HorizontalFlip(p=1.0))
+            if params.get('flip_v'): tfms.append(A.VerticalFlip(p=1.0))
+            if params.get('rotate'):
+                tfms.append(A.Rotate(limit=(params['angle'], params['angle']),
+                                    p=1.0, border_mode=cv2.BORDER_CONSTANT))
+            return A.Compose(tfms, p=1.0)
+
+
+        def stack_imgs_to_tensor(imgs: Dict[str, np.ndarray],
+                                camera_channels: List[str],
+                                device: torch.device) -> torch.Tensor:
+            """
+            dict[cam] -> (H,W,3 BGR uint8)  ==>  Tensor[1, V, 3, H, W] float32
+            """
+            tensors = [torch.from_numpy(imgs[ch]).permute(2, 0, 1).float() for ch in camera_channels]
+            return torch.stack(tensors, dim=0).unsqueeze(0).to(device)
+        # def load_remap(ch, frame_type):
+        #         # frame_type = 'prev' 或 'curr'
+        #         path = test_entries[idx][f'{frame_type}_camera_data'][ch]['filename']
+        #         img = cv2.imread(path, cv2.IMREAD_COLOR)
+        #         map1, map2, K_ud = undistort_maps[ch]
+        #         img_ud = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
+        #         # 更新内参
+        #         test_entries[idx][f'sensor_metas_{frame_type}'][ch]['K_undist'] = K_ud
+        #         # 计算 R_l2c, t_l2c
+        #         R = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['R']
+        #         t = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['t']
+        #         R_inv, t_inv = R.T, -R.T @ t
+        #         test_entries[idx][f'sensor_metas_{frame_type}'][ch].update({
+        #             'R_l2c': R_inv, 't_l2c': t_inv
+        #         })
+        #         return ch, img_ud
             
         # for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
         #      # if idx <= 180:
@@ -249,76 +304,45 @@ def main():
         #     augmented_prev, _ = augmentor(prev_images_undistorted.copy(), affine_params)
         #     augmented_curr, _ = augmentor(curr_images_undistorted.copy(), affine_params)
         #     affine_matrix = augmentor.get_affine_matrix(affine_params)
+
+        pool = ThreadPoolExecutor(max_workers=len(camera_channels) * 2)
+
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view'):
 
-            # if idx < 4400 or idx > 4600:
-            #     continue
-            # start = time.perf_counter()
-            # 1) 并行加载 + 去畸变
+            if idx < 4400 or idx > 4600:
+                continue
 
-            # 用线程池并行处理所有通道的 prev/curr
-            prev_raw, curr_raw = {}, {}
-            with ThreadPoolExecutor(max_workers=len(camera_channels)*2) as exe:
-                # prev futures
-                prev_futs = [exe.submit(load_remap, ch, 'prev') for ch in camera_channels]
-                curr_futs = [exe.submit(load_remap, ch, 'curr') for ch in camera_channels]
-                for fut in prev_futs:
-                    ch, img_ud = fut.result(); prev_raw[ch] = img_ud
-                for fut in curr_futs:
-                    ch, img_ud = fut.result(); curr_raw[ch] = img_ud
+            start = time.perf_counter()
 
-            # 2) 批量仿射增强 —— 用 Albumentations 一次性处理所有视角
+            # -------- 1) 并行读取 + 去畸变（复用线程池） --------
+            t0 = time.perf_counter()
+            prev_futs = [pool.submit(load_and_undistort, ch, 'prev', idx, test_entries, undistort_maps)
+                        for ch in camera_channels]
+            curr_futs = [pool.submit(load_and_undistort, ch, 'curr', idx, test_entries, undistort_maps)
+                        for ch in camera_channels]
+
+            prev_raw = {ch: img for ch, img in (f.result() for f in prev_futs)}
+            curr_raw = {ch: img for ch, img in (f.result() for f in curr_futs)}
+            t1 = time.perf_counter()
+
+            # -------- 2) 采样同一套仿射参数，构造一次性变换，然后逐视角应用 --------
             orig_h, orig_w = next(iter(prev_raw.values())).shape[:2]
-            params = augmentor.sample_params_sjtu((orig_w, orig_h))
-            resize_w, resize_h = params['resize']      # (width, height)
-            crop_x, crop_y = params['crop']            # (x offset, y offset)
-            crop_h, crop_w = augmentor.crop_size       # from your class
+            params   = augmentor.sample_params_sjtu((orig_w, orig_h))   # 注意顺序：(W, H)
+            alb_tf   = make_sjtu_albu_transform(params, crop_size=augmentor.crop_size)
+            augmented_prev = {ch: alb_tf(image=prev_raw[ch])['image'] for ch in camera_channels}
+            augmented_curr = {ch: alb_tf(image=curr_raw[ch])['image'] for ch in camera_channels}
+            affine_matrix  = augmentor.get_affine_matrix(params)
+            t2 = time.perf_counter()
 
-            # 2) 构造 Transform 列表
-            tfms = [
-                # 2.1 Resize 到 (resize_h, resize_w)
-                A.Resize(height=resize_h, width=resize_w, 
-                        interpolation=cv2.INTER_LINEAR),
-                # 2.2 Crop 出 (crop_h, crop_w) 大小的窗口
-                A.Crop(x_min=crop_x, y_min=crop_y,
-                    x_max=crop_x+crop_w, y_max=crop_y+crop_h),
-            ]
-            # 2.3 水平 / 垂直 翻转
-            if params['flip_h']:
-                tfms.append(A.HorizontalFlip(p=1.0))
-            if params['flip_v']:
-                tfms.append(A.VerticalFlip(p=1.0))
-            # 2.4 旋转
-            if params['rotate']:
-                # 固定 angle；border_mode 可根据你想要的背景填充方式调整
-                tfms.append(A.Rotate(limit=(params['angle'], params['angle']),
-                                    p=1.0,
-                                    border_mode=cv2.BORDER_CONSTANT))
+            # -------- 3) 打包为 batch tensor --------
+            prev_batch = stack_imgs_to_tensor(augmented_prev, camera_channels, device)
+            curr_batch = stack_imgs_to_tensor(augmented_curr, camera_channels, device)
+            t3 = time.perf_counter()
 
-            # 3) 最终 Compose
-            alb_tf = A.Compose(tfms, p=1.0)
-
-            # 4) 对每张图像分别应用（用 dict comprehension 也行）
-            augmented_prev = {
-                ch: alb_tf(image=prev_raw[ch])['image']
-                for ch in camera_channels
-            }
-            augmented_curr = {
-                ch: alb_tf(image=curr_raw[ch])['image']
-                for ch in camera_channels
-            }
-            affine_matrix = augmentor.get_affine_matrix(params)
-
-            # end1 = time.perf_counter()
-            # print(f"Image loading and augmentation took {(end1 - start)*1000:.2f} ms")
-
-            # Convert to tensors and stack
-            prev_tensors = [torch.from_numpy(augmented_prev[ch]).permute(2,0,1).float() for ch in camera_channels]
-            curr_tensors = [torch.from_numpy(augmented_curr[ch]).permute(2,0,1).float() for ch in camera_channels]
-
-            prev_batch = torch.stack(prev_tensors, dim=0).unsqueeze(0).to(device)
-            curr_batch = torch.stack(curr_tensors, dim=0).unsqueeze(0).to(device)
-
+            print(f"Image loading and augmentation took {(t3 - t0)*1000:.2f} ms "
+                f"[io={ (t1-t0)*1000:.2f} | aug={ (t2-t1)*1000:.2f} | to_tensor={ (t3-t2)*1000:.2f}]")
+            
+            end1 = time.perf_counter()
             # 2) Load Depth Pred Map (DepthAnythingV2)
             prev_depth_pred_map = {}
             curr_depth_pred_map = {}
@@ -342,21 +366,44 @@ def main():
             # end_event   = torch.cuda.Event(enable_timing=True)
             # start_event.record()
 
-            for channel in camera_channels:
-                raw_image_prev = cv2.cvtColor(augmented_prev[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
-                prev_depth_pred_map[channel] = depth_model.infer_image(raw_image_prev, input_size=320)
+            # for channel in camera_channels:
+            #     raw_image_prev = cv2.cvtColor(augmented_prev[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
+            #     prev_depth_pred_map[channel] = depth_model.infer_image(raw_image_prev, input_size=320)
 
-                raw_image_curr = cv2.cvtColor(augmented_curr[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
-                curr_depth_pred_map[channel] = depth_model.infer_image(raw_image_curr, input_size=320)
+            #     raw_image_curr = cv2.cvtColor(augmented_curr[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
+            #     curr_depth_pred_map[channel] = depth_model.infer_image(raw_image_curr, input_size=320)
 
-                prev_depth_pred_map_tensor[channel] = torch.from_numpy(prev_depth_pred_map[channel])
-                curr_depth_pred_map_tensor[channel] = torch.from_numpy(curr_depth_pred_map[channel])
+            #     prev_depth_pred_map_tensor[channel] = torch.from_numpy(prev_depth_pred_map[channel])
+            #     curr_depth_pred_map_tensor[channel] = torch.from_numpy(curr_depth_pred_map[channel])
 
-            prev_depths_pred_tensor_stacked = torch.stack([prev_depth_pred_map_tensor[channel] for channel in camera_channels], dim=0).unsqueeze(1)
-            curr_depths_pred_tensor_stacked = torch.stack([curr_depth_pred_map_tensor[channel] for channel in camera_channels], dim=0).unsqueeze(1)
+            # prev_depths_pred_tensor_stacked = torch.stack([prev_depth_pred_map_tensor[channel] for channel in camera_channels], dim=0).unsqueeze(1)
+            # curr_depths_pred_tensor_stacked = torch.stack([curr_depth_pred_map_tensor[channel] for channel in camera_channels], dim=0).unsqueeze(1)
 
-            prev_depths_pred_batch = prev_depths_pred_tensor_stacked.unsqueeze(0).to(device)
-            curr_depths_pred_batch = curr_depths_pred_tensor_stacked.unsqueeze(0).to(device)
+            # prev_depths_pred_batch = prev_depths_pred_tensor_stacked.unsqueeze(0).to(device)
+            # curr_depths_pred_batch = curr_depths_pred_tensor_stacked.unsqueeze(0).to(device)
+
+            # augmented_prev / augmented_curr 是 RGB，需要转回 BGR 给 DepthAnything
+            prev_bgr_list = [cv2.cvtColor(augmented_prev[ch], cv2.COLOR_RGB2BGR) for ch in camera_channels]
+            curr_bgr_list = [cv2.cvtColor(augmented_curr[ch], cv2.COLOR_RGB2BGR) for ch in camera_channels]
+
+            # 批量推理（返回按相机顺序的 list[np.ndarray(H,W)]）
+            prev_depth_list = depth_model.infer_images(prev_bgr_list, input_size=224)  # 或 256 更快
+            curr_depth_list = depth_model.infer_images(curr_bgr_list, input_size=224)
+
+            # 组装成你后续流程需要的字典与 batch
+            prev_depth_pred_map = {ch: d for ch, d in zip(camera_channels, prev_depth_list)}
+            curr_depth_pred_map = {ch: d for ch, d in zip(camera_channels, curr_depth_list)}
+
+            prev_depths_pred_batch = torch.stack(
+                [torch.from_numpy(prev_depth_pred_map[ch]) for ch in camera_channels], dim=0
+            ).unsqueeze(0).unsqueeze(2).to(device)  # [1,V,1,H,W]
+
+            curr_depths_pred_batch = torch.stack(
+                [torch.from_numpy(curr_depth_pred_map[ch]) for ch in camera_channels], dim=0
+            ).unsqueeze(0).unsqueeze(2).to(device)
+
+            end2 = time.perf_counter()
+            print(f"Depthanything took {(end2 - end1)*1000:.2f} ms")
 
             # end_event.record()
             # torch.cuda.synchronize()
@@ -364,16 +411,30 @@ def main():
             # print(f"test：{elapsed_ms:.3f} ms")
 
             # 3) load 环视图像 uv 坐标与 range view uv 坐标之间的对应关系 (DepthAnythingV2)
-            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'sjtu', 'prev', prev_depth_pred_map,
-                                                                 affine_matrix, idx, H_r=40, W_r=480, visualize=False)
-            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'sjtu', 'curr', curr_depth_pred_map,
-                                                                 affine_matrix, idx, H_r=40, W_r=480, visualize=False)
+            # proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'sjtu', 'prev', prev_depth_pred_map,
+            #                                                      affine_matrix, idx, H_r=40, W_r=480, visualize=False)
+            # proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'sjtu', 'curr', curr_depth_pred_map,
+            #                                                      affine_matrix, idx, H_r=40, W_r=480, visualize=False)
+            proj_range_prev, proj_pix_prev = build_frame_mapping_fast(
+                test_entries, 'sjtu', 'prev', prev_depth_pred_map,
+                affine_matrix, idx, H_r=40, W_r=480, visualize=False,
+                pixel_stride=2
+            )
+            proj_range_curr, proj_pix_curr = build_frame_mapping_fast(
+                test_entries, 'sjtu', 'curr', curr_depth_pred_map,
+                affine_matrix, idx, H_r=40, W_r=480, visualize=False,
+                pixel_stride=2
+            )
+
             # 转换为 tensor
             proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
             proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
             # 打包 batch
             proj_pix_prev_batch = proj_pix_prev_tensor.unsqueeze(0).to(device)
             proj_pix_curr_batch = proj_pix_curr_tensor.unsqueeze(0).to(device)
+
+            end3 = time.perf_counter()
+            print(f"Building frame mapping took {(end3 - end2)*1000:.2f} ms")
 
             # Inference
             with torch.no_grad():
@@ -391,11 +452,10 @@ def main():
                         num_reg_refine   = args.num_reg_refine,
                         scale_only       = False,
                     )
-            # end2 = time.perf_counter()
-            # print(f"Inference took {(end2 - end1)*1000:.2f} ms")
-
-            # print(f"The whole process took {(end2 - start)*1000:.2f} ms")
-
+                
+            end4 = time.perf_counter()
+            print(f"Inference took {(end4 - end3)*1000:.2f} ms")
+            print(f"Total time for idx {idx} : {(end4 - start)*1000:.2f} ms")
             # Visualization
             # visualize RGB images
             concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
@@ -412,15 +472,15 @@ def main():
             # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
 
             # new vis method
-            # scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
-            # vis = scale2rgb(scale_vis)
-            # vis = vis*255.0
-            # cv2.imwrite(os.path.join(output_dir, f"new_pred_scale_{idx}.png"), vis)
+            scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
+            vis = scale2rgb(scale_vis)
+            vis = vis*255.0
+            cv2.imwrite(os.path.join(output_dir, f"new_pred_scale_{idx}.png"), vis)
 
-            # orien = np.clip(risk_prediction_array, 0.0, np.pi)
-            # orien_vis = orientation2rgb(orien)
-            # orien_vis = orien_vis * 255.0
-            # cv2.imwrite(os.path.join(output_dir, f"new_pred_orien_{idx}.png"), orien_vis)
+            orien = np.clip(risk_prediction_array, 0.0, np.pi)
+            orien_vis = orientation2rgb(orien)
+            orien_vis = orien_vis * 255.0
+            cv2.imwrite(os.path.join(output_dir, f"new_pred_orien_{idx}.png"), orien_vis)
 
             # save prediction as .npy files for collision map generation
             if args.save_pred_npy:
@@ -438,7 +498,9 @@ def main():
             #         -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
             # plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
             #         -normalized_pred_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-            
+        
+        pool.shutdown(wait=True)
+
     else:
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
             # if test_entries[idx]['scene_indice'] != '7':
