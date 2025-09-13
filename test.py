@@ -1,33 +1,49 @@
-from PIL import Image
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["BLIS_NUM_THREADS"] = "1"
+
 import cv2
+cv2.setNumThreads(1)
+
 import numpy as np
+
 import torch
-import torch.nn.functional as F
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 import argparse
 import datetime
-from glob import glob
+import pickle
+import time
+import albumentations as A
+
+from PIL import Image
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Tuple
+
 from fpttc.fp_ttc import FpTTC
-from utils.trainer import TTCTrainer
-from utils.draw import (
-    visual_scale_map_range_image,
-    visual_risk_score_map_range_image,
-    scale2rgb,
-    orientation2rgb
-)
+from utils.draw import scale2rgb, orientation2rgb
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
 from dataloader.dataset import build_frame_mapping, build_frame_mapping_fast
-import pickle
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from tools.cyberrock.sjtu_test_info import undistort_image
-from PIL import ImageDraw
 from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
-import time
-from concurrent.futures import ThreadPoolExecutor
-import albumentations as A
-from typing import Dict, List, Tuple
+
 parser = argparse.ArgumentParser()
+
+torch.backends.cuda.matmul.allow_tf32 = True          # 让 TF32 生效
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True                 # 固定输入尺寸时很有效
+
+FAST_DEPTH_INPUT = 192          # 224→192 常见性价比更高
+FAST_PIXEL_STRIDE = 4           # 原来是 2，进一步减半 CPU 开销
+FAST_RANGE_H, FAST_RANGE_W = 32, 384   # 40x480 → 32x384
+
+# bfloat16 精度略低，速度更快；float16 精度稍高，但速度稍慢；时间约差 30~40 ms
+AMP_DTYPE = torch.bfloat16      
 
 # Dataset & evaluation parameters
 parser.add_argument('--checkpoint_dir', default='tmp', type=str)
@@ -121,7 +137,7 @@ def main():
                   num_head               = args.num_head,
                   ffn_dim_expansion      = args.ffn_dim_expansion,
                   num_transformer_layers = args.num_transformer_layers,
-                  reg_refine             = args.reg_refine).cuda()
+                  reg_refine             = args.reg_refine).to('cuda', memory_format=torch.channels_last).eval()
 
     # Optionally resume checkpoint
     if args.resume:
@@ -164,10 +180,10 @@ def main():
     
     # Load DepthAnythingV2 model for depth prediction
     model_configs = {
-    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]}
-    }
+        'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+        'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+        'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]}
+        }
 
     encoder = 'vits' # or 'vits', 'vitb'
     dataset = 'vkitti' # 'hypersim' for indoor model, 'vkitti' for outdoor model
@@ -175,52 +191,19 @@ def main():
 
     depth_model = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': max_depth})
     depth_model.load_state_dict(torch.load(f'pretrained/new/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
-    depth_model.to('cuda').eval()
+    depth_model.to('cuda', memory_format=torch.channels_last).eval()
     
     if args.sjtu_test:
 
-        undistort_maps = {}
-        for ch in camera_channels:
-            # 任意一帧的 K/dist 都是固定的：
-            K = test_entries[0]['sensor_metas_prev'][ch]['K']
-            dist = test_entries[0]['sensor_metas_prev'][ch]['dist']
-            w, h = (1920, 1080)  # e.g. (1600, 900)
-            # 1) 计算去畸变映射表
-            newK, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0)
-            map1, map2 = cv2.initUndistortRectifyMap(K, dist, None, newK, (w, h), cv2.CV_32FC1)
-            undistort_maps[ch] = (map1, map2, newK)
-
-        def load_and_undistort(ch: str, frame_type: str, idx: int,
-                       test_entries: list, undistort_maps: dict) -> Tuple[str, np.ndarray]:
-            """
-            读取磁盘 -> 去畸变 -> 回写 K_undist / R_l2c / t_l2c 到 test_entries，并返回图像。
-            返回: (channel, img_ud[BGR, HxW x3])
-            """
+        def load_rectified(ch: str, frame_type: str, idx: int, test_entries: list):
             path = test_entries[idx][f'{frame_type}_camera_data'][ch]['filename']
             img  = cv2.imread(path, cv2.IMREAD_COLOR)  # BGR
-            map1, map2, K_ud = undistort_maps[ch]
-            img_ud = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
-
-            # 同步元数据（K_undist, R_l2c, t_l2c）
-            meta = test_entries[idx][f'sensor_metas_{frame_type}'][ch]
-            meta['K_undist'] = K_ud
-            R = meta['R']; t = meta['t']
-            R_inv = R.T
-            t_inv = -R_inv @ t
-            meta['R_l2c'] = R_inv
-            meta['t_l2c'] = t_inv
-
-            return ch, img_ud
-
+            return ch, img
 
         def make_sjtu_albu_transform(params: dict, crop_size: Tuple[int, int]):
-            """
-            根据 augmentor.sample_params_sjtu 的输出，构造一次性的 Albumentations 变换。
-            """
             resize_w, resize_h = params['resize']    # (W, H)
-            crop_x, crop_y     = params['crop']      # 左上角 (x, y)
-            crop_h, crop_w     = crop_size           # augmentor.crop_size = (H, W)
-
+            crop_x, crop_y     = params['crop']
+            crop_h, crop_w     = crop_size
             tfms = [
                 A.Resize(height=resize_h, width=resize_w, interpolation=cv2.INTER_LINEAR),
                 A.Crop(x_min=crop_x, y_min=crop_y, x_max=crop_x + crop_w, y_max=crop_y + crop_h),
@@ -229,105 +212,35 @@ def main():
             if params.get('flip_v'): tfms.append(A.VerticalFlip(p=1.0))
             if params.get('rotate'):
                 tfms.append(A.Rotate(limit=(params['angle'], params['angle']),
-                                    p=1.0, border_mode=cv2.BORDER_CONSTANT))
+                                     p=1.0, border_mode=cv2.BORDER_CONSTANT))
             return A.Compose(tfms, p=1.0)
 
-
         def stack_imgs_to_tensor(imgs: Dict[str, np.ndarray],
-                                camera_channels: List[str],
-                                device: torch.device) -> torch.Tensor:
-            """
-            dict[cam] -> (H,W,3 BGR uint8)  ==>  Tensor[1, V, 3, H, W] float32
-            """
+                                 camera_channels: List[str],
+                                 device: torch.device) -> torch.Tensor:
+            # imgs[ch] = (H,W,3) BGR uint8
             tensors = [torch.from_numpy(imgs[ch]).permute(2, 0, 1).float() for ch in camera_channels]
             return torch.stack(tensors, dim=0).unsqueeze(0).to(device)
-        # def load_remap(ch, frame_type):
-        #         # frame_type = 'prev' 或 'curr'
-        #         path = test_entries[idx][f'{frame_type}_camera_data'][ch]['filename']
-        #         img = cv2.imread(path, cv2.IMREAD_COLOR)
-        #         map1, map2, K_ud = undistort_maps[ch]
-        #         img_ud = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
-        #         # 更新内参
-        #         test_entries[idx][f'sensor_metas_{frame_type}'][ch]['K_undist'] = K_ud
-        #         # 计算 R_l2c, t_l2c
-        #         R = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['R']
-        #         t = test_entries[idx][f'sensor_metas_{frame_type}'][ch]['t']
-        #         R_inv, t_inv = R.T, -R.T @ t
-        #         test_entries[idx][f'sensor_metas_{frame_type}'][ch].update({
-        #             'R_l2c': R_inv, 't_l2c': t_inv
-        #         })
-        #         return ch, img_ud
-            
-        # for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
-        #      # if idx <= 180:
-        #     #     continue
-        #     # 1) Load input images
-        #     prev_images_undistorted = {}
-        #     curr_images_undistorted = {}
-
-        #     for ch in camera_channels:
-        #         # 对 prev 帧的图像去畸变，并且获取去畸变后的内参 K_undist
-        #         prev_path = test_entries[idx]['prev_camera_data'][ch]['filename']
-        #         prev_images_undistorted[ch] = cv2.imread(prev_path, cv2.IMREAD_COLOR)
-        #         prev_images_undistorted[ch], K_prev, _ = undistort_image(prev_images_undistorted[ch], 
-        #                                                                  test_entries[idx]['sensor_metas_prev'][ch]['K'],
-        #                                                                  test_entries[idx]['sensor_metas_prev'][ch]['dist'])
-        #         prev_images_undistorted[ch] = Image.fromarray(cv2.cvtColor(prev_images_undistorted[ch], cv2.COLOR_BGR2RGB))
-        #         test_entries[idx]['sensor_metas_prev'][ch]['K_undist'] = K_prev
-        #         # 将 相机 -> LiDAR 的 RT 转换为 LiDAR -> 相机 的 RT
-        #         R = test_entries[idx]['sensor_metas_prev'][ch]['R']
-        #         t = test_entries[idx]['sensor_metas_prev'][ch]['t']
-        #         R_inv = R.T
-        #         t_inv = -R_inv @ t
-        #         test_entries[idx]['sensor_metas_prev'][ch]['R_l2c'] = R_inv
-        #         test_entries[idx]['sensor_metas_prev'][ch]['t_l2c'] = t_inv
-
-        #         # 对 curr 帧的图像去畸变，并且获取去畸变后的内参 K_undist
-        #         curr_path = test_entries[idx]['curr_camera_data'][ch]['filename']
-        #         curr_images_undistorted[ch] = cv2.imread(curr_path, cv2.IMREAD_COLOR)
-        #         curr_images_undistorted[ch], K_curr, _ = undistort_image(curr_images_undistorted[ch],
-        #                                                                  test_entries[idx]['sensor_metas_curr'][ch]['K'],
-        #                                                                  test_entries[idx]['sensor_metas_curr'][ch]['dist'])
-        #         curr_images_undistorted[ch] = Image.fromarray(cv2.cvtColor(curr_images_undistorted[ch], cv2.COLOR_BGR2RGB))
-        #         test_entries[idx]['sensor_metas_curr'][ch]['K_undist'] = K_curr
-        #         # 将 相机 -> LiDAR 的 RT 转换为 LiDAR -> 相机 的 RT
-        #         R = test_entries[idx]['sensor_metas_curr'][ch]['R']
-        #         t = test_entries[idx]['sensor_metas_curr'][ch]['t']
-        #         R_inv = R.T
-        #         t_inv = -R_inv @ t
-        #         test_entries[idx]['sensor_metas_curr'][ch]['R_l2c'] = R_inv
-        #         test_entries[idx]['sensor_metas_curr'][ch]['t_l2c'] = t_inv       
-
-        #     # augment images
-        #     orig_size = next(iter(prev_images_undistorted.values())).size  # (W, H)
-        #     affine_params = augmentor.sample_params(orig_size)
-        #     augmented_prev, _ = augmentor(prev_images_undistorted.copy(), affine_params)
-        #     augmented_curr, _ = augmentor(curr_images_undistorted.copy(), affine_params)
-        #     affine_matrix = augmentor.get_affine_matrix(affine_params)
 
         pool = ThreadPoolExecutor(max_workers=len(camera_channels) * 2)
 
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view'):
-
-            if idx < 4400 or idx > 4600:
-                continue
+            # if idx < 4400 or idx > 4600:
+            #     continue
 
             start = time.perf_counter()
 
-            # -------- 1) 并行读取 + 去畸变（复用线程池） --------
+            # -------- 1) 并行读取（去畸变图像） --------
             t0 = time.perf_counter()
-            prev_futs = [pool.submit(load_and_undistort, ch, 'prev', idx, test_entries, undistort_maps)
-                        for ch in camera_channels]
-            curr_futs = [pool.submit(load_and_undistort, ch, 'curr', idx, test_entries, undistort_maps)
-                        for ch in camera_channels]
-
+            prev_futs = [pool.submit(load_rectified, ch, 'prev', idx, test_entries) for ch in camera_channels]
+            curr_futs = [pool.submit(load_rectified, ch, 'curr', idx, test_entries) for ch in camera_channels]
             prev_raw = {ch: img for ch, img in (f.result() for f in prev_futs)}
             curr_raw = {ch: img for ch, img in (f.result() for f in curr_futs)}
             t1 = time.perf_counter()
 
-            # -------- 2) 采样同一套仿射参数，构造一次性变换，然后逐视角应用 --------
+            # -------- 2) 采样同一套仿射变换，然后逐视角应用 --------
             orig_h, orig_w = next(iter(prev_raw.values())).shape[:2]
-            params   = augmentor.sample_params_sjtu((orig_w, orig_h))   # 注意顺序：(W, H)
+            params   = augmentor.sample_params_sjtu((orig_w, orig_h))   # (W, H)
             alb_tf   = make_sjtu_albu_transform(params, crop_size=augmentor.crop_size)
             augmented_prev = {ch: alb_tf(image=prev_raw[ch])['image'] for ch in camera_channels}
             augmented_curr = {ch: alb_tf(image=curr_raw[ch])['image'] for ch in camera_channels}
@@ -337,121 +250,76 @@ def main():
             # -------- 3) 打包为 batch tensor --------
             prev_batch = stack_imgs_to_tensor(augmented_prev, camera_channels, device)
             curr_batch = stack_imgs_to_tensor(augmented_curr, camera_channels, device)
-            t3 = time.perf_counter()
-
-            print(f"Image loading and augmentation took {(t3 - t0)*1000:.2f} ms "
-                f"[io={ (t1-t0)*1000:.2f} | aug={ (t2-t1)*1000:.2f} | to_tensor={ (t3-t2)*1000:.2f}]")
             
+            t3 = time.perf_counter()
+            print(f"Image loading and augmentation took {(t3 - t0)*1000:.2f} ms "
+                  f"[io={ (t1-t0)*1000:.2f} | aug={ (t2-t1)*1000:.2f} | to_tensor={ (t3-t2)*1000:.2f}]")
+
+            # ---- DepthAnythingV2 ----
             end1 = time.perf_counter()
-            # 2) Load Depth Pred Map (DepthAnythingV2)
-            prev_depth_pred_map = {}
-            curr_depth_pred_map = {}
-            prev_depth_pred_map_tensor = {}
-            curr_depth_pred_map_tensor = {}
+            prev_bgr_list = [augmented_prev[ch] for ch in camera_channels]
+            curr_bgr_list = [augmented_curr[ch] for ch in camera_channels]
+            imgs_bgr_12 = prev_bgr_list + curr_bgr_list
 
-            ######################### 从预先生成的 Depth Map 中加载 #########################
-            # for channel in camera_channels:
-            #     depth_pred_prev_path = test_entries[idx]['prev_camera_data'][channel]['depth_pred']
-            #     depth_pred_curr_path = test_entries[idx]['curr_camera_data'][channel]['depth_pred']
+            torch.cuda.nvtx.range_push("DepthAnything")
+            with torch.inference_mode():
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    depth_list_12 = depth_model.infer_images(imgs_bgr_12, input_size=FAST_DEPTH_INPUT)
+            torch.cuda.nvtx.range_pop()
 
-            #     prev_depth_pred_map[channel] = np.load(depth_pred_prev_path)
-            #     curr_depth_pred_map[channel] = np.load(depth_pred_curr_path)
+            end2 = time.perf_counter()
+            print(f"DepthAnythingV2 inference took {(end2 - end1)*1000:.2f} ms")
 
-            #     prev_depth_pred_map[channel] = torch.from_numpy(prev_depth_pred_map[channel])
-            #     curr_depth_pred_map[channel] = torch.from_numpy(curr_depth_pred_map[channel])
-
-            ######################### 用 DepthAnythingV2 推理生成 Depth Map #########################
-            # 测算 DepthAnythingV2 的推理时间
-            # start_event = torch.cuda.Event(enable_timing=True)
-            # end_event   = torch.cuda.Event(enable_timing=True)
-            # start_event.record()
-
-            # for channel in camera_channels:
-            #     raw_image_prev = cv2.cvtColor(augmented_prev[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
-            #     prev_depth_pred_map[channel] = depth_model.infer_image(raw_image_prev, input_size=320)
-
-            #     raw_image_curr = cv2.cvtColor(augmented_curr[channel], cv2.COLOR_RGB2BGR)  # Convert to BGR for DepthAnythingV2
-            #     curr_depth_pred_map[channel] = depth_model.infer_image(raw_image_curr, input_size=320)
-
-            #     prev_depth_pred_map_tensor[channel] = torch.from_numpy(prev_depth_pred_map[channel])
-            #     curr_depth_pred_map_tensor[channel] = torch.from_numpy(curr_depth_pred_map[channel])
-
-            # prev_depths_pred_tensor_stacked = torch.stack([prev_depth_pred_map_tensor[channel] for channel in camera_channels], dim=0).unsqueeze(1)
-            # curr_depths_pred_tensor_stacked = torch.stack([curr_depth_pred_map_tensor[channel] for channel in camera_channels], dim=0).unsqueeze(1)
-
-            # prev_depths_pred_batch = prev_depths_pred_tensor_stacked.unsqueeze(0).to(device)
-            # curr_depths_pred_batch = curr_depths_pred_tensor_stacked.unsqueeze(0).to(device)
-
-            # augmented_prev / augmented_curr 是 RGB，需要转回 BGR 给 DepthAnything
-            prev_bgr_list = [cv2.cvtColor(augmented_prev[ch], cv2.COLOR_RGB2BGR) for ch in camera_channels]
-            curr_bgr_list = [cv2.cvtColor(augmented_curr[ch], cv2.COLOR_RGB2BGR) for ch in camera_channels]
-
-            # 批量推理（返回按相机顺序的 list[np.ndarray(H,W)]）
-            prev_depth_list = depth_model.infer_images(prev_bgr_list, input_size=224)  # 或 256 更快
-            curr_depth_list = depth_model.infer_images(curr_bgr_list, input_size=224)
-
-            # 组装成你后续流程需要的字典与 batch
+            prev_depth_list = depth_list_12[:len(camera_channels)]
+            curr_depth_list = depth_list_12[len(camera_channels):]
             prev_depth_pred_map = {ch: d for ch, d in zip(camera_channels, prev_depth_list)}
             curr_depth_pred_map = {ch: d for ch, d in zip(camera_channels, curr_depth_list)}
 
-            prev_depths_pred_batch = torch.stack(
-                [torch.from_numpy(prev_depth_pred_map[ch]) for ch in camera_channels], dim=0
-            ).unsqueeze(0).unsqueeze(2).to(device)  # [1,V,1,H,W]
+            def stack_depth_batch(depth_dict):
+                t = torch.stack([torch.from_numpy(depth_dict[ch]) for ch in camera_channels], dim=0)\
+                        .unsqueeze(0).unsqueeze(2)  # [1,V,1,H,W]
+                return t.pin_memory()
 
-            curr_depths_pred_batch = torch.stack(
-                [torch.from_numpy(curr_depth_pred_map[ch]) for ch in camera_channels], dim=0
-            ).unsqueeze(0).unsqueeze(2).to(device)
+            prev_depths_pred_batch = stack_depth_batch(prev_depth_pred_map).to(device, non_blocking=True)
+            curr_depths_pred_batch = stack_depth_batch(curr_depth_pred_map).to(device, non_blocking=True)
 
-            end2 = time.perf_counter()
-            print(f"Depthanything took {(end2 - end1)*1000:.2f} ms")
-
-            # end_event.record()
-            # torch.cuda.synchronize()
-            # elapsed_ms = start_event.elapsed_time(end_event)
-            # print(f"test：{elapsed_ms:.3f} ms")
-
-            # 3) load 环视图像 uv 坐标与 range view uv 坐标之间的对应关系 (DepthAnythingV2)
-            # proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'sjtu', 'prev', prev_depth_pred_map,
-            #                                                      affine_matrix, idx, H_r=40, W_r=480, visualize=False)
-            # proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'sjtu', 'curr', curr_depth_pred_map,
-            #                                                      affine_matrix, idx, H_r=40, W_r=480, visualize=False)
+            # ---- range 投影（注意：test_entries 里 meta['K'] 已是 K_ud，再无畸变） ----
+            torch.cuda.nvtx.range_push("build_mapping")
             proj_range_prev, proj_pix_prev = build_frame_mapping_fast(
                 test_entries, 'sjtu', 'prev', prev_depth_pred_map,
-                affine_matrix, idx, H_r=40, W_r=480, visualize=False,
-                pixel_stride=2
+                affine_matrix, idx, H_r=FAST_RANGE_H, W_r=FAST_RANGE_W,
+                visualize=False, pixel_stride=FAST_PIXEL_STRIDE
             )
             proj_range_curr, proj_pix_curr = build_frame_mapping_fast(
                 test_entries, 'sjtu', 'curr', curr_depth_pred_map,
-                affine_matrix, idx, H_r=40, W_r=480, visualize=False,
-                pixel_stride=2
+                affine_matrix, idx, H_r=FAST_RANGE_H, W_r=FAST_RANGE_W,
+                visualize=False, pixel_stride=FAST_PIXEL_STRIDE
             )
+            torch.cuda.nvtx.range_pop()
 
-            # 转换为 tensor
-            proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
-            proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
-            # 打包 batch
-            proj_pix_prev_batch = proj_pix_prev_tensor.unsqueeze(0).to(device)
-            proj_pix_curr_batch = proj_pix_curr_tensor.unsqueeze(0).to(device)
+            proj_pix_prev_batch = torch.from_numpy(proj_pix_prev.astype(np.int64)).unsqueeze(0).pin_memory().to(device, non_blocking=True)
+            proj_pix_curr_batch = torch.from_numpy(proj_pix_curr.astype(np.int64)).unsqueeze(0).pin_memory().to(device, non_blocking=True)
 
             end3 = time.perf_counter()
-            print(f"Building frame mapping took {(end3 - end2)*1000:.2f} ms")
-
-            # Inference
-            with torch.no_grad():
-                scale_pred, risk_pred    = model.forward(
-                        img_prev         = prev_batch,
-                        img_curr         = curr_batch,
-                        depth_prev       = prev_depths_pred_batch,
-                        depth_curr       = curr_depths_pred_batch,
-                        proj_pix_prev    = proj_pix_prev_batch,
-                        proj_pix_curr    = proj_pix_curr_batch,
-                        attn_type        = args.attn_type,
-                        attn_splits_list = args.attn_splits_list,
-                        corr_radius_list = args.corr_radius_list,
-                        prop_radius_list = args.prop_radius_list,
-                        num_reg_refine   = args.num_reg_refine,
-                        scale_only       = False,
-                    )
+            print(f"Building range-image mapping took {(end3 - end2)*1000:.2f} ms")
+            # ---- 模型前向 ----
+            torch.cuda.nvtx.range_push("FpTTC.forward")
+            with torch.inference_mode(), torch.cuda.amp.autocast(dtype=AMP_DTYPE):
+                scale_pred, risk_pred = model.forward(
+                    img_prev         = prev_batch,
+                    img_curr         = curr_batch,
+                    depth_prev       = prev_depths_pred_batch,
+                    depth_curr       = curr_depths_pred_batch,
+                    proj_pix_prev    = proj_pix_prev_batch,
+                    proj_pix_curr    = proj_pix_curr_batch,
+                    attn_type        = args.attn_type,
+                    attn_splits_list = args.attn_splits_list,
+                    corr_radius_list = args.corr_radius_list,
+                    prop_radius_list = args.prop_radius_list,
+                    num_reg_refine   = args.num_reg_refine,
+                    scale_only       = False,
+                )
+            torch.cuda.nvtx.range_pop()
                 
             end4 = time.perf_counter()
             print(f"Inference took {(end4 - end3)*1000:.2f} ms")
@@ -465,11 +333,8 @@ def main():
             concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
 
             scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
-            # scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
-            # normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
 
             risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
-            # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
 
             # new vis method
             scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
@@ -493,12 +358,6 @@ def main():
                 }
                 np.save(os.path.join(pred_npy_subdir, f"pred_{idx}.npy"), pred_data)
 
-            # Save visuals
-            # plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
-            #         -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
-            # plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
-            #         -normalized_pred_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-        
         pool.shutdown(wait=True)
 
     else:

@@ -15,7 +15,15 @@ import numpy as np
 from utils.dist import is_main_process
 
 import matplotlib.pyplot as plt
+import time
 
+def _safe_bilinear(x, *, size=None, scale_factor=None, align_corners=True):
+    orig_dtype = x.dtype
+    if orig_dtype == torch.bfloat16:
+        x = x.float()  # or x.half()
+    y = F.interpolate(x, size=size, scale_factor=scale_factor,
+                      mode='bilinear', align_corners=align_corners)
+    return y.to(orig_dtype)
 class CorrEncoder(nn.Module):
     def __init__(self, dim_in, dim_out):
         super(CorrEncoder, self).__init__()
@@ -79,73 +87,83 @@ class FpTTC(nn.Module):
                                  head_type        = 'risk')
         
 
-    def forward(self,
-                img_prev, img_curr,
-                depth_prev, depth_curr,
-                proj_pix_prev, proj_pix_curr,
-                attn_type,
-                attn_splits_list,
-                corr_radius_list,
-                prop_radius_list,
-                num_reg_refine,
-                scale_only):
+    def forward(
+        self,
+        img_prev, img_curr,
+        depth_prev, depth_curr,
+        proj_pix_prev, proj_pix_curr,
+        attn_type,
+        attn_splits_list,
+        corr_radius_list,
+        prop_radius_list,
+        num_reg_refine,
+        scale_only
+    ):
+        t0 = time.perf_counter()
 
-        ### 1）提取输入的多视角图像的底层特征
-        img0, img1 = normalize_img(img_prev, img_curr)
-        rgbd0 = torch.cat([img0, depth_prev], dim=2)  # [B, V, 4, H, W]
-        rgbd1 = torch.cat([img1, depth_curr], dim=2)  # [B, V, 4, H, W]
-        B, V, C, H_img, W_img = img0.shape
-        shared_prev, shared_curr = [], []
-        for view in range(rgbd0.size(1)):
-            p, c = self.extract_feature(rgbd0[:, view], rgbd1[:, view], branch=None)
-            shared_prev.append(p)
-            shared_curr.append(c)
+        # ----- 预处理 -----
+        img0, img1 = normalize_img(img_prev, img_curr)         # [B,V,3,H,W] -> normed
+        rgbd0 = torch.cat([img0, depth_prev], dim=2)           # [B,V,4,H,W]
+        rgbd1 = torch.cat([img1, depth_curr], dim=2)           # [B,V,4,H,W]
+        B, V, C, H_img, W_img = rgbd0.shape
 
-        corr_features = []
+        # 合并视角到 batch 维，一次性提特征
+        x0 = rgbd0.view(B*V, C, H_img, W_img)
+        x1 = rgbd1.view(B*V, C, H_img, W_img)
+        # extract_feature 会在内部 cat([x0, x1], 0) -> cnet -> 多尺度 -> chunk 回来
+        prev_lvls_flat, curr_lvls_flat = self.extract_feature(x0, x1, branch=None)  # list[T][B*V,C,Hs,Ws]
+
+        # reshape 回 [B,V,C,Hs,Ws]
+        prev_lvls = [f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for f in prev_lvls_flat]
+        curr_lvls = [f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for f in curr_lvls_flat]
+
+        t1 = time.perf_counter()
+        # print(f"feature extraction time: {t1 - t0:.4f} s")
+
+        # ----- 多尺度 Transformer + 相关性，仍然“只按尺度循环”，但每次处理 B*V -----
+        corr = None
         multi_level_feats_prev = []
         multi_level_feats_curr = []
 
-        for prev_lvls, curr_lvls in zip(shared_prev, shared_curr):
-            corr = None
-            lvl_feats_prev = []
-            lvl_feats_curr = []
-            # 多尺度特征融合与相关性计算
-            for lvl in range(self.num_scales):
-                prev_feat = prev_lvls[lvl]
-                curr_feat = curr_lvls[lvl]
-                # 1. 前后帧特征融合
-                fused_prev, fused_curr = self.featnet(
-                    prev_feat, curr_feat,
-                    lvl, attn_type, attn_splits_list,
-                    corr
-                )
-                lvl_feats_prev.append(fused_prev)
-                lvl_feats_curr.append(fused_curr)
-                # 2. 计算前后帧特征图的相关性
-                corr, _ = self.corrnet(
-                    fused_prev, fused_curr,
-                    lvl, corr_radius_list, prop_radius_list,
-                    num_reg_refine, False, corr
-                )
-                # 3. 如果不是最后一个尺度，则将 correlation map 上采样
-                if lvl < self.num_scales - 1:
-                    corr = F.interpolate(
-                        corr, scale_factor=2,
-                        mode='bilinear', align_corners=True
-                    ) * 2
-            corr_features.append(corr)
-            multi_level_feats_prev.append(lvl_feats_prev)
-            multi_level_feats_curr.append(lvl_feats_curr)
+        for lvl in range(self.num_scales):
+            # 取出该尺度的 [B,V,C,Hs,Ws]，合并为 [B*V,C,Hs,Ws] 一次性送入
+            p = prev_lvls[lvl].reshape(B*V, -1, prev_lvls[lvl].shape[3], prev_lvls[lvl].shape[4])
+            c = curr_lvls[lvl].reshape(B*V, -1, curr_lvls[lvl].shape[3], curr_lvls[lvl].shape[4])
 
-        # 1) 投影 corr 特征到 range-view（risk）
+            fused_prev, fused_curr = self.featnet(
+                p, c, lvl, attn_type, attn_splits_list, corr
+            )
+
+            # 保存为 [B,V,C,Hs,Ws] 以便后续投影
+            fp = fused_prev.view(B, V, fused_prev.shape[1], fused_prev.shape[2], fused_prev.shape[3])
+            fc = fused_curr.view(B, V, fused_curr.shape[1], fused_curr.shape[2], fused_curr.shape[3])
+            multi_level_feats_prev.append(fp)
+            multi_level_feats_curr.append(fc)
+
+            corr, _ = self.corrnet(
+                fused_prev, fused_curr,
+                lvl, corr_radius_list, prop_radius_list,
+                num_reg_refine, False, corr
+            )
+            if lvl < self.num_scales - 1:
+                corr = _safe_bilinear(corr, scale_factor=2, align_corners=True) * 2
+
+
+        t2 = time.perf_counter()
+        # print(f"correlation computation time: {t2 - t1:.4f} s")
+
+        # corr 此时是 [B*V, 2, Hc, Wc]，变回 [B,V,2,Hc,Wc] 后，为每个视角投影到 range
+        Cc, Hc, Wc = corr.shape[1], corr.shape[2], corr.shape[3]
+        corr_bv = corr.view(B, V, Cc, Hc, Wc)
+        corr_list = [corr_bv[:, v] for v in range(V)]          # list[V] of [B,2,Hc,Wc]
+
+        # 1) 风险/尺度的“相关性特征”投影（当前帧）
         corr_range = self.project_views_to_range(
-            corr_features, proj_pix_curr,
-            H_img=160, W_img=320
-        )
+            corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
+        )  # -> [B, Cc, H_r, W_r]
 
-        # 2) multi-lvl、multi-view 特征投影
-        multi_level_ranges_prev = []
-        multi_level_ranges_curr = []
+        # 2) 每个尺度的多视角特征投影
+        multi_level_ranges_prev, multi_level_ranges_curr = [], []
         for lvl in range(self.num_scales):
             scale = 2 ** (self.num_scales - 1 - lvl)
             if scale > 1:
@@ -155,48 +173,44 @@ class FpTTC(nn.Module):
                 proj_prev_lvl = proj_pix_prev
                 proj_curr_lvl = proj_pix_curr
 
-            prev_feats = [feats[lvl] for feats in multi_level_feats_prev]
-            curr_feats = [feats[lvl] for feats in multi_level_feats_curr]
+            # 组建 list[V] of [B,C,Hs,Ws]
+            prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
+            curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
 
-            range_prev = self.project_views_to_range(
-                prev_feats, proj_prev_lvl,
-                H_img=160, W_img=320
-            )
-            range_curr = self.project_views_to_range(
-                curr_feats, proj_curr_lvl,
-                H_img=160, W_img=320
-            )
+            range_prev = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
+            range_curr = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
 
-            multi_level_ranges_prev.append(range_prev)
+            multi_level_ranges_prev.append(range_prev)  # [B,C,Hr,Wr]
             multi_level_ranges_curr.append(range_curr)
 
-        # 3) 编码并预测风险分支输出
+        t3 = time.perf_counter()
+        # print(f"projection to range-view time: {t3 - t2:.4f} s")
+
+        # ----- 预测（两分支）-----
         # scale 分支
         corr_encoded_s = self.conv_corr(corr_range)
         initial_scale = F.softplus(corr_encoded_s[:, :1]) + 1e-3
         corr_encoded_s = corr_encoded_s[:, 1:]
-        scales = self.scale_net(
-            corr_encoded_s,
-            multi_level_ranges_prev,
-            multi_level_ranges_curr,
-            initial_scale
-        )
 
+        scales = self.scale_net(
+            corr_encoded_s, multi_level_ranges_prev, multi_level_ranges_curr, initial_scale
+        )
         if scale_only:
             return scales, None
-        
+
         # risk 分支
         corr_encoded = self.conv_corr_risk(corr_range)
         initial_risk = corr_encoded[:, :1]
         corr_encoded = corr_encoded[:, 1:]
         risk_score = self.risk_net(
-            corr_encoded,
-            multi_level_ranges_prev,
-            multi_level_ranges_curr,
-            initial_risk
+            corr_encoded, multi_level_ranges_prev, multi_level_ranges_curr, initial_risk
         )
 
+        t4 = time.perf_counter()
+        # print(f"scale & risk prediction time: {t4 - t3:.4f} s")
+
         return scales, risk_score
+
 
     def forward_with_loss( 
             self,
