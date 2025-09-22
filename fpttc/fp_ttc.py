@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +9,7 @@ from .scale_net.backbone import CNNEncoder
 from .scale_net.feature_net.feature_net import FeatureNet
 from .scale_net.flow_net import FlowNet
 from .scale_net.scale_net import ScaleNet
-from .scale_net.multi_view_deformable_fusion import MultiViewDeformableFusion
+from fpttc.rvt.range_view_transformer import RangeViewTransformer
 
 import torch.distributed as dist
 import numpy as np
@@ -65,7 +66,7 @@ class FpTTC(nn.Module):
                                upsample_factor  = upsample_factor,
                                reg_refine       = reg_refine) 
         
-        self.conv_corr = CorrEncoder(dim_in  = 2,
+        self.conv_corr = CorrEncoder(dim_in  = feature_channels,
                                      dim_out = feature_channels+1)
         self.scale_net = ScaleNet(num_scales      = num_scales,
                                  feature_channels = feature_channels,
@@ -86,12 +87,48 @@ class FpTTC(nn.Module):
                                  reg_refine       = reg_refine, 
                                  head_type        = 'risk')
         
+        K_bins = 8
+        num_views = len(self.camera_channels)
+        self.register_buffer(
+            "depth_bins",
+            torch.logspace(math.log10(1.0), math.log10(40.0), K_bins)
+        )
+        self.conv_corr_ = CorrEncoder(dim_in  = 2,
+                                      dim_out = feature_channels)
+        # 特征分支：按尺度各一个
+        self.rvt_feat = nn.ModuleList([
+            RangeViewTransformer(
+                num_layers=2,                 # 与 ScaleEncoder 层数保持一致
+                input_dim=feature_channels,   # 输入通道（每相机该尺度特征的 C）
+                d_model=feature_channels,     # 输出/隐藏维，建议与 input_dim 对齐，便于无缝替换
+                nhead=4,
+                num_level=num_views,          # 相机数 = 6
+                num_points=K_bins,            # 深度 bins 数
+                fov_up=8.0,
+                fov_down=-15.0
+            )
+            for _ in range(num_scales)
+        ])
+
+        # corr 分支：输入是 conv_corr(corr) 的输出通道 = feature_channels+1
+        self.rvt_corr = RangeViewTransformer(
+            num_layers=2,
+            input_dim=feature_channels,
+            d_model=feature_channels,
+            nhead=4,
+            num_level=num_views,
+            num_points=K_bins,
+            fov_up=8.0,
+            fov_down=-15.0
+        )
+        
 
     def forward(
         self,
         img_prev, img_curr,
         depth_prev, depth_curr,
         proj_pix_prev, proj_pix_curr,
+        sensor_metas,
         attn_type,
         attn_splits_list,
         corr_radius_list,
@@ -99,8 +136,7 @@ class FpTTC(nn.Module):
         num_reg_refine,
         scale_only
     ):
-        t0 = time.perf_counter()
-
+        
         # ----- 预处理 -----
         img0, img1 = normalize_img(img_prev, img_curr)         # [B,V,3,H,W] -> normed
         rgbd0 = torch.cat([img0, depth_prev], dim=2)           # [B,V,4,H,W]
@@ -116,9 +152,6 @@ class FpTTC(nn.Module):
         # reshape 回 [B,V,C,Hs,Ws]
         prev_lvls = [f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for f in prev_lvls_flat]
         curr_lvls = [f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for f in curr_lvls_flat]
-
-        t1 = time.perf_counter()
-        # print(f"feature extraction time: {t1 - t0:.4f} s")
 
         # ----- 多尺度 Transformer + 相关性，仍然“只按尺度循环”，但每次处理 B*V -----
         corr = None
@@ -148,43 +181,86 @@ class FpTTC(nn.Module):
             if lvl < self.num_scales - 1:
                 corr = _safe_bilinear(corr, scale_factor=2, align_corners=True) * 2
 
-
-        t2 = time.perf_counter()
-        # print(f"correlation computation time: {t2 - t1:.4f} s")
-
         # corr 此时是 [B*V, 2, Hc, Wc]，变回 [B,V,2,Hc,Wc] 后，为每个视角投影到 range
         Cc, Hc, Wc = corr.shape[1], corr.shape[2], corr.shape[3]
         corr_bv = corr.view(B, V, Cc, Hc, Wc)
         corr_list = [corr_bv[:, v] for v in range(V)]          # list[V] of [B,2,Hc,Wc]
 
-        # 1) 风险/尺度的“相关性特征”投影（当前帧）
-        corr_range = self.project_views_to_range(
-            corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
-        )  # -> [B, Cc, H_r, W_r]
+        # ====== 基于 RVT 将多视角特征图聚合到 Range View ======
+        # corr -> range（当前帧）
+        corr_encoded_list = [self.conv_corr_(c) for c in corr_list]  # list[V] of [B, Ccorr, Hc, Wc]
+        H_r = corr_encoded_list[0].shape[2]
+        W_r = corr_encoded_list[0].shape[3] * V
+        # 将每个视角的 corr_encoded_list 在 W 维度横向拼接，作为初始查询
+        ini_corr_query = torch.cat(corr_encoded_list, dim=3)  # [B, Ccorr, Hc, Wc*V]
+        corr_range = self.rvt_corr(
+            feats_by_cam=corr_encoded_list,
+            cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
+            cam_R=[sensor_metas['curr'][cam]['R_l2c'] for cam in self.camera_channels],
+            cam_t=[sensor_metas['curr'][cam]['t_l2c'] for cam in self.camera_channels],
+            affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
+            Hr=H_r, Wr=W_r,
+            depth_bins=self.depth_bins,
+            ini_query=ini_corr_query
+        )
 
-        # 2) 每个尺度的多视角特征投影
+        # 多尺度特征 -> range（前/当前帧）
         multi_level_ranges_prev, multi_level_ranges_curr = [], []
         for lvl in range(self.num_scales):
-            scale = 2 ** (self.num_scales - 1 - lvl)
-            if scale > 1:
-                proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
-                proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
-            else:
-                proj_prev_lvl = proj_pix_prev
-                proj_curr_lvl = proj_pix_curr
-
-            # 组建 list[V] of [B,C,Hs,Ws]
             prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
             curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
+            H_r = prev_feats_list[0].shape[2]
+            W_r = prev_feats_list[0].shape[3] * V
 
-            range_prev = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
-            range_curr = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
-
+            range_prev = self.rvt_feat[lvl](
+                feats_by_cam=prev_feats_list,
+                cam_K=[sensor_metas['prev'][cam]['K']     for cam in self.camera_channels],
+                cam_R=[sensor_metas['prev'][cam]['R_l2c'] for cam in self.camera_channels],
+                cam_t=[sensor_metas['prev'][cam]['t_l2c'] for cam in self.camera_channels],
+                affine_M=[sensor_metas['prev'][cam]['affine'] for cam in self.camera_channels],
+                Hr=H_r, Wr=W_r,
+                depth_bins=self.depth_bins
+            )
+            range_curr = self.rvt_feat[lvl](
+                feats_by_cam=curr_feats_list,
+                cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
+                cam_R=[sensor_metas['curr'][cam]['R_l2c'] for cam in self.camera_channels],
+                cam_t=[sensor_metas['curr'][cam]['t_l2c'] for cam in self.camera_channels],
+                affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
+                Hr=H_r, Wr=W_r,
+                depth_bins=self.depth_bins
+            )
             multi_level_ranges_prev.append(range_prev)  # [B,C,Hr,Wr]
             multi_level_ranges_curr.append(range_curr)
 
-        t3 = time.perf_counter()
-        # print(f"projection to range-view time: {t3 - t2:.4f} s")
+        
+        # # ====== 传统投影（不使用 RVT） ======
+        # # 1) 风险/尺度的“相关性特征”投影（当前帧）
+        # corr_range = self.project_views_to_range(
+        #     corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
+        # )  # -> [B, Cc, H_r, W_r]
+
+        # # 2) 每个尺度的多视角特征投影
+        # multi_level_ranges_prev, multi_level_ranges_curr = [], []
+        # for lvl in range(self.num_scales):
+        #     scale = 2 ** (self.num_scales - 1 - lvl)
+        #     if scale > 1:
+        #         proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
+        #         proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
+        #     else:
+        #         proj_prev_lvl = proj_pix_prev
+        #         proj_curr_lvl = proj_pix_curr
+
+        #     # 组建 list[V] of [B,C,Hs,Ws]
+        #     prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
+        #     curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
+
+        #     range_prev = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
+        #     range_curr = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
+
+        #     multi_level_ranges_prev.append(range_prev)  # [B,C,Hr,Wr]
+        #     multi_level_ranges_curr.append(range_curr)
+        # # ====== 传统投影（不使用 RVT） ======
 
         # ----- 预测（两分支）-----
         # scale 分支
@@ -206,9 +282,6 @@ class FpTTC(nn.Module):
             corr_encoded, multi_level_ranges_prev, multi_level_ranges_curr, initial_risk
         )
 
-        t4 = time.perf_counter()
-        # print(f"scale & risk prediction time: {t4 - t3:.4f} s")
-
         return scales, risk_score
 
 
@@ -222,6 +295,7 @@ class FpTTC(nn.Module):
             proj_pix_curr,                 
             gt_scale_map_with_mask,        # Tensor[B, 2, H_sph, W_sph]
             gt_risk_score_map_with_mask,   # Tensor[B, 2, H_sph, W_sph]
+            sensor_metas,
             attn_type,                     # str
             attn_splits_list,              # List[int]
             corr_radius_list,              # List[int]
@@ -237,6 +311,7 @@ class FpTTC(nn.Module):
             depth_curr       = depth_curr,
             proj_pix_prev    = proj_pix_prev,
             proj_pix_curr    = proj_pix_curr,
+            sensor_metas     = sensor_metas,
             attn_type        = attn_type,
             attn_splits_list = attn_splits_list,
             corr_radius_list = corr_radius_list,
@@ -244,6 +319,43 @@ class FpTTC(nn.Module):
             num_reg_refine   = num_reg_refine,
             scale_only       = scale_only,
         )
+
+        # # ===== teacher 蒸馏（训练期才启用） =====
+        # if self.training and self.cfg.get('use_rvt_distill', True):
+        #     with torch.no_grad():
+        #         # 用现有 teacher 投影：特征与 corr -> Range
+        #         # teacher_feats_prev/teacher_feats_curr 通过 project_views_to_range(..., proj_pix_prev/curr, ...) 得到
+        #         t_range_prev_list, t_range_curr_list = [], []
+        #         for lvl in range(self.num_scales):
+        #             prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
+        #             curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
+        #             t_prev = self.project_views_to_range(prev_feats_list, proj_pix_prev, H_img=H_img, W_img=W_img)  # [B,C,Hr,Wr]
+        #             t_curr = self.project_views_to_range(curr_feats_list, proj_pix_curr, H_img=H_img, W_img=W_img)
+        #             t_range_prev_list.append(t_prev); t_range_curr_list.append(t_curr)
+
+        #         t_corr_range = self.project_views_to_range(
+        #             [self.conv_corr(c) for c in corr_list], proj_pix_curr, H_img=H_img, W_img=W_img
+        #         )
+
+        #     # L_feat：student vs teacher（多尺度 Range 特征）
+        #     L_feat = 0.0
+        #     for l in range(self.num_scales):
+        #         L_feat = L_feat + (multi_level_ranges_prev[l] - t_range_prev_list[l]).abs().mean()
+        #         L_feat = L_feat + (multi_level_ranges_curr[l] - t_range_curr_list[l]).abs().mean()
+
+        #     # L_corr：student vs teacher（Range corr）
+        #     L_corr = (corr_range - t_corr_range).abs().mean()
+
+        #     # 汇总
+        #     lam_f = self.cfg.get('lambda_feat', 1.0)
+        #     lam_c = self.cfg.get('lambda_corr', 1.0)
+        #     if scale_only:
+        #         loss = loss_s + lam_f * L_feat + lam_c * L_corr
+        #         return scales, None, loss, None
+        #     else:
+        #         loss = loss_r + lam_f * L_feat + lam_c * L_corr
+        #         return None, risks, None, loss
+        
         if scale_only:
             # 仅计算尺度分支的损失
             loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)

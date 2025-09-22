@@ -59,7 +59,7 @@ class nuScenes_range_image(data.Dataset):
         # - gt range images path (including scale map, depth map and risk score map)
         # - nuscenes scene flow pointcloud path
         self.image_list = [] # input images
-        # self.sensor_meta_list = []
+        self.sensor_meta_list = []
         self.scale_map_list = [] # ground truth
         self.risk_score_map_list = []
         # [TODO] 目前 depth map 是将碰撞点反投影回图像平面时使用的，仅在可视化时使用
@@ -70,7 +70,7 @@ class nuScenes_range_image(data.Dataset):
         # 在加载数据集时离线构建 spherical voxel grid
         # 结合 DepthAnything 预测的 Depth Pred Map，提前计算每一个像素坐标对应的 Range View 坐标
 
-        for i in tqdm(range(len(self.data)), desc='Loading nuScenes Range Image Dataset'):
+        for i in tqdm(range(len(self.data)-1794), desc='Loading nuScenes Range Image Dataset'):
 
             if self.data[i]['scene_indice'] == '10':
                 continue
@@ -90,9 +90,13 @@ class nuScenes_range_image(data.Dataset):
 
             # 3. 环视图像 (cam_idx, u, v) 与 range image (u, v) 之间的映射关系
             #    通过 DepthAnything 预测的 Depth Pred Map + 内外参 计算得到
-            proj_range_prev, proj_pix_prev = build_frame_mapping(self.data, 'nusc', 'prev', self.affine_matrix, i, H_r=40, W_r=480)
-            proj_range_curr, proj_pix_curr = build_frame_mapping(self.data, 'nusc', 'curr', self.affine_matrix, i, H_r=40, W_r=480)
+            proj_range_prev, proj_pix_prev, sensor_metas_prev = build_frame_mapping(self.data, 'nusc', 'prev', None,
+                                                                                    self.affine_matrix, i, H_r=40, W_r=480)
+            proj_range_curr, proj_pix_curr, sensor_metas_curr = build_frame_mapping(self.data, 'nusc', 'curr', None,
+                                                                                    self.affine_matrix, i, H_r=40, W_r=480)
             self.proj_list.append([proj_pix_prev, proj_pix_curr])
+            sensor_metas = {'prev': sensor_metas_prev, 'curr': sensor_metas_curr}
+            self.sensor_meta_list.append(sensor_metas)
 
     def __len__(self):
         return len(self.image_list)
@@ -167,8 +171,15 @@ class nuScenes_range_image(data.Dataset):
         proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
         proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
 
-        # 4) 将图像增强的仿射矩阵转换为 Tensor
-        affine_matrix = torch.from_numpy(affine_matrix)
+        # # 4) 将图像增强的仿射矩阵转换为 Tensor
+        # affine_matrix = torch.from_numpy(affine_matrix)
+
+        # 5) 将 sensor meta 转换为 Tensor
+        sensor_metas = self.sensor_meta_list[index]
+        for frame_key in ['prev', 'curr']:
+            for channel in camera_channels:
+                for k, v in sensor_metas[frame_key][channel].items():
+                    sensor_metas[frame_key][channel][k] = torch.from_numpy(np.asarray(v)).float()
 
         return (prev_surr_view_imgs_tensor,
                 curr_surr_view_imgs_tensor,
@@ -177,7 +188,8 @@ class nuScenes_range_image(data.Dataset):
                 proj_pix_prev_tensor,
                 proj_pix_curr_tensor,
                 gt_scale_map_with_mask,
-                gt_risk_map_with_mask)
+                gt_risk_map_with_mask,
+                sensor_metas)
 
     def __rmul__(self, v):
         self.image_list          = v * self.image_list
@@ -185,6 +197,7 @@ class nuScenes_range_image(data.Dataset):
         self.risk_score_map_list = v * self.risk_score_map_list
         self.depth_map_list      = v * self.depth_map_list
         self.proj_list           = v * self.proj_list
+        self.sensor_meta_list    = v * self.sensor_meta_list
         return self
 
 
@@ -200,6 +213,7 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
                        'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
     all_points = []
     all_pix    = []
+    sensor_metas_channel = {}
 
     for cam_idx, channel in enumerate(camera_channels):
         
@@ -210,7 +224,9 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
             K = data[idx][f'sensor_metas_{frame_key}'][channel]['K_undist']
             R_l2c = data[idx][f'sensor_metas_{frame_key}'][channel]['R_l2c']
             t_l2c = data[idx][f'sensor_metas_{frame_key}'][channel]['t_l2c']
-            sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c}
+            sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c, 'affine': affine_matrix}
+            
+            sensor_metas_channel[channel] = sensor_meta
 
             # 3) 根据深度图和相机内外参，将像素坐标转换为 LiDAR 坐标系下的 XYZ 坐标
             depth_pred_map = depth_map[channel]
@@ -222,14 +238,16 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
 
         elif dataset_key == 'nusc':
             # # 读取 idx 帧、cam_idx 相机的 depth pred map
-            # depth_pred_path = data[idx][f'{frame_key}_camera_data'][channel]['depth_pred']
-            # depth_pred_map  = np.load(depth_pred_path)  # (H_img, W_img)
+            depth_pred_path = data[idx][f'{frame_key}_camera_data'][channel]['depth_pred']
+            depth_map  = np.load(depth_pred_path)  # (H_img, W_img)
             proj_matrix, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
                 data[idx][f'sensor_metas_{frame_key}'],
                 data[idx][f'sensor_metas_{frame_key}']['camera']['calibrated_sensor'][channel],
                 data[idx][f'sensor_metas_{frame_key}']['camera']['ego_pose'][channel]
             )
-            sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c}
+            sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c, 'affine': affine_matrix}
+
+            sensor_metas_channel[channel] = sensor_meta
 
             # 3) 根据深度图和相机内外参，将像素坐标转换为 LiDAR 坐标系下的 XYZ 坐标
             coords = get_geometry(depth_map, sensor_meta, affine_matrix)  # (H_img, W_img, 3)
@@ -300,7 +318,7 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
         plt.savefig(f"./Datasets/cyberrock/scene_7/depth_vis/{frame_key}_normalized_range_{idx}.png", bbox_inches='tight', pad_inches=0)
         plt.close()
 
-    return proj_range, proj_pix
+    return proj_range, proj_pix, sensor_metas_channel
 
 
 

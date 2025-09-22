@@ -260,10 +260,10 @@ def main(nusc, val_list, indice, args):
         points_mask = ~(points_in_boxes[0])
 
         ############################# get point mask of the vehicle itself ##########################
-        range = [3.0, 3.0, 3.0] # remove points within 3m of the vehicle itself
-        oneself_mask = torch.from_numpy((np.abs(pc0[:, 0]) > range[0]) |
-                                        (np.abs(pc0[:, 1]) > range[1]) |
-                                        (np.abs(pc0[:, 2]) > range[2]))
+        ego_range = [3.0, 3.0, 3.0] # remove points within 3m of the vehicle itself
+        oneself_mask = torch.from_numpy((np.abs(pc0[:, 0]) > ego_range[0]) |
+                                        (np.abs(pc0[:, 1]) > ego_range[1]) |
+                                        (np.abs(pc0[:, 2]) > ego_range[2]))
 
         ############################# get static scene segment ##########################
         points_mask = points_mask & oneself_mask

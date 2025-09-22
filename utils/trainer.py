@@ -151,7 +151,8 @@ class TTCTrainer(object):
              proj_pix_prev_tensor,
              proj_pix_curr_tensor,
              gt_scale_map_with_mask,
-             gt_risk_score_map_with_mask) = data
+             gt_risk_score_map_with_mask,
+             sensor_metas) = data
             
             prev_surr_view_imgs_tensor   = prev_surr_view_imgs_tensor.to(self.device)
             curr_surr_view_imgs_tensor   = curr_surr_view_imgs_tensor.to(self.device)
@@ -161,7 +162,11 @@ class TTCTrainer(object):
             proj_pix_curr_tensor         = proj_pix_curr_tensor.to(self.device)
             gt_scale_map_with_mask       = gt_scale_map_with_mask.to(self.device)
             gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
-            # affine_matrix                = affine_matrix.to(self.device)
+            for frame_key in sensor_metas:
+                for channel in sensor_metas[frame_key]:
+                    for key in sensor_metas[frame_key][channel]:
+                        sensor_metas[frame_key][channel][key] = sensor_metas[frame_key][channel][key].to(self.device)
+            # sensor_metas                 = sensor_metas.to(self.device)
 
             self.optimizer.zero_grad()
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
@@ -175,6 +180,7 @@ class TTCTrainer(object):
                     proj_pix_curr                 = proj_pix_curr_tensor,
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
                     gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
+                    sensor_metas                  = sensor_metas,
                     attn_type                     = self.attn_type,
                     attn_splits_list              = self.attn_splits_list,
                     corr_radius_list              = self.corr_radius_list,
@@ -192,6 +198,7 @@ class TTCTrainer(object):
                     proj_pix_curr                 = proj_pix_curr_tensor,
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
                     gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
+                    sensor_metas                  = sensor_metas,
                     attn_type                     = self.attn_type,
                     attn_splits_list              = self.attn_splits_list,
                     corr_radius_list              = self.corr_radius_list,

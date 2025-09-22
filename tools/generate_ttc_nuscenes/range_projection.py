@@ -157,6 +157,11 @@ def range_projection(points, scales, risk_score, H=160, W=1920, fov_up=10.0, fov
     scan_y = points[:, 1]
     scan_z = points[:, 2]
 
+    # nuscenes 的坐标系定义: y 前、x 右、z 上 
+    # 这里使用的坐标系定义： x 前、y 左、z 上 （由 NuScenes 坐标系顺时针旋转得到）
+    # 因此投影得到的range image中，车辆正前方不在图像中心，而是在图像的左侧1/4处
+    # 这样 range image 从左到右，可以依次与环视图像的 左前、前、右前、右后、后、左后 对齐
+
     # 计算每个点的水平角（yaw）和垂直角（pitch）
     yaw = -np.arctan2(scan_y, scan_x)                  # 水平角
     pitch = np.arcsin(scan_z / depth)                  # 垂直角
