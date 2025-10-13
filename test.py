@@ -31,6 +31,7 @@ from utils.draw import scale2rgb, orientation2rgb
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
 from dataloader.dataset import build_frame_mapping, build_frame_mapping_fast
 from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
+from utils.loss import get_loss_scale_map, get_loss_risk_score_map
 
 parser = argparse.ArgumentParser()
 
@@ -185,7 +186,7 @@ def main():
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]}
         }
 
-    encoder = 'vits' # or 'vits', 'vitb'
+    encoder = 'vitl' # or 'vits', 'vitb'
     dataset = 'vkitti' # 'hypersim' for indoor model, 'vkitti' for outdoor model
     max_depth = 80 # 20 for indoor model, 80 for outdoor model
 
@@ -361,9 +362,11 @@ def main():
         pool.shutdown(wait=True)
 
     else:
+        mid_err = 0.0
+        count = 0
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
-            # if test_entries[idx]['scene_indice'] != '7':
-            #     continue
+            if test_entries[idx]['scene_indice'] not in ['10']:
+                continue
             scene_indice = test_entries[idx]['scene_indice']
             # 1) load 相邻两帧的输入图像
             # Load images
@@ -463,6 +466,10 @@ def main():
                         num_reg_refine   = args.num_reg_refine,
                         scale_only       = False,
                     )
+            
+            loss = get_loss_scale_map(scale_pred, gt_scale_tensor)
+            mid_err += loss.item()
+            count += 1
 
             # # Visualization
             # gt_scale_array = gt_scale_tensor[0,0].cpu().numpy()
@@ -500,7 +507,8 @@ def main():
             gt_risk_vis = np.clip(gt_risk_array, 0.0, np.pi)
             gt_risk_vis = orientation2rgb(gt_risk_vis)
             gt_risk_vis = gt_risk_vis * 255.0
-            cv2.imwrite(os.path.join(output_dir, f"gt_risk_{idx}.png"), gt_risk_vis)
+            vis_bgr = cv2.cvtColor(gt_risk_vis.astype(np.uint8), cv2.COLOR_RGB2BGR)
+            cv2.imwrite(os.path.join(output_dir, f"gt_risk_{idx}.png"), vis_bgr)
             # gt_risk_mask_array = gt_risk_tensor[0,1].cpu().bool().numpy()
             # normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array, gt_risk_mask_array)
 
@@ -508,6 +516,7 @@ def main():
             risk_vis = np.clip(risk_prediction_array, 0.0, np.pi)
             risk_vis = orientation2rgb(risk_vis)
             risk_vis = risk_vis * 255.0
+            risk_vis = cv2.cvtColor(risk_vis.astype(np.uint8), cv2.COLOR_RGB2BGR)
             cv2.imwrite(os.path.join(output_dir, f"pred_risk_{idx}.png"), risk_vis)
             # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
 
@@ -542,6 +551,7 @@ def main():
             # Cleanup
             del prev_batch, curr_batch, scale_pred, risk_pred
             torch.cuda.empty_cache()
+        print(f"Average scale MAE on scene {scene_indice}: {mid_err/count:.4f}")
 
 if __name__ == "__main__":
     main()
