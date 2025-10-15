@@ -70,7 +70,7 @@ class nuScenes_range_image(data.Dataset):
         # 在加载数据集时离线构建 spherical voxel grid
         # 结合 DepthAnything 预测的 Depth Pred Map，提前计算每一个像素坐标对应的 Range View 坐标
 
-        for i in tqdm(range(len(self.data)-1794), desc='Loading nuScenes Range Image Dataset'):
+        for i in tqdm(range(len(self.data)), desc='Loading nuScenes Range Image Dataset'):
 
             if self.data[i]['scene_indice'] == '10':
                 continue

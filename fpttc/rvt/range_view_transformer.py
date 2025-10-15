@@ -207,7 +207,8 @@ class RangeViewTransformer(nn.Module):
                  num_level=6,       # 相机数（把每个相机当作一个 level）
                  num_points=8,      # 深度 bins 数
                  fov_up=8.0,
-                 fov_down=-15.0):
+                 fov_down=-15.0,
+                 input_hw=(160, 320)):
         super().__init__()
         self.d_model = d_model
         self.nhead   = nhead
@@ -215,6 +216,7 @@ class RangeViewTransformer(nn.Module):
         self.num_points = num_points
         self.fov_up = fov_up
         self.fov_down = fov_down
+        self.input_h, self.imput_w = input_hw
 
         # 与 ScaleEncoder 对齐的“query 编码器”（这里输入通常是 0，占位）
         self.scale_conv = nn.Sequential(
@@ -282,9 +284,15 @@ class RangeViewTransformer(nn.Module):
         for l in range(L):
             Ki, Ri, ti, Ai = cam_K[l], cam_R[l], cam_t[l], affine_M[l]
             Hin, Win = in_sizes[l]
+
+            sx = Win / self.imput_w
+            sy = Hin / self.input_h
+            S = torch.tensor([[sx, 0, 0], [0, sy, 0], [0, 0, 1]], device=Ai.device, dtype=Ai.dtype)
+            Affine_feat = S @ Ai
+
             X = pts.view(B, -1, 3)                                    # [B,Q*K,3]
             uv, zmask = project_points_to_image(X, Ki, Ri, ti)        # [B,QK,2], [B,QK]
-            uv_aug = apply_affine_to_uv(uv, Ai)                       # [B,QK,2]
+            uv_aug = apply_affine_to_uv(uv, Affine_feat)                       # [B,QK,2]
 
             u = uv_aug[..., 0]; v = uv_aug[..., 1]
             inb = (u >= 0) & (u <= (Win - 1)) & (v >= 0) & (v <= (Hin - 1))  # [B,QK]
