@@ -298,6 +298,9 @@ def main():
             ##########################################################################
         # 1) freeze risk branch
         freeze_prefixes = (
+            # 
+            'cnet.', 'featnet.', 'corrnet.',
+            # risk branch
             'conv_corr_risk.','risk_net.'
         )
 

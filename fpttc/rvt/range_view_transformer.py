@@ -207,7 +207,8 @@ class RangeViewTransformer(nn.Module):
                  num_level=6,       # 相机数（把每个相机当作一个 level）
                  num_points=8,      # 深度 bins 数
                  fov_up=8.0,
-                 fov_down=-15.0):
+                 fov_down=-15.0,
+                 input_hw=(160, 320)):
         super().__init__()
         self.d_model = d_model
         self.nhead   = nhead
@@ -215,6 +216,7 @@ class RangeViewTransformer(nn.Module):
         self.num_points = num_points
         self.fov_up = fov_up
         self.fov_down = fov_down
+        self.input_h, self.input_w = input_hw
 
         # 与 ScaleEncoder 对齐的“query 编码器”（这里输入通常是 0，占位）
         self.scale_conv = nn.Sequential(
@@ -223,7 +225,7 @@ class RangeViewTransformer(nn.Module):
             conv(d_model, d_model)
         )
         from fpttc.modules.position import PositionEmbeddingSine
-        self.pos_enc = PositionEmbeddingSine(num_pos_feats=d_model/2)
+        self.pos_enc = PositionEmbeddingSine(num_pos_feats=d_model // 2)
 
         # value 编码（与 ScaleEncoder 相同风格，但这里只有“单时刻多相机”，所以是 input_dim -> d_model）
         self.value_fs_conv = nn.Conv1d(input_dim, d_model, 1)
@@ -236,6 +238,10 @@ class RangeViewTransformer(nn.Module):
         ])
         self.level_embeds = nn.Parameter(torch.Tensor(self.num_level, input_dim))
         nn.init.xavier_uniform_(self.level_embeds)
+
+        for m in self.layers:
+            nn.init.constant_(m.sampling_offsets.weight, 0.0)
+            nn.init.constant_(m.sampling_offsets.bias,   0.0)
 
     @staticmethod
     def _pack_levels(feats_by_cam):
@@ -282,9 +288,15 @@ class RangeViewTransformer(nn.Module):
         for l in range(L):
             Ki, Ri, ti, Ai = cam_K[l], cam_R[l], cam_t[l], affine_M[l]
             Hin, Win = in_sizes[l]
+
+            sx = Win / self.input_w
+            sy = Hin / self.input_h
+            S = torch.tensor([[sx, 0, 0], [0, sy, 0], [0, 0, 1]], device=Ai.device, dtype=Ai.dtype)
+            Affine_feat = S @ Ai
+
             X = pts.view(B, -1, 3)                                    # [B,Q*K,3]
             uv, zmask = project_points_to_image(X, Ki, Ri, ti)        # [B,QK,2], [B,QK]
-            uv_aug = apply_affine_to_uv(uv, Ai)                       # [B,QK,2]
+            uv_aug = apply_affine_to_uv(uv, Affine_feat)                       # [B,QK,2]
 
             u = uv_aug[..., 0]; v = uv_aug[..., 1]
             inb = (u >= 0) & (u <= (Win - 1)) & (v >= 0) & (v <= (Hin - 1))  # [B,QK]
@@ -354,33 +366,58 @@ class RangeViewTransformer(nn.Module):
             B, Hr, Wr, depth_bins, cam_K, cam_R, cam_t, affine_M, in_sizes
         )  # [B,Q,H,L,K,2], [B,Q,H,L,K] bool
 
-        # 用 query 回归的注意力（与 ScaleEncoder 一致），再乘 mask、按 K 归一化
-        # 先建立一个“哑层”来复用 attention_weights 的线性头（不想改 Block 的话也可复制参数）
-        attn_head = getattr(self, "_attn_head", None)
-        if attn_head is None:
-            self._attn_head = nn.Linear(self.d_model, self.nhead*self.num_level*self.num_points).to(device)
-            # 初始化为与 TransformerBlock.attention_weights 相同风格（零+softmax），也可拷贝参数
-            nn.init.constant_(self._attn_head.weight, 0.0)
-            nn.init.constant_(self._attn_head.bias,   0.0)
-            attn_head = self._attn_head
+        # # 用 query 回归的注意力（与 ScaleEncoder 一致），再乘 mask、按 K 归一化
+        # # 先建立一个“哑层”来复用 attention_weights 的线性头（不想改 Block 的话也可复制参数）
+        # attn_head = getattr(self, "_attn_head", None)
+        # if attn_head is None:
+        #     self._attn_head = nn.Linear(self.d_model, self.nhead*self.num_level*self.num_points).to(device)
+        #     # 初始化为与 TransformerBlock.attention_weights 相同风格（零+softmax），也可拷贝参数
+        #     nn.init.constant_(self._attn_head.weight, 0.0)
+        #     nn.init.constant_(self._attn_head.bias,   0.0)
+        #     attn_head = self._attn_head
 
-        attn_raw = attn_head(query).view(B, Hr*Wr, self.nhead, self.num_level, self.num_points)  # [B,Q,H,L,K]
-        attn_raw = F.softmax(attn_raw, dim=-1)
-        ext_attn = attn_raw * vis_mask.float()
-        denom = ext_attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        ext_attn = ext_attn / denom  # [B,Q,H,L,K]
+        # attn_raw = attn_head(query).view(B, Hr*Wr, self.nhead, self.num_level, self.num_points)  # [B,Q,H,L,K]
+        # attn_raw = F.softmax(attn_raw, dim=-1)
+        # ext_attn = attn_raw * vis_mask.float()
+        # denom = ext_attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        # ext_attn = ext_attn / denom  # [B,Q,H,L,K]
 
-        # 6) 逐层 DeformableAttn（与 ScaleEncoder 完全一致，只是传入 ext_*）
+        # 6) 逐层 DeformableAttn
         out = query
         for layer in self.layers:
+            # === (A) 每层重算注意力，并与可见性 mask 融合 + 在 L×K 上归一化 ===
+            attn_raw = layer.attention_weights(out)                           # [B, Q, H*L*K]
+            attn_raw = attn_raw.view(B, Hr*Wr, self.nhead, self.num_level*self.num_points)
+            attn_raw = F.softmax(attn_raw, dim=-1)                            # over (L*K)
+            attn_raw = attn_raw.view(B, Hr*Wr, self.nhead, self.num_level, self.num_points)
+            ext_attn = attn_raw * vis_mask.float()                            # [B,Q,H,L,K]
+            # 在 L×K 维度上重归一化，确保每个 head 的权重和为 1
+            ext_attn = ext_attn / ext_attn.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+
+            # === (B) 几何采样位置 + 学习偏移 ===
+            # 生成未归一化的像素偏移 Δ，形状与 ext_loc 对齐
+            delta = layer.sampling_offsets(out)                                # [B, Q, H*L*K*2]
+            delta = delta.view(B, Hr*Wr, self.nhead, self.num_level, self.num_points, 2)
+
+            # 以 (W_l, H_l) 为归一化因子，把像素偏移变成 [0,1] 空间的增量
+            # spatial_shapes: [L, 2] = (H_l, W_l)，构造 [L,2] = (W_l, H_l)
+            offset_normalizer = torch.stack(
+                [spatial_shapes[..., 1], spatial_shapes[..., 0]], dim=-1      # [L,2] = (W, H)
+            ).to(delta.dtype).to(delta.device)
+            offset_normalizer = offset_normalizer.view(1, 1, 1, self.num_level, 1, 2)  # [1,1,1,L,1,2]
+
+            delta01 = delta / offset_normalizer                                # 像素 → 归一化
+            sampling_locations = (ext_loc + delta01).clamp(0.0, 1.0)           # 叠加并裁剪
+
+            # === (C) 本层 Deformable Attention（位置=几何+学习偏移，权重=融合 vis_mask 后的注意力）
             out = layer(
                 out, value,
                 height=Hr, width=Wr,
-                query_location=query_location,
+                query_location=query_location,          # 占位，无实际用处
                 spatial_shapes=spatial_shapes,
                 level_start_index=lvl_start,
-                ext_sampling_locations=ext_loc,     # 几何采样点（[0,1]）
-                ext_attention_weights=ext_attn      # mask 后再归一化的注意力
+                ext_sampling_locations=sampling_locations,
+                ext_attention_weights=ext_attn
             )
 
         # 7) reshape 回 Range-View 张量

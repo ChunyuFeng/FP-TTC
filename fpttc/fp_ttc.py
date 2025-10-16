@@ -66,8 +66,14 @@ class FpTTC(nn.Module):
                                upsample_factor  = upsample_factor,
                                reg_refine       = reg_refine) 
         
-        self.conv_corr = CorrEncoder(dim_in  = feature_channels,
-                                     dim_out = feature_channels+1)
+        # self.conv_corr = CorrEncoder(dim_in  = 2,
+        #                              dim_out = feature_channels+1)
+        
+        self.conv_corr_rvt_in = CorrEncoder(dim_in  = 2,
+                                            dim_out = feature_channels)
+        
+        self.conv_corr_rvt_out = CorrEncoder(dim_in  = feature_channels,
+                                             dim_out = feature_channels+1)
         self.scale_net = ScaleNet(num_scales      = num_scales,
                                  feature_channels = feature_channels,
                                  upsample_factor  = upsample_factor,
@@ -93,8 +99,7 @@ class FpTTC(nn.Module):
             "depth_bins",
             torch.logspace(math.log10(1.0), math.log10(40.0), K_bins)
         )
-        self.conv_corr_ = CorrEncoder(dim_in  = 2,
-                                      dim_out = feature_channels)
+        
         # 特征分支：按尺度各一个
         self.rvt_feat = nn.ModuleList([
             RangeViewTransformer(
@@ -186,13 +191,42 @@ class FpTTC(nn.Module):
         corr_bv = corr.view(B, V, Cc, Hc, Wc)
         corr_list = [corr_bv[:, v] for v in range(V)]          # list[V] of [B,2,Hc,Wc]
 
+        # ====== 传统投影（不使用 RVT） ======
+        # 1) 风险/尺度的“相关性特征”投影（当前帧）
+        corr_range_init = self.project_views_to_range(
+            corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
+        )  # -> [B, Cc, H_r, W_r]
+
+        # 2) 每个尺度的多视角特征投影
+        multi_level_ranges_prev_init, multi_level_ranges_curr_init = [], []
+        for lvl in range(self.num_scales):
+            scale = 2 ** (self.num_scales - 1 - lvl)
+            if scale > 1:
+                proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
+                proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
+            else:
+                proj_prev_lvl = proj_pix_prev
+                proj_curr_lvl = proj_pix_curr
+
+            # 组建 list[V] of [B,C,Hs,Ws]
+            prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
+            curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
+
+            range_prev = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
+            range_curr = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
+
+            multi_level_ranges_prev_init.append(range_prev)  # [B,C,Hr,Wr]
+            multi_level_ranges_curr_init.append(range_curr)
+        # ====== 传统投影（不使用 RVT） ======
+
         # ====== 基于 RVT 将多视角特征图聚合到 Range View ======
         # corr -> range（当前帧）
-        corr_encoded_list = [self.conv_corr_(c) for c in corr_list]  # list[V] of [B, Ccorr, Hc, Wc]
+        corr_encoded_list = [self.conv_corr_rvt_in(c) for c in corr_list]  # list[V] of [B, Ccorr, Hc, Wc]
         H_r = corr_encoded_list[0].shape[2]
         W_r = corr_encoded_list[0].shape[3] * V
         # 将每个视角的 corr_encoded_list 在 W 维度横向拼接，作为初始查询
-        ini_corr_query = torch.cat(corr_encoded_list, dim=3)  # [B, Ccorr, Hc, Wc*V]
+        # ini_corr_query = torch.cat(corr_encoded_list, dim=3)  # [B, Ccorr, Hc, Wc*V]
+        corr_range_init = self.conv_corr_rvt_in(corr_range_init.detach())
         corr_range = self.rvt_corr(
             feats_by_cam=corr_encoded_list,
             cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
@@ -201,7 +235,7 @@ class FpTTC(nn.Module):
             affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
             Hr=H_r, Wr=W_r,
             depth_bins=self.depth_bins,
-            ini_query=ini_corr_query
+            ini_query=corr_range_init
         )
 
         # 多尺度特征 -> range（前/当前帧）
@@ -219,7 +253,8 @@ class FpTTC(nn.Module):
                 cam_t=[sensor_metas['prev'][cam]['t_l2c'] for cam in self.camera_channels],
                 affine_M=[sensor_metas['prev'][cam]['affine'] for cam in self.camera_channels],
                 Hr=H_r, Wr=W_r,
-                depth_bins=self.depth_bins
+                depth_bins=self.depth_bins,
+                ini_query=multi_level_ranges_prev_init[lvl].detach()  # 传统投影结果作为初始查询
             )
             range_curr = self.rvt_feat[lvl](
                 feats_by_cam=curr_feats_list,
@@ -228,43 +263,16 @@ class FpTTC(nn.Module):
                 cam_t=[sensor_metas['curr'][cam]['t_l2c'] for cam in self.camera_channels],
                 affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
                 Hr=H_r, Wr=W_r,
-                depth_bins=self.depth_bins
+                depth_bins=self.depth_bins,
+                ini_query=multi_level_ranges_curr_init[lvl].detach()  # 传统投影结果作为初始查询
             )
             multi_level_ranges_prev.append(range_prev)  # [B,C,Hr,Wr]
             multi_level_ranges_curr.append(range_curr)
 
-        
-        # # ====== 传统投影（不使用 RVT） ======
-        # # 1) 风险/尺度的“相关性特征”投影（当前帧）
-        # corr_range = self.project_views_to_range(
-        #     corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
-        # )  # -> [B, Cc, H_r, W_r]
-
-        # # 2) 每个尺度的多视角特征投影
-        # multi_level_ranges_prev, multi_level_ranges_curr = [], []
-        # for lvl in range(self.num_scales):
-        #     scale = 2 ** (self.num_scales - 1 - lvl)
-        #     if scale > 1:
-        #         proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
-        #         proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
-        #     else:
-        #         proj_prev_lvl = proj_pix_prev
-        #         proj_curr_lvl = proj_pix_curr
-
-        #     # 组建 list[V] of [B,C,Hs,Ws]
-        #     prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
-        #     curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
-
-        #     range_prev = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
-        #     range_curr = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
-
-        #     multi_level_ranges_prev.append(range_prev)  # [B,C,Hr,Wr]
-        #     multi_level_ranges_curr.append(range_curr)
-        # # ====== 传统投影（不使用 RVT） ======
 
         # ----- 预测（两分支）-----
         # scale 分支
-        corr_encoded_s = self.conv_corr(corr_range)
+        corr_encoded_s = self.conv_corr_rvt_out(corr_range)
         initial_scale = F.softplus(corr_encoded_s[:, :1]) + 1e-3
         corr_encoded_s = corr_encoded_s[:, 1:]
 
