@@ -31,7 +31,7 @@ from utils.draw import scale2rgb, orientation2rgb
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
 from dataloader.dataset import build_frame_mapping, build_frame_mapping_fast
 from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
-from utils.loss import get_loss_scale_map, get_loss_risk_score_map
+from utils.loss import get_loss_scale_map, get_loss_risk_score_map, compute_errs_ttc_from_scale, eval_orientation_and_highrisk_stats, reduce_metrics_across_frames
 
 parser = argparse.ArgumentParser()
 
@@ -362,7 +362,10 @@ def main():
         pool.shutdown(wait=True)
 
     else:
+        VIS = False
         mid_err = 0.0
+        mid_err_pct = {"Err-1": 0.0, "Err-2": 0.0, "Err-5": 0.0}
+        orien_status = []
         count = 0
         for idx in tqdm(range(len(test_entries)), desc='Processing surround view images'):
             if test_entries[idx]['scene_indice'] not in ['10']:
@@ -471,54 +474,53 @@ def main():
             mid_err += loss.item()
             count += 1
 
-            # # Visualization
-            # gt_scale_array = gt_scale_tensor[0,0].cpu().numpy()
-            # gt_scale_mask_array = gt_scale_tensor[0,1].cpu().bool().numpy()
-            # normalized_gt_scale_image = visual_scale_map_range_image(gt_scale_array, gt_scale_mask_array)
+            # 计算 Error -1 -2 -5
+            errs = compute_errs_ttc_from_scale(scale_pred[0,0], gt_scale_tensor[0,0], gt_scale_tensor[0,1])
+            for k in mid_err_pct.keys():
+                if errs[k] is not None:
+                    mid_err_pct[k] += errs[k]
 
-            # scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
-            # scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
-            # normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
+            status = eval_orientation_and_highrisk_stats(
+                ori_pred = risk_pred[0,0], 
+                ori_gt   = gt_risk_tensor[0,0], 
+                scale_pred = scale_pred[0,0],
+                scale_gt   = gt_scale_tensor[0,0],
+                valid_mask = gt_risk_tensor[0,1], 
+                )
+            orien_status.append(status)
 
-            # gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
-            # gt_risk_mask_array = gt_risk_tensor[0,1].cpu().bool().numpy()
-            # normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array, gt_risk_mask_array)
+            if VIS: 
+                gt_scale_array = gt_scale_tensor[0,0].cpu().numpy()
+                gt_scale_vis = np.clip(gt_scale_array, 0.0, 2.0)
+                gt_scale_vis = scale2rgb(gt_scale_vis)
+                gt_scale_vis = gt_scale_vis * 255.0
+                cv2.imwrite(os.path.join(output_dir, f"gt_scale_{idx}.png"), gt_scale_vis)
 
-            # risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
-            # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
+                scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
+                scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
+                vis = scale2rgb(scale_vis)
+                vis = vis * 255.0
+                cv2.imwrite(os.path.join(output_dir, f"pred_scale_{idx}.png"), vis)
 
-            gt_scale_array = gt_scale_tensor[0,0].cpu().numpy()
-            gt_scale_vis = np.clip(gt_scale_array, 0.0, 2.0)
-            gt_scale_vis = scale2rgb(gt_scale_vis)
-            gt_scale_vis = gt_scale_vis * 255.0
-            cv2.imwrite(os.path.join(output_dir, f"gt_scale_{idx}.png"), gt_scale_vis)
-            # gt_scale_mask_array = gt_scale_tensor[0,1].cpu().bool().numpy()
-            # normalized_gt_scale_image = visual_scale_map_range_image(gt_scale_array, gt_scale_mask_array)
+                gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
+                gt_risk_vis = np.clip(gt_risk_array, 0.0, np.pi)
+                gt_risk_vis = orientation2rgb(gt_risk_vis)
+                gt_risk_vis = gt_risk_vis * 255.0
+                vis_bgr = cv2.cvtColor(gt_risk_vis.astype(np.uint8), cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(output_dir, f"gt_risk_{idx}.png"), vis_bgr)
 
-            scale_prediction_array = scale_pred[0].squeeze(0).cpu().numpy()
-            scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
-            vis = scale2rgb(scale_vis)
-            vis = vis * 255.0
-            cv2.imwrite(os.path.join(output_dir, f"pred_scale_{idx}.png"), vis)
-            # scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 3.0)
-            # normalized_pred_scale_image = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
+                risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
+                risk_vis = np.clip(risk_prediction_array, 0.0, np.pi)
+                risk_vis = orientation2rgb(risk_vis)
+                risk_vis = risk_vis * 255.0
+                risk_vis = cv2.cvtColor(risk_vis.astype(np.uint8), cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(output_dir, f"pred_risk_{idx}.png"), risk_vis)
 
-            gt_risk_array = gt_risk_tensor[0,0].cpu().numpy()
-            gt_risk_vis = np.clip(gt_risk_array, 0.0, np.pi)
-            gt_risk_vis = orientation2rgb(gt_risk_vis)
-            gt_risk_vis = gt_risk_vis * 255.0
-            vis_bgr = cv2.cvtColor(gt_risk_vis.astype(np.uint8), cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(output_dir, f"gt_risk_{idx}.png"), vis_bgr)
-            # gt_risk_mask_array = gt_risk_tensor[0,1].cpu().bool().numpy()
-            # normalized_gt_risk_image = visual_risk_score_map_range_image(gt_risk_array, gt_risk_mask_array)
-
-            risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
-            risk_vis = np.clip(risk_prediction_array, 0.0, np.pi)
-            risk_vis = orientation2rgb(risk_vis)
-            risk_vis = risk_vis * 255.0
-            risk_vis = cv2.cvtColor(risk_vis.astype(np.uint8), cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(output_dir, f"pred_risk_{idx}.png"), risk_vis)
-            # normalized_pred_risk_image = visual_risk_score_map_range_image(risk_prediction_array, None)
+                # 将 augmented_prev 中的图像按照channel顺序拼接，并保存为 concat_prev_{idx}.png
+                concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
+                concat_prev = concat_prev.astype(np.uint8)
+                concat_prev_img = Image.fromarray(concat_prev)
+                concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
 
             # save prediction as .npy files
             # for collision map generation
@@ -532,26 +534,16 @@ def main():
                 }
                 np.save(os.path.join(pred_npy_subdir, f"scene_{scene_indice}_pred_{idx}.npy"), pred_data)
 
-            # Save visuals
-            # 将 augmented_prev 中的图像按照channel顺序拼接，并保存为 concat_prev_{idx}.png
-            concat_prev = np.concatenate([augmented_prev[ch] for ch in camera_channels], axis=1)
-            concat_prev = concat_prev.astype(np.uint8)
-            concat_prev_img = Image.fromarray(concat_prev)
-            concat_prev_img.save(os.path.join(output_dir, f"concat_prev_{idx}.png"))
-
-            # plt.imsave(os.path.join(output_dir, f"pred_scale_{idx}.png"),
-            #         -normalized_pred_scale_image, cmap='seismic', vmin=-1, vmax=1)
-            # plt.imsave(os.path.join(output_dir, f"gt_scale_{idx}.png"),
-            #         -normalized_gt_scale_image, cmap='seismic', vmin=-1, vmax=1)
-            # plt.imsave(os.path.join(output_dir, f"pred_risk_{idx}.png"),
-            #         -normalized_pred_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-            # plt.imsave(os.path.join(output_dir, f"gt_risk_{idx}.png"),
-            #         -normalized_gt_risk_image, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-
             # Cleanup
             del prev_batch, curr_batch, scale_pred, risk_pred
             torch.cuda.empty_cache()
         print(f"Average scale MAE on scene {scene_indice}: {mid_err/count:.4f}")
+        for k in mid_err_pct.keys():
+            print(f"Error-{k} (%): {mid_err_pct[k]/count*100:.2f}")
+        orien_final_metrics = reduce_metrics_across_frames(orien_status, beta=2.0)
+        print("Orientation and High-Risk Metrics:", orien_final_metrics)
+        
+
 
 if __name__ == "__main__":
     main()

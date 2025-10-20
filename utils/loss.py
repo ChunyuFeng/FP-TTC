@@ -340,3 +340,150 @@ def get_loss_risk_score_map(risk_score, gt_risk_score_with_mask):
     
     loss = criterion(risk_score[mask], gt_risk_score[mask])
     return loss
+
+@torch.no_grad()
+def compute_errs_ttc_from_scale(
+    scale_pred: torch.Tensor,
+    gt_scale_tensor: torch.Tensor,
+    valid_mask: torch.Tensor = None,      # 可选：True 表示该像素参与评估
+    thresholds=(1.0, 2.0, 5.0),           # 单位：秒
+    eps: float = 1e-6
+):
+    """
+    返回一个 dict: {'Err-1': float, 'Err-2': float, 'Err-5': float}
+    约定：TTC<0 视为远离（非风险），在阈值分类中当作 >max(thresholds) 处理。
+    """
+
+    assert scale_pred.shape == gt_scale_tensor.shape, "pred/gt 尺寸需一致"
+
+    # 计算 TTC = 1 / (1 - scale)，并做数值稳定处理
+    def scale_to_ttc(s: torch.Tensor) -> torch.Tensor:
+        denom = 1.0 - s
+        # 避免除零（scale=1）或极小分母
+        denom = torch.where(torch.abs(denom) < eps, torch.sign(denom) * eps, denom)
+        ttc = 0.1 / denom
+        # 负 TTC（远离）按评测习惯视为“很大”（不应落入 <T 的正类）
+        ttc = torch.where(ttc < 0, torch.tensor(float('inf'), device=ttc.device), ttc)
+        return ttc
+
+    ttc_pred = scale_to_ttc(scale_pred)
+    ttc_gt   = scale_to_ttc(gt_scale_tensor)
+
+    # 有效掩码：默认忽略 NaN/Inf
+    base_valid = torch.isfinite(ttc_pred) & torch.isfinite(ttc_gt)
+    if valid_mask is not None:
+        base_valid = base_valid & (valid_mask.bool())
+
+    num_valid = base_valid.sum().item()
+    if num_valid == 0:
+        return {f"Err-{int(t)}": float('nan') for t in thresholds}
+
+    errs = {}
+    for T in thresholds:
+        y_gt   = (ttc_gt < T)
+        y_pred = (ttc_pred < T)
+        wrong  = (y_gt != y_pred) & base_valid
+        errs[f"Err-{int(T)}"] = wrong.float().sum().item() / (scale_pred.shape[0]*scale_pred.shape[1])
+
+    return errs
+
+@torch.no_grad()
+def eval_orientation_and_highrisk_stats(
+    ori_pred: torch.Tensor,          # \hat{\theta}(p) \in [0, \pi]
+    ori_gt: torch.Tensor,            # \theta_{gt}(p) \in [0, \pi]
+    scale_pred: torch.Tensor,        # \widehat{scale}(p)
+    scale_gt: torch.Tensor,          # scale_{gt}(p)
+    valid_mask: torch.Tensor = None, # True 表示参与评估
+    tau_theta: float = 3.14159265/12.0,  # 方向容差 \tau_\theta（注意此处=pi/6）
+    tau_T: float = 2.0,              # TTC 阈值（秒）
+    delta_t: float = 0.1,            # 帧间隔（秒）
+    eps: float = 1e-12               # 数值稳定
+):
+    """
+    返回可跨帧累加的统计量：
+      {
+        'mae_num': float,   # sum |Δθ|
+        'acc_num': float,   # sum 1[|Δθ|<=τθ]
+        'N': float,         # 有效像素数
+        'TP': float, 'FP': float, 'FN': float
+      }
+    """
+
+    assert ori_pred.shape == ori_gt.shape == scale_pred.shape == scale_gt.shape, \
+        "pred/gt 张量形状需一致"
+
+    # --- scale -> TTC 稳定转换 ---
+    def scale_to_ttc(s: torch.Tensor) -> torch.Tensor:
+        denom = 1.0 - s
+        tiny = torch.abs(denom) < eps
+        denom = torch.where(tiny, torch.sign(denom) * eps, denom)
+        ttc = delta_t / denom
+        # 负 TTC(远离) 记为 +inf，不进入短TTC正类
+        ttc = torch.where(ttc < 0, torch.tensor(float('inf'), device=ttc.device), ttc)
+        return ttc
+
+    ttc_pred = scale_to_ttc(scale_pred)
+    ttc_gt   = scale_to_ttc(scale_gt)
+
+    # 有效掩码：过滤 NaN/Inf，并与外部 valid_mask 取交
+    finite_mask = (
+        torch.isfinite(ori_pred) & torch.isfinite(ori_gt) &
+        torch.isfinite(ttc_pred) & torch.isfinite(ttc_gt)
+    )
+    if valid_mask is not None:
+        finite_mask = finite_mask & valid_mask.bool()
+
+    N = finite_mask.sum().item()
+    if N == 0:
+        return {'mae_num': 0.0, 'acc_num': 0.0, 'N': 0.0,
+                'TP': 0.0, 'FP': 0.0, 'FN': 0.0}
+
+    # 裁剪到有效像素
+    op = ori_pred[finite_mask]
+    og = ori_gt[finite_mask]
+    tp = ttc_pred[finite_mask]
+    tg = ttc_gt[finite_mask]
+
+    # |Δθ| 与 Acc@τθ 的计数
+    abs_dtheta = torch.abs(op - og)
+    mae_num = torch.sum(abs_dtheta).item()
+    acc_num = torch.sum((abs_dtheta <= tau_theta).float()).item()
+
+    # 高风险二分类标签
+    y_gt  = (tg < tau_T) & (og <= tau_theta)
+    y_hat = (tp < tau_T) & (op <= tau_theta)
+
+    TP = torch.sum(y_hat & y_gt).item()
+    FP = torch.sum(y_hat & (~y_gt)).item()
+    FN = torch.sum((~y_hat) & y_gt).item()
+
+    return {'mae_num': mae_num, 'acc_num': acc_num, 'N': float(N),
+            'TP': float(TP), 'FP': float(FP), 'FN': float(FN)}
+
+def reduce_metrics_across_frames(stats_list, beta=2.0, eps=1e-12):
+    # 累加原子统计量
+    mae_num = sum(d['mae_num'] for d in stats_list)
+    acc_num = sum(d['acc_num'] for d in stats_list)
+    N       = sum(d['N']       for d in stats_list)
+
+    TP = sum(d['TP'] for d in stats_list)
+    FP = sum(d['FP'] for d in stats_list)
+    FN = sum(d['FN'] for d in stats_list)
+
+    # micro-average（先合并，再算比值）
+    mae = mae_num / max(1.0, N)
+    acc = acc_num / max(1.0, N)
+
+    prec = TP / max(eps, TP + FP)
+    rec  = TP / max(eps, TP + FN)
+
+    b2 = beta * beta
+    fbeta = (1 + b2) * prec * rec / max(eps, b2 * prec + rec)
+
+    return {
+        'MAE_theta': mae,
+        'Acc@tau_theta': acc,
+        'Precision': prec,
+        'Recall': rec,
+        'HR-Fbeta': fbeta
+    }
