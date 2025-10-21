@@ -154,6 +154,18 @@ parser.add_argument(
 parser.add_argument('--neptune', action='store_true',
                     help='use neptune for logging')
 
+
+# RVT teacher->student 退火超参
+parser.add_argument('--alpha_start', type=float, default=1.0,
+                    help='alpha at the beginning (0~10% steps)')
+parser.add_argument('--alpha_end', type=float, default=0.0,
+                    help='alpha at the end (80~100% steps)')
+parser.add_argument('--alpha_hold', type=float, default=0.10,
+                    help='fraction of total steps to hold alpha=alpha_start (e.g., 0.10 for 10%)')
+parser.add_argument('--alpha_decay_end', type=float, default=0.80,
+                    help='fraction of total steps when alpha reaches alpha_end (e.g., 0.80 for 80%)')
+
+
 args = parser.parse_args()
 
 if args.parallel:

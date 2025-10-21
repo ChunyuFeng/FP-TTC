@@ -5,12 +5,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=8 torchrun --standalone --nnodes=1 
 --attn_splits_list 2 8 \
 --corr_radius_list -1 4 \
 --prop_radius_list -1 1 \
---epoch 2400 \
 --lr 4e-5 \
---batch_size 3 \
 --stage 'nuscenes_range_image' \
 --train_stage 'scale' \
---scale_epochs 1502 \
+--scale_epochs 602 \
 --scale_batch_size 11 \
 --image_size 160 320 \
 --resume ./pretrained/new/1000y.pth.tar \

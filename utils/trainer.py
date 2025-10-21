@@ -95,6 +95,13 @@ class TTCTrainer(object):
 
         self.neptune_run = neptune_run
 
+        # ===== RVT Teacher->Student 退火超参 =====
+        self.alpha_start = getattr(args, "alpha_start", 1.0)
+        self.alpha_end   = getattr(args, "alpha_end",   0.0)
+        # 你要的 10% / 80% 断点
+        self.alpha_hold       = getattr(args, "alpha_hold", 0.10)          # 前 10% 步数 alpha=1
+        self.alpha_decay_end  = getattr(args, "alpha_decay_end", 0.80)     # 在 80% 时降到 0
+ 
 
     def train(self):
         out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
@@ -169,6 +176,20 @@ class TTCTrainer(object):
             # sensor_metas                 = sensor_metas.to(self.device)
 
             self.optimizer.zero_grad()
+
+            # === 设置 RVT 的退火系数 alpha（Teacher→Student） ===
+            total_steps = self.epoch * len(self.train_loader)
+            global_step = epoch * len(self.train_loader) + i
+            alpha_now = self._compute_alpha(global_step, total_steps)
+
+            model_ref = self.model.module if hasattr(self.model, "module") else self.model
+            model_ref.set_anneal_alpha(alpha_now)
+
+            if self.neptune_run is not None and is_main_process():
+                self.neptune_run["train/alpha"].append(alpha_now, step=global_step)
+            elif is_main_process() and (i % 200 == 0):
+                print(f"[alpha] step {global_step}/{total_steps} -> {alpha_now:.4f}")
+
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
             if hasattr(self.model, "module"):
                 scale, risk_score, loss_s, loss_r = self.model.module.forward_with_loss(
@@ -295,6 +316,26 @@ class TTCTrainer(object):
                 tag = f"train/epoch_learning_rate_group_{group_idx}"
                 self.neptune_run[tag].append(pg["lr"], step=epoch)
     
+    def _compute_alpha(self, global_step: int, total_steps: int) -> float:
+        """
+        0%~alpha_hold:           alpha = alpha_start
+        alpha_hold~alpha_decay_end: 线性衰减到 alpha_end
+        alpha_decay_end~100%:    alpha = alpha_end
+        """
+        if total_steps <= 0:
+            return float(self.alpha_end)
+
+        f = float(global_step) / float(total_steps)  # [0,1]
+        f = max(0.0, min(1.0, f))
+
+        if f <= self.alpha_hold:
+            return float(self.alpha_start)
+        elif f <= self.alpha_decay_end:
+            t = (f - self.alpha_hold) / max(1e-8, (self.alpha_decay_end - self.alpha_hold))
+            return float(self.alpha_start + (self.alpha_end - self.alpha_start) * t)
+        else:
+            return float(self.alpha_end)
+
     def _weighted_loss(self, keys_s, keys_r, loss_s, loss_r, model_ref):
         """
         根据两个分支的梯度范数，动态计算权重 w_s, w_r，

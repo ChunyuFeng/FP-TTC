@@ -127,6 +127,7 @@ class FpTTC(nn.Module):
             fov_down=-15.0
         )
         
+        self.register_buffer("anneal_alpha", torch.tensor(1.0))  # [0,1]
 
     def forward(
         self,
@@ -191,70 +192,161 @@ class FpTTC(nn.Module):
         corr_bv = corr.view(B, V, Cc, Hc, Wc)
         corr_list = [corr_bv[:, v] for v in range(V)]          # list[V] of [B,2,Hc,Wc]
 
-        # ====== 传统投影（不使用 RVT） ======
-        # 1) 风险/尺度的“相关性特征”投影（当前帧）
-        corr_range_init = self.project_views_to_range(
-            corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
-        )  # -> [B, Cc, H_r, W_r]
+        # # ====== 传统投影（不使用 RVT） ======
+        # # 1) 风险/尺度的“相关性特征”投影（当前帧）
+        # corr_range_init = self.project_views_to_range(
+        #     corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
+        # )  # -> [B, Cc, H_r, W_r]
 
-        # 2) 每个尺度的多视角特征投影
-        multi_level_ranges_prev_init, multi_level_ranges_curr_init = [], []
-        for lvl in range(self.num_scales):
-            scale = 2 ** (self.num_scales - 1 - lvl)
-            if scale > 1:
-                proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
-                proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
-            else:
-                proj_prev_lvl = proj_pix_prev
-                proj_curr_lvl = proj_pix_curr
+        # # 2) 每个尺度的多视角特征投影
+        # multi_level_ranges_prev_init, multi_level_ranges_curr_init = [], []
+        # for lvl in range(self.num_scales):
+        #     scale = 2 ** (self.num_scales - 1 - lvl)
+        #     if scale > 1:
+        #         proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
+        #         proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
+        #     else:
+        #         proj_prev_lvl = proj_pix_prev
+        #         proj_curr_lvl = proj_pix_curr
 
-            # 组建 list[V] of [B,C,Hs,Ws]
-            prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
-            curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
+        #     # 组建 list[V] of [B,C,Hs,Ws]
+        #     prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
+        #     curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
 
-            range_prev = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
-            range_curr = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
+        #     range_prev = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
+        #     range_curr = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
 
-            multi_level_ranges_prev_init.append(range_prev)  # [B,C,Hr,Wr]
-            multi_level_ranges_curr_init.append(range_curr)
-        # ====== 传统投影（不使用 RVT） ======
+        #     multi_level_ranges_prev_init.append(range_prev)  # [B,C,Hr,Wr]
+        #     multi_level_ranges_curr_init.append(range_curr)
+        # # ====== 传统投影（不使用 RVT） ======
 
-        # ====== 基于 RVT 将多视角特征图聚合到 Range View ======
-        # corr -> range（当前帧）
-        corr_encoded_list = [self.conv_corr_rvt_in(c) for c in corr_list]  # list[V] of [B, Ccorr, Hc, Wc]
-        H_r = corr_encoded_list[0].shape[2]
-        W_r = corr_encoded_list[0].shape[3] * V
-        # 将每个视角的 corr_encoded_list 在 W 维度横向拼接，作为初始查询
-        # ini_corr_query = torch.cat(corr_encoded_list, dim=3)  # [B, Ccorr, Hc, Wc*V]
-        corr_range_init = self.conv_corr_rvt_in(corr_range_init.detach())
+        # # ====== 基于 RVT 将多视角特征图聚合到 Range View ======
+        # # corr -> range（当前帧）
+        # corr_encoded_list = [self.conv_corr_rvt_in(c) for c in corr_list]  # list[V] of [B, Ccorr, Hc, Wc]
+        # H_r = corr_encoded_list[0].shape[2]
+        # W_r = corr_encoded_list[0].shape[3] * V
+        # # 将每个视角的 corr_encoded_list 在 W 维度横向拼接，作为初始查询
+        # # ini_corr_query = torch.cat(corr_encoded_list, dim=3)  # [B, Ccorr, Hc, Wc*V]
+        # corr_range_init = self.conv_corr_rvt_in(corr_range_init.detach())
+        # corr_range = self.rvt_corr(
+        #     feats_by_cam=corr_encoded_list,
+        #     cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
+        #     cam_R=[sensor_metas['curr'][cam]['R_l2c'] for cam in self.camera_channels],
+        #     cam_t=[sensor_metas['curr'][cam]['t_l2c'] for cam in self.camera_channels],
+        #     affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
+        #     Hr=H_r, Wr=W_r,
+        #     depth_bins=self.depth_bins,
+        #     ini_query=corr_range_init
+        # )
+
+        # # 多尺度特征 -> range（前/当前帧）
+        # multi_level_ranges_prev, multi_level_ranges_curr = [], []
+        # for lvl in range(self.num_scales):
+        #     prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
+        #     curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
+        #     H_r = prev_feats_list[0].shape[2]
+        #     W_r = prev_feats_list[0].shape[3] * V
+
+        #     range_prev = self.rvt_feat[lvl](
+        #         feats_by_cam=prev_feats_list,
+        #         cam_K=[sensor_metas['prev'][cam]['K']     for cam in self.camera_channels],
+        #         cam_R=[sensor_metas['prev'][cam]['R_l2c'] for cam in self.camera_channels],
+        #         cam_t=[sensor_metas['prev'][cam]['t_l2c'] for cam in self.camera_channels],
+        #         affine_M=[sensor_metas['prev'][cam]['affine'] for cam in self.camera_channels],
+        #         Hr=H_r, Wr=W_r,
+        #         depth_bins=self.depth_bins,
+        #         ini_query=multi_level_ranges_prev_init[lvl].detach()  # 传统投影结果作为初始查询
+        #     )
+        #     range_curr = self.rvt_feat[lvl](
+        #         feats_by_cam=curr_feats_list,
+        #         cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
+        #         cam_R=[sensor_metas['curr'][cam]['R_l2c'] for cam in self.camera_channels],
+        #         cam_t=[sensor_metas['curr'][cam]['t_l2c'] for cam in self.camera_channels],
+        #         affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
+        #         Hr=H_r, Wr=W_r,
+        #         depth_bins=self.depth_bins,
+        #         ini_query=multi_level_ranges_curr_init[lvl].detach()  # 传统投影结果作为初始查询
+        #     )
+        #     multi_level_ranges_prev.append(range_prev)  # [B,C,Hr,Wr]
+        #     multi_level_ranges_curr.append(range_curr)
+                # ====================== Teacher/Student 查询初始化（统一管理） ======================
+        # 训练期：alpha>0 时启用 DA teacher 初始化；推理期/alpha=0 时只用 student
+        alpha = float(self.anneal_alpha.item()) if self.training else 0.0
+        use_teacher = (alpha > 0.0)
+
+        # ---------- (A) corr 路：构造 student/teacher 的 ini_query ----------
+        # Student：各相机的 corr（2ch -> 128ch）先编码，再按宽拼接
+        corr_encoded_list = [self.conv_corr_rvt_in(c) for c in corr_list]  # list[V]: [B,C,Hc,Wc]
+        H_r_corr = corr_encoded_list[0].shape[2]
+        W_r_corr = corr_encoded_list[0].shape[3] * V
+        q_student_corr = torch.cat(corr_encoded_list, dim=3)               # [B,C,Hr,Wr]
+
+        # Teacher：只有在训练且 alpha>0 时才用 DA 的投影结果来做初始 query
+        if use_teacher:
+            with torch.no_grad():  # teacher 路不反传
+                corr_range_teacher = self.project_views_to_range(
+                    corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
+                )                                                      # [B, 2, Hr, Wr]
+                corr_range_teacher = self.conv_corr_rvt_in(corr_range_teacher)  # [B, C, Hr, Wr]
+        else:
+            corr_range_teacher = None
+
+        # 混合初始化（推理期自动退化为 student-only）
+        if (use_teacher and corr_range_teacher is not None):
+            ini_corr_query = alpha * corr_range_teacher.detach() + (1.0 - alpha) * q_student_corr
+        else:
+            ini_corr_query = q_student_corr
+
+        # 进入 RVT（corr 聚合）
         corr_range = self.rvt_corr(
-            feats_by_cam=corr_encoded_list,
+            feats_by_cam=corr_encoded_list,   # RVT 采样来自几何，相机级特征仍按列表输入
             cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
             cam_R=[sensor_metas['curr'][cam]['R_l2c'] for cam in self.camera_channels],
             cam_t=[sensor_metas['curr'][cam]['t_l2c'] for cam in self.camera_channels],
             affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
-            Hr=H_r, Wr=W_r,
+            Hr=H_r_corr, Wr=W_r_corr,
             depth_bins=self.depth_bins,
-            ini_query=corr_range_init
+            ini_query=ini_corr_query
         )
 
-        # 多尺度特征 -> range（前/当前帧）
+        # ---------- (B) 多尺度图像特征路：同样用 teacher/student 统一逻辑 ----------
         multi_level_ranges_prev, multi_level_ranges_curr = [], []
+
         for lvl in range(self.num_scales):
-            prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
+            # per-camera 特征列表（保持给 RVT 的 feats_by_cam 接口）
+            prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]  # list[V]: [B,C,Hs,Ws]
             curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
             H_r = prev_feats_list[0].shape[2]
             W_r = prev_feats_list[0].shape[3] * V
 
+            # Student：按宽拼接，直接作为 ini_query
+            q_student_prev = torch.cat(prev_feats_list, dim=3)  # [B,C,Hr,Wr]
+            q_student_curr = torch.cat(curr_feats_list, dim=3)
+
+            # Teacher：仅在 use_teacher 时用 DA 硬投影（注意：按尺度下采样 proj_pix_*）
+            if use_teacher:
+                scale = 2 ** (self.num_scales - 1 - lvl)
+                proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :] if scale > 1 else proj_pix_prev
+                proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :] if scale > 1 else proj_pix_curr
+                with torch.no_grad():
+                    t_prev = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
+                    t_curr = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
+            else:
+                t_prev = t_curr = None
+
+            # 混合初始化（推理期就只用 student）
+            ini_prev = (alpha * t_prev.detach() + (1.0 - alpha) * q_student_prev) if (use_teacher and t_prev is not None) else q_student_prev
+            ini_curr = (alpha * t_curr.detach() + (1.0 - alpha) * q_student_curr) if (use_teacher and t_curr is not None) else q_student_curr
+
+            # RVT 聚合（同一摄像头集合作为 levels；几何采样依赖 K/R/t/affine，不依赖 proj_pix_*）
             range_prev = self.rvt_feat[lvl](
                 feats_by_cam=prev_feats_list,
                 cam_K=[sensor_metas['prev'][cam]['K']     for cam in self.camera_channels],
                 cam_R=[sensor_metas['prev'][cam]['R_l2c'] for cam in self.camera_channels],
                 cam_t=[sensor_metas['prev'][cam]['t_l2c'] for cam in self.camera_channels],
                 affine_M=[sensor_metas['prev'][cam]['affine'] for cam in self.camera_channels],
-                Hr=H_r, Wr=W_r,
-                depth_bins=self.depth_bins,
-                ini_query=multi_level_ranges_prev_init[lvl].detach()  # 传统投影结果作为初始查询
+                Hr=H_r, Wr=W_r, depth_bins=self.depth_bins,
+                ini_query=ini_prev
             )
             range_curr = self.rvt_feat[lvl](
                 feats_by_cam=curr_feats_list,
@@ -262,11 +354,10 @@ class FpTTC(nn.Module):
                 cam_R=[sensor_metas['curr'][cam]['R_l2c'] for cam in self.camera_channels],
                 cam_t=[sensor_metas['curr'][cam]['t_l2c'] for cam in self.camera_channels],
                 affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
-                Hr=H_r, Wr=W_r,
-                depth_bins=self.depth_bins,
-                ini_query=multi_level_ranges_curr_init[lvl].detach()  # 传统投影结果作为初始查询
+                Hr=H_r, Wr=W_r, depth_bins=self.depth_bins,
+                ini_query=ini_curr
             )
-            multi_level_ranges_prev.append(range_prev)  # [B,C,Hr,Wr]
+            multi_level_ranges_prev.append(range_prev)
             multi_level_ranges_curr.append(range_curr)
 
 
@@ -431,3 +522,13 @@ class FpTTC(nn.Module):
                             .permute(0,2,1) \
                             .reshape(B, C, H_r, W_r)
         return range_feat
+    
+    # === 便捷接口：设置/读取退火系数 ===
+    @torch.no_grad()
+    def set_anneal_alpha(self, alpha: float):
+        alpha = float(alpha)
+        self.anneal_alpha.fill_(max(0.0, min(1.0, alpha)))
+
+    def get_anneal_alpha(self) -> float:
+        return float(self.anneal_alpha.item())
+
