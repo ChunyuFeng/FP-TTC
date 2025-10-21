@@ -83,8 +83,8 @@ class FpTTC(nn.Module):
                                  head_type        = 'scale')
 
         # Risk 分支
-        self.conv_corr_risk = CorrEncoder(dim_in  = 2,
-                                          dim_out = feature_channels+1)
+        self.conv_corr_rvt_out_risk = CorrEncoder(dim_in  = feature_channels,
+                                                  dim_out = feature_channels+1)
         self.risk_net = ScaleNet(num_scales       = num_scales,
                                  feature_channels = feature_channels,
                                  upsample_factor  = upsample_factor,
@@ -283,7 +283,7 @@ class FpTTC(nn.Module):
             return scales, None
 
         # risk 分支
-        corr_encoded = self.conv_corr_risk(corr_range)
+        corr_encoded = self.conv_corr_rvt_out_risk(corr_range)
         initial_risk = corr_encoded[:, :1]
         corr_encoded = corr_encoded[:, 1:]
         risk_score = self.risk_net(

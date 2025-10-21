@@ -342,7 +342,9 @@ def main():
     if args.train_stage in ('risk', 'both'):
         # 1) freeze scale branch
         freeze_prefixes = (
-            'cnet.','featnet.','corrnet.','conv_corr.','scale_net.'
+            'cnet.','featnet.','corrnet.',
+            'conv_corr_rvt_in.', 'conv_corr_rvt_out', 
+            'scale_net.', 'rvt_feat', 'rvt_corr'
         )
 
         for name, p in model.named_parameters():
