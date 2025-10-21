@@ -9,10 +9,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=8 torchrun --standalone --nnodes=1 
 --lr 4e-5 \
 --batch_size 3 \
 --stage 'nuscenes_range_image' \
+--train_stage 'scale' \
+--scale_epochs 1502 \
+--scale_batch_size 11 \
 --image_size 160 320 \
---finetune \
---ft_epoch_s1 0 \
---ft_epoch_s2 200 \
---resume ./pretrained/surroundttc_v1.pth.tar \
---neptune \
+--resume ./pretrained/new/1000y.pth.tar \
 --parallel
