@@ -279,23 +279,26 @@ class FpTTC(nn.Module):
         corr_encoded_list = [self.conv_corr_rvt_in(c) for c in corr_list]  # list[V]: [B,C,Hc,Wc]
         H_r_corr = corr_encoded_list[0].shape[2]
         W_r_corr = corr_encoded_list[0].shape[3] * V
-        q_student_corr = torch.cat(corr_encoded_list, dim=3)               # [B,C,Hr,Wr]
 
-        # Teacher：只有在训练且 alpha>0 时才用 DA 的投影结果来做初始 query
+        # ★ 学生端改为 0-init（和 Teacher 同形状/同 dtype/device）
+        q_zero_corr = torch.zeros(
+            B, corr_encoded_list[0].shape[1], H_r_corr, W_r_corr,
+            device=corr_encoded_list[0].device, dtype=corr_encoded_list[0].dtype
+        )
+
         if use_teacher:
-            with torch.no_grad():  # teacher 路不反传
+            with torch.no_grad():
                 corr_range_teacher = self.project_views_to_range(
                     corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
-                )                                                      # [B, 2, Hr, Wr]
-                corr_range_teacher = self.conv_corr_rvt_in(corr_range_teacher)  # [B, C, Hr, Wr]
+                )  # [B, 2, Hr, Wr]
+                corr_range_teacher = self.conv_corr_rvt_in(corr_range_teacher)  # [B,C,Hr,Wr]
         else:
             corr_range_teacher = None
 
-        # 混合初始化（推理期自动退化为 student-only）
-        if (use_teacher and corr_range_teacher is not None):
-            ini_corr_query = alpha * corr_range_teacher.detach() + (1.0 - alpha) * q_student_corr
-        else:
-            ini_corr_query = q_student_corr
+        # ★ 退火：从 DA → 0-init
+        ini_corr_query = (alpha * corr_range_teacher.detach() + (1.0 - alpha) * q_zero_corr) \
+                        if (use_teacher and corr_range_teacher is not None) else q_zero_corr
+
 
         # 进入 RVT（corr 聚合）
         corr_range = self.rvt_corr(
@@ -314,16 +317,16 @@ class FpTTC(nn.Module):
 
         for lvl in range(self.num_scales):
             # per-camera 特征列表（保持给 RVT 的 feats_by_cam 接口）
-            prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]  # list[V]: [B,C,Hs,Ws]
+            prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
             curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
             H_r = prev_feats_list[0].shape[2]
             W_r = prev_feats_list[0].shape[3] * V
+            C_ = prev_feats_list[0].shape[1]
 
-            # Student：按宽拼接，直接作为 ini_query
-            q_student_prev = torch.cat(prev_feats_list, dim=3)  # [B,C,Hr,Wr]
-            q_student_curr = torch.cat(curr_feats_list, dim=3)
+            # ★ 学生端改为 0-init
+            q_zero_prev = torch.zeros(B, C_, H_r, W_r, device=prev_feats_list[0].device, dtype=prev_feats_list[0].dtype)
+            q_zero_curr = torch.zeros(B, C_, H_r, W_r, device=curr_feats_list[0].device, dtype=curr_feats_list[0].dtype)
 
-            # Teacher：仅在 use_teacher 时用 DA 硬投影（注意：按尺度下采样 proj_pix_*）
             if use_teacher:
                 scale = 2 ** (self.num_scales - 1 - lvl)
                 proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :] if scale > 1 else proj_pix_prev
@@ -334,9 +337,9 @@ class FpTTC(nn.Module):
             else:
                 t_prev = t_curr = None
 
-            # 混合初始化（推理期就只用 student）
-            ini_prev = (alpha * t_prev.detach() + (1.0 - alpha) * q_student_prev) if (use_teacher and t_prev is not None) else q_student_prev
-            ini_curr = (alpha * t_curr.detach() + (1.0 - alpha) * q_student_curr) if (use_teacher and t_curr is not None) else q_student_curr
+            # ★ 退火：从 DA → 0-init
+            ini_prev = (alpha * t_prev.detach() + (1.0 - alpha) * q_zero_prev) if (use_teacher and t_prev is not None) else q_zero_prev
+            ini_curr = (alpha * t_curr.detach() + (1.0 - alpha) * q_zero_curr) if (use_teacher and t_curr is not None) else q_zero_curr
 
             # RVT 聚合（同一摄像头集合作为 levels；几何采样依赖 K/R/t/affine，不依赖 proj_pix_*）
             range_prev = self.rvt_feat[lvl](
