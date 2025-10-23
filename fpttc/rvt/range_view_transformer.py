@@ -314,6 +314,60 @@ class RangeViewTransformer(nn.Module):
         samp = samp.unsqueeze(2).repeat(1, 1, self.nhead, 1, 1, 1)
         msk  =  msk.unsqueeze(2).repeat(1, 1, self.nhead, 1, 1)
         return samp, msk
+    
+    def geom_bootstrap(self,
+                       feats_by_cam,         # list(L) of [B, C_in, Hf, Wf]
+                       cam_K, cam_R, cam_t,  # list(L) of [B,3,3],[B,3,3],[B,3]或[B,3,1]
+                       affine_M,             # list(L) of [B,3,3]
+                       Hr, Wr,
+                       depth_bins=None):
+        """
+        用与 forward 相同的几何参考点 (ext_loc) + 可见性 (vis_mask)，
+        对“原始每相机特征”做一次 MSDeformAttn 聚合（H=1，值通道=C_in），
+        得到无缝的 Range-View 初值 [B, C_in, Hr, Wr]。
+        """
+        B, C_in, _, _ = feats_by_cam[0].shape
+        device = feats_by_cam[0].device
+
+        # pack 原始值（不加 level_embed，不做 1x1 到 d_model）
+        value_lvls, spatial_shapes, lvl_start, in_sizes = self._pack_levels(feats_by_cam)  # list(L)[B,HW,C_in]
+        value_cat = torch.cat(value_lvls, dim=1)           # [B, S=sum(HW_l), C_in]
+        value     = value_cat.unsqueeze(2)                 # [B, S, 1, C_in] (H=1)
+
+        # 深度 bins
+        if depth_bins is None:
+            d_min, d_max = 1.0, 40.0
+            K = self.num_points
+            depth_bins = torch.logspace(math.log10(d_min), math.log10(d_max), K, device=device)
+        else:
+            K = depth_bins.numel()
+            assert K == self.num_points, f"num_points({self.num_points}) != len(depth_bins)({K})"
+
+        # 几何采样点与可见性掩码
+        ext_loc, vis_mask = self._make_geom_sampling(
+            B, Hr, Wr, depth_bins, cam_K, cam_R, cam_t, affine_M, in_sizes
+        )  # [B,Q,H,L,K,2], [B,Q,H,L,K]  (H = nhead)
+
+        # 只取一个 head（H=1），因为这里不做多头拆分
+        ext_loc_h1  = ext_loc[:, :, 0:1, :, :, :]            # [B,Q,1,L,K,2]
+        ext_attn_h1 = vis_mask.float()[:, :, 0:1, :, :]      # [B,Q,1,L,K]
+        # 在 L×K 上归一化
+        ext_attn_h1 = ext_attn_h1 / ext_attn_h1.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+
+        value = value.contiguous().float()
+        ext_loc_h1  = ext_loc_h1.contiguous().float()
+        ext_attn_h1 = ext_attn_h1.contiguous().float()
+        spatial_shapes   = spatial_shapes.contiguous()
+        level_start_index = lvl_start.contiguous()
+        
+        # 单次 DeformableAttn：输出 [B, Q, 1*C_in] = [B, Q, C_in]
+        out = MSDeformAttn.apply(
+            value, spatial_shapes, lvl_start, ext_loc_h1, ext_attn_h1
+        )
+
+
+        return out.view(B, Hr, Wr, C_in).permute(0, 3, 1, 2).contiguous()  # [B, C_in, Hr, Wr]
+
 
     def forward(self,
                 feats_by_cam,         # list(L) of [B, C_in, Hf, Wf]

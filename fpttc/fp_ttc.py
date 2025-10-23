@@ -280,10 +280,14 @@ class FpTTC(nn.Module):
         H_r_corr = corr_encoded_list[0].shape[2]
         W_r_corr = corr_encoded_list[0].shape[3] * V
 
-        # ★ 学生端改为 0-init（和 Teacher 同形状/同 dtype/device）
-        q_zero_corr = torch.zeros(
-            B, corr_encoded_list[0].shape[1], H_r_corr, W_r_corr,
-            device=corr_encoded_list[0].device, dtype=corr_encoded_list[0].dtype
+        # ★ 学生端：几何无缝聚合（geom_bootstrap），不再拼接、不再 0-init
+        q_student_corr = self.rvt_corr.geom_bootstrap(
+            feats_by_cam=corr_encoded_list,
+            cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
+            cam_R=[sensor_metas['curr'][cam]['R_l2c'] for cam in self.camera_channels],
+            cam_t=[sensor_metas['curr'][cam]['t_l2c'] for cam in self.camera_channels],
+            affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
+            Hr=H_r_corr, Wr=W_r_corr, depth_bins=self.depth_bins
         )
 
         if use_teacher:
@@ -295,10 +299,9 @@ class FpTTC(nn.Module):
         else:
             corr_range_teacher = None
 
-        # ★ 退火：从 DA → 0-init
-        ini_corr_query = (alpha * corr_range_teacher.detach() + (1.0 - alpha) * q_zero_corr) \
-                        if (use_teacher and corr_range_teacher is not None) else q_zero_corr
-
+        # ★ 退火：从 DA（teacher） → 几何无缝（student）
+        ini_corr_query = (alpha * corr_range_teacher.detach() + (1.0 - alpha) * q_student_corr) \
+                        if (use_teacher and corr_range_teacher is not None) else q_student_corr
 
         # 进入 RVT（corr 聚合）
         corr_range = self.rvt_corr(
@@ -324,9 +327,23 @@ class FpTTC(nn.Module):
             C_ = prev_feats_list[0].shape[1]
 
             # ★ 学生端改为 0-init
-            q_zero_prev = torch.zeros(B, C_, H_r, W_r, device=prev_feats_list[0].device, dtype=prev_feats_list[0].dtype)
-            q_zero_curr = torch.zeros(B, C_, H_r, W_r, device=curr_feats_list[0].device, dtype=curr_feats_list[0].dtype)
-
+            # ★ 学生端：几何无缝聚合（prev / curr）
+            q_student_prev = self.rvt_feat[lvl].geom_bootstrap(
+                feats_by_cam=prev_feats_list,
+                cam_K=[sensor_metas['prev'][cam]['K']     for cam in self.camera_channels],
+                cam_R=[sensor_metas['prev'][cam]['R_l2c'] for cam in self.camera_channels],
+                cam_t=[sensor_metas['prev'][cam]['t_l2c'] for cam in self.camera_channels],
+                affine_M=[sensor_metas['prev'][cam]['affine'] for cam in self.camera_channels],
+                Hr=H_r, Wr=W_r, depth_bins=self.depth_bins
+            )
+            q_student_curr = self.rvt_feat[lvl].geom_bootstrap(
+                feats_by_cam=curr_feats_list,
+                cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
+                cam_R=[sensor_metas['curr'][cam]['R_l2c'] for cam in self.camera_channels],
+                cam_t=[sensor_metas['curr'][cam]['t_l2c'] for cam in self.camera_channels],
+                affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
+                Hr=H_r, Wr=W_r, depth_bins=self.depth_bins
+            )
             if use_teacher:
                 scale = 2 ** (self.num_scales - 1 - lvl)
                 proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :] if scale > 1 else proj_pix_prev
@@ -338,9 +355,8 @@ class FpTTC(nn.Module):
                 t_prev = t_curr = None
 
             # ★ 退火：从 DA → 0-init
-            ini_prev = (alpha * t_prev.detach() + (1.0 - alpha) * q_zero_prev) if (use_teacher and t_prev is not None) else q_zero_prev
-            ini_curr = (alpha * t_curr.detach() + (1.0 - alpha) * q_zero_curr) if (use_teacher and t_curr is not None) else q_zero_curr
-
+            ini_prev = (alpha * t_prev.detach() + (1.0 - alpha) * q_student_prev) if (use_teacher and t_prev is not None) else q_student_prev
+            ini_curr = (alpha * t_curr.detach() + (1.0 - alpha) * q_student_curr) if (use_teacher and t_curr is not None) else q_student_curr
             # RVT 聚合（同一摄像头集合作为 levels；几何采样依赖 K/R/t/affine，不依赖 proj_pix_*）
             range_prev = self.rvt_feat[lvl](
                 feats_by_cam=prev_feats_list,

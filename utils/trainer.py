@@ -96,11 +96,14 @@ class TTCTrainer(object):
         self.neptune_run = neptune_run
 
         # ===== RVT Teacher->Student 退火超参 =====
-        self.alpha_start = getattr(args, "alpha_start", 1.0)
-        self.alpha_end   = getattr(args, "alpha_end",   0.0)
-        # 你要的 10% / 80% 断点
-        self.alpha_hold       = getattr(args, "alpha_hold", 0.10)          # 前 10% 步数 alpha=1
-        self.alpha_decay_end  = getattr(args, "alpha_decay_end", 0.80)     # 在 80% 时降到 0
+        # ===== RVT Teacher->Student 退火超参（改成三段式）=====
+        self.alpha_start = getattr(args, "alpha_start", 1.0)   # 典型 1.0
+        self.alpha_end   = getattr(args, "alpha_end",   0.0)   # 典型 0.0
+        # 三段占比 [hold, anneal, tail]，默认 [0.10, 0.80, 0.10]
+        pcts = getattr(args, "alpha_pcts", [0.10, 0.80, 0.10])
+        assert abs(sum(pcts) - 1.0) < 1e-6, "alpha_pcts must sum to 1.0"
+        self.alpha_hold, self.alpha_anneal, self.alpha_tail = pcts
+
  
 
     def train(self):
@@ -318,23 +321,21 @@ class TTCTrainer(object):
     
     def _compute_alpha(self, global_step: int, total_steps: int) -> float:
         """
-        0%~alpha_hold:           alpha = alpha_start
-        alpha_hold~alpha_decay_end: 线性衰减到 alpha_end
-        alpha_decay_end~100%:    alpha = alpha_end
+        0~hold: alpha = alpha_start
+        hold~hold+anneal: 线性从 alpha_start -> alpha_end
+        之后: alpha = alpha_end
         """
-        if total_steps <= 0:
-            return float(self.alpha_end)
-
-        f = float(global_step) / float(total_steps)  # [0,1]
-        f = max(0.0, min(1.0, f))
-
-        if f <= self.alpha_hold:
+        t = global_step / max(1, total_steps)
+        if t <= self.alpha_hold:
             return float(self.alpha_start)
-        elif f <= self.alpha_decay_end:
-            t = (f - self.alpha_hold) / max(1e-8, (self.alpha_decay_end - self.alpha_hold))
-            return float(self.alpha_start + (self.alpha_end - self.alpha_start) * t)
-        else:
-            return float(self.alpha_end)
+
+        if t <= (self.alpha_hold + self.alpha_anneal):
+            # 线性段
+            u = (t - self.alpha_hold) / max(1e-6, self.alpha_anneal)
+            return float(self.alpha_start + (self.alpha_end - self.alpha_start) * u)
+
+        return float(self.alpha_end)
+
 
     def _weighted_loss(self, keys_s, keys_r, loss_s, loss_r, model_ref):
         """

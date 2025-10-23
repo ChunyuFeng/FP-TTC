@@ -156,14 +156,14 @@ parser.add_argument('--neptune', action='store_true',
 
 
 # RVT teacher->student 退火超参
+# --- annealing schedule for DA->student ---
 parser.add_argument('--alpha_start', type=float, default=1.0,
-                    help='alpha at the beginning (0~10% steps)')
-parser.add_argument('--alpha_end', type=float, default=0.0,
-                    help='alpha at the end (80~100% steps)')
-parser.add_argument('--alpha_hold', type=float, default=0.10,
-                    help='fraction of total steps to hold alpha=alpha_start (e.g., 0.10 for 10%)')
-parser.add_argument('--alpha_decay_end', type=float, default=0.80,
-                    help='fraction of total steps when alpha reaches alpha_end (e.g., 0.80 for 80%)')
+                    help='alpha at the beginning (teacher weight)')
+parser.add_argument('--alpha_end',   type=float, default=0.0,
+                    help='alpha at the end')
+# [hold, anneal, tail] percentages that must sum to 1.0
+parser.add_argument('--alpha_pcts',  type=float, nargs=3, default=[0.10, 0.80, 0.10],
+                    help='piecewise schedule: [0-10%]=hold, [10-80%]=linear, [80-100%]=tail')
 
 
 args = parser.parse_args()
