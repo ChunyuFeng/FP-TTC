@@ -95,6 +95,146 @@ class TTCTrainer(object):
 
         self.neptune_run = neptune_run
 
+        # ===== RVT 蒸馏阶段配置 =====
+        self.rvt_pretrain_epochs = getattr(args, "rvt_pretrain_epochs", 0)
+        self.rvt_lam_corr = getattr(args, "rvt_lam_corr", 1.0)
+        self.rvt_lam_feat = getattr(args, "rvt_lam_feat", 1.0)
+        self.rvt_loss_type = getattr(args, "rvt_loss", "smoothl1")
+
+    def train_rvt_pretrain(self):
+        """
+        阶段1：仅用硬投影监督 RVT。
+        需在 train.py 里先把除 rvt_corr./rvt_feat. 之外的参数全设为 requires_grad=False。
+        """
+        out_dir = "./log/%s_surround_ttc" % (self.time_stamp)
+        os.makedirs(out_dir, exist_ok=True)
+
+        # ★ 解包出真实模型
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+
+        # 只用 OneCycle 做个简单 schedule
+        steps_per_epoch = int(len(self.train_loader))
+        self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.optimizer.param_groups[0]['lr'],
+            epochs=self.rvt_pretrain_epochs,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=0.05,
+            cycle_momentum=False,
+            anneal_strategy='cos'
+        )
+
+        for epoch in range(self.start_epoch, self.rvt_pretrain_epochs):
+            if is_main_process():
+                print('[RVT] Epoch:', epoch)
+            epoch_loss = 0.0
+            steps = 0
+            if self.parallel:
+                self.train_sampler.set_epoch(epoch)
+            self.model.train()
+
+            for i, data in enumerate(self.train_loader):
+                (prev_imgs, curr_imgs,
+                prev_depths, curr_depths,
+                proj_pix_prev, proj_pix_curr,
+                gt_scale_map_with_mask, gt_risk_score_map_with_mask,
+                sensor_metas) = data
+
+                prev_imgs     = prev_imgs.to(self.device)
+                curr_imgs     = curr_imgs.to(self.device)
+                prev_depths   = prev_depths.to(self.device)
+                curr_depths   = curr_depths.to(self.device)
+                proj_pix_prev = proj_pix_prev.to(self.device)
+                proj_pix_curr = proj_pix_curr.to(self.device)
+                for frame_key in sensor_metas:
+                    for channel in sensor_metas[frame_key]:
+                        for key in sensor_metas[frame_key][channel]:
+                            sensor_metas[frame_key][channel][key] = sensor_metas[frame_key][channel][key].to(self.device)
+
+                self.optimizer.zero_grad()
+
+                vis_every = 200
+                # ★ 统一用 model_ref 调 forward_rvt_distill
+                distill_loss, dbg = model_ref.forward_rvt_distill(
+                    img_prev=prev_imgs, img_curr=curr_imgs,
+                    depth_prev=prev_depths, depth_curr=curr_depths,
+                    proj_pix_prev=proj_pix_prev, proj_pix_curr=proj_pix_curr,
+                    sensor_metas=sensor_metas,
+                    attn_type=self.attn_type,
+                    attn_splits_list=self.attn_splits_list,
+                    corr_radius_list=self.corr_radius_list,
+                    prop_radius_list=self.prop_radius_list,
+                    num_reg_refine=self.num_reg_refine,
+                    lam_feat=self.rvt_lam_feat, lam_corr=self.rvt_lam_corr,
+                    loss_type=self.rvt_loss_type,
+                    return_debug=(i % vis_every == 0),   # ← 名称按你实现的来
+                    return_student=True,
+                )
+
+                distill_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                self.optimizer.step()
+                self.lr_scheduler.step()
+
+                epoch_loss += distill_loss.item()
+                steps += 1
+
+                if i % 10 == 0 and is_main_process():
+                    Lc = float(dbg["L_corr_norm"])
+                    Lf = float(dbg["L_feat_norm"])
+                    sc = float(dbg["sigma_corr_ema"])
+                    sp = float(dbg["sigma_feat_prev_mean_ema"])
+                    su = float(dbg["sigma_feat_curr_mean_ema"])
+                    lvc = float(dbg["logvar_corr"])
+                    lvf = float(dbg["logvar_feat"])
+                    wc = math.exp(-lvc)
+                    wf = math.exp(-lvf)
+                    print(
+                        f"[RVT {i:05d}] "
+                        f"loss={distill_loss.item():.6f}  "
+                        f"L_corr_norm={Lc:.6f}  L_feat_norm={Lf:.6f}  "
+                        f"(sigma_corr={sc:.4e}, sigma_feat_prev={sp:.4e}, sigma_feat_curr={su:.4e})  "
+                        f"(logvar_corr={lvc:.3f}, logvar_feat={lvf:.3f}  =>  w_corr={wc:.3f}, w_feat={wf:.3f})"
+                    )
+
+                # —— 存图（可视化 & 预览 scale）——
+                if (i % vis_every == 0) and is_main_process() and ("vis" in dbg):
+                    v = dbg["vis"]  # 全是 [H,W] in [0,1] 的 CPU tensor
+                    import matplotlib.pyplot as plt
+                    plt.imsave(os.path.join(out_dir, f"rvt_corr_student_{epoch:03d}_{i:06d}.png"),
+                            v["corr_student_gray"].numpy(), cmap="magma")
+                    plt.imsave(os.path.join(out_dir, f"rvt_corr_teacher_{epoch:03d}_{i:06d}.png"),
+                            v["corr_teacher_gray"].numpy(), cmap="magma")
+                    plt.imsave(os.path.join(out_dir, f"rvt_corr_cos_{epoch:03d}_{i:06d}.png"),
+                            v["corr_cos"].numpy(), cmap="viridis")
+                    plt.imsave(os.path.join(out_dir, f"rvt_lvl0_prev_s_{epoch:03d}_{i:06d}.png"),
+                            v["lvl0_prev_s_gray"].numpy(), cmap="magma")
+                    plt.imsave(os.path.join(out_dir, f"rvt_lvl0_prev_t_{epoch:03d}_{i:06d}.png"),
+                            v["lvl0_prev_t_gray"].numpy(), cmap="magma")
+                    plt.imsave(os.path.join(out_dir, f"rvt_lvl0_prev_cos_{epoch:03d}_{i:06d}.png"),
+                            v["lvl0_prev_cos"].numpy(), cmap="viridis")
+                    plt.imsave(os.path.join(out_dir, f"rvt_lvl0_curr_s_{epoch:03d}_{i:06d}.png"),
+                            v["lvl0_curr_s_gray"].numpy(), cmap="magma")
+                    plt.imsave(os.path.join(out_dir, f"rvt_lvl0_curr_t_{epoch:03d}_{i:06d}.png"),
+                            v["lvl0_curr_t_gray"].numpy(), cmap="magma")
+                    plt.imsave(os.path.join(out_dir, f"rvt_lvl0_curr_cos_{epoch:03d}_{i:06d}.png"),
+                            v["lvl0_curr_cos"].numpy(), cmap="viridis")
+
+                    # ★ 用 model_ref 调你的预览与存盘工具
+                    if "student" in dbg:
+                        stu = dbg["student"]
+                        scale_preview = model_ref.preview_scale_from_student(
+                            corr_range_student = stu["corr"],
+                            ranges_prev_student = stu["prev"],
+                            ranges_curr_student = stu["curr"],
+                        )
+                        out_path = os.path.join(out_dir, f"preview_scale_e{epoch:03d}_i{i:06d}.png")
+                        model_ref.save_scale_preview(scale_preview, out_path)
+
+            if is_main_process():
+                print(f"[RVT] Epoch {epoch} avg loss: {epoch_loss / max(1, steps):.6f}")
+
+
 
     def train(self):
         out_dir = "./log/%s_surround_ttc"%(self.time_stamp)

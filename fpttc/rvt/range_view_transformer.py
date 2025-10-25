@@ -217,6 +217,7 @@ class RangeViewTransformer(nn.Module):
         self.fov_up = fov_up
         self.fov_down = fov_down
         self.input_h, self.input_w = input_hw
+        self.qbias = nn.Parameter(torch.zeros(1, input_dim, 1, 1))  # learnable zero-bias query seed
 
         # 与 ScaleEncoder 对齐的“query 编码器”（这里输入通常是 0，占位）
         self.scale_conv = nn.Sequential(
@@ -331,7 +332,8 @@ class RangeViewTransformer(nn.Module):
         # 1) 构造“query特征”，保持与 ScaleEncoder 风格一致（有 pos_enc）
         if ini_query is None:
             # 这里没有天然的 Range-View 输入，给零特征也可以（scale_conv 的 bias/BN 不会引入问题）
-            ini_query = torch.zeros(B, C_in, Hr, Wr, device=device)
+            # ini_query = torch.zeros(B, C_in, Hr, Wr, device=device)
+            ini_query = self.qbias.expand(B, C_in, Hr, Wr)
         query = self.scale_conv(ini_query)            # [B,d_model,Hr,Wr]
         query = query + self.pos_enc(query)           # 与 ScaleEncoder 一致
         query = query.flatten(2).transpose(1, 2).contiguous()  # [B,Q,C]

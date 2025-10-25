@@ -154,6 +154,15 @@ parser.add_argument(
 parser.add_argument('--neptune', action='store_true',
                     help='use neptune for logging')
 
+# ===== Stage 1: RVT pretrain by hard-projection distillation =====
+parser.add_argument('--rvt_pretrain_epochs', type=int, default=0,
+                    help='>0 to enable stage-1 RVT-only distillation with hard projection')
+parser.add_argument('--rvt_batch_size', type=int, default=1)
+parser.add_argument('--rvt_lam_corr', type=float, default=1.0)
+parser.add_argument('--rvt_lam_feat', type=float, default=1.0)
+parser.add_argument('--rvt_loss', type=str, default='smoothl1', choices=['l1','mse','smoothl1'])
+
+
 args = parser.parse_args()
 
 if args.parallel:
@@ -260,6 +269,45 @@ def main():
         print('Start Loading ...')
 
     dataset = datasets.fetch_dataloader(args) 
+
+    # ========== STAGE 1: RVT-only pretrain with hard-projection supervision ==========
+    if args.rvt_pretrain_epochs > 0:
+        # 冻结除了 RVT 之外的所有模块（教师投影 conv 也冻结，Teacher 只做前向）
+        freeze_prefixes = (
+            'cnet.', 'featnet.', 'corrnet.',
+            'conv_corr_rvt_in.', 'conv_corr_rvt_out.',  # teacher 编码器与 scale 输入编码器冻结
+            'scale_net.', 'conv_corr_risk.', 'risk_net.'
+        )
+        for name, p in model.named_parameters():
+            bare = name[7:] if name.startswith('module.') else name
+            if bare.startswith('rvt_corr.') or bare.startswith('rvt_feat.'):
+                p.requires_grad = True
+            elif any(bare.startswith(pref) for pref in freeze_prefixes):
+                p.requires_grad = False
+            else:
+                # 其他万一漏网的，也默认冻结
+                p.requires_grad = False
+
+        optimizer = build_optimizer(model, args)
+        if is_main_process():
+            print("[RVT] Learning rate:", optimizer.state_dict()['param_groups'][0]['lr'])
+
+        # 用 RVT 批大小
+        args.batch_size = args.rvt_batch_size
+
+        print(f"[RVT] Pretraining RVT for {args.rvt_pretrain_epochs} epochs (hard-projection distill)...")
+        trainer = TTCTrainer(model       = model,
+                             dataset     = dataset,
+                             optimizer   = optimizer,
+                             args        = args,
+                             start_epoch = start_epoch,
+                             device      = device,
+                             parallel    = parallel,
+                             time_stamp  = time_stamp,
+                             neptune_run = run,
+                             scale_only  = True)  # dataloader 逻辑共用
+        trainer.train_rvt_pretrain()
+
     
     # stage 1: train scale branch
     if args.train_stage in ('scale', 'both'):
