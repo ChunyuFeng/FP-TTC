@@ -6,6 +6,8 @@ from nuscenes.nuscenes import NuScenes
 import matplotlib.pyplot as plt
 import argparse
 from PIL import Image
+from utils.draw import scale2rgb, orientation2rgb
+import cv2
 
 def compute_percentage_in_range(data_frame, t):
     """
@@ -500,7 +502,7 @@ def main(args):
         }
 
         range_image_save_path = os.path.join(args.gt_map_save_path,
-                                             f'range_image_all_frames_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_new',
+                                             f'range_image_all_frames_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson',
                                              current_sf_record['folder_name'])
         if not os.path.exists(range_image_save_path):
             os.makedirs(range_image_save_path)
@@ -564,74 +566,101 @@ def main(args):
         trainval_test_infos.append(info)
 
         ###################################### 可视化 ######################################
-        
-        if args.risk_score_map_vis:
-            risk_score_display = np.copy(proj_risk_score) - np.pi/2
-            risk_score_display[proj_mask == 0] = 0.0  # 将无效像素设为0
-            
-            risk_score_vis_save_path = os.path.join(args.vis_dir, 'risk_score_map',
-                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_theta_new")
-            
-            if not os.path.exists(risk_score_vis_save_path):
-                os.makedirs(risk_score_vis_save_path)
-
-            risk_score_vis_name = f"scene_{scene_indice}_risk_score_map_{i}.png"
-
-            plt.imsave(os.path.join(risk_score_vis_save_path, risk_score_vis_name),
-                       -risk_score_display, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-            
         if args.scale_map_vis:
             scale_display = np.copy(proj_scale)
-
             valid_mask = scale_display >= 0
-
             # 将用于可视化的尺度值裁切到 [0.5, 1.5] 范围
-            scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.85, 1.15)
+            scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.0, 2.0)
+            scale_display[~valid_mask] = 0.0
 
-            # 将尺度的分界线从 1 移至 0（scale - 1）
-            deviations = np.zeros_like(scale_display, dtype=np.float32)
-            deviations[valid_mask] = scale_display[valid_mask] - 1.0
-
-            # 分别处理大于0和小于0的部分
-            pos_mask = deviations > 0
-            neg_mask = deviations < 0
-
-            # 初始化归一化后的显示数组
-            normalized_display = np.zeros_like(deviations, dtype=np.float32)
-
-            # 处理大于1的尺度
-            if np.any(pos_mask):
-                pos_devs = deviations[pos_mask]
-                pos_max = pos_devs.max()
-                pos_min = pos_devs.min()
-                if pos_max > pos_min >= 0:
-                    normalized_display[pos_mask] = (pos_devs - pos_min) / (pos_max - pos_min)  # 归一化到 [0,1]
-                else:
-                    normalized_display[pos_mask] = 0.0  # 如果没有变化，设为0
-
-            # 处理小于1的尺度
-            if np.any(neg_mask):
-                neg_devs = deviations[neg_mask]
-                neg_max = neg_devs.max()
-                neg_min = neg_devs.min()
-                if neg_min < neg_max <= 0:
-                    normalized_display[neg_mask] = (neg_devs - neg_min) / (neg_max - neg_min) - 1.0  # 归一化到 [-1,0]
-                    # normalized_display[neg_mask] = neg_devs / abs(neg_min)  # 归一化到 [-1,0]
-                else:
-                    normalized_display[neg_mask] = 0.0  # 如果没有变化，设为0
-
-            # # 对无效像素赋值为0
-            normalized_display[~valid_mask] = 0.0
-            
+            vis = scale2rgb(scale_display)*255.0
             scale_map_vis_save_path = os.path.join(args.vis_dir, 'scale_map',
-                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}")
+                                    f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson")
             if not os.path.exists(scale_map_vis_save_path):
                 os.makedirs(scale_map_vis_save_path)
+            cv2.imwrite(os.path.join(scale_map_vis_save_path, f"scene_{scene_indice}_scale_map_{i}.png"), vis)
 
-            out_name = f"scene_{scene_indice}_scale_map_{i}.png"
-            out_path = os.path.join(scale_map_vis_save_path, out_name)
+        if args.risk_score_map_vis:
 
-            plt.imsave(out_path, -normalized_display, cmap='seismic', vmin=-1, vmax=1)
+            risk_score_display = np.copy(proj_risk_score)
+            risk_score_display[proj_mask == 0] = 0.0  # 将无效像素设为0
+            risk_score_display = np.clip(risk_score_display, 0.0, np.pi)
+
+            risk_vis = orientation2rgb(risk_score_display)*255.0
+            risk_vis = cv2.cvtColor(risk_vis.astype(np.uint8), cv2.COLOR_RGB2BGR)
+            risk_score_vis_save_path = os.path.join(args.vis_dir, 'risk_score_map',
+                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson")
+            if not os.path.exists(risk_score_vis_save_path):
+                os.makedirs(risk_score_vis_save_path)
+            cv2.imwrite(os.path.join(risk_score_vis_save_path, f"scene_{scene_indice}_risk_score_map_{i}.png"), risk_vis)
+            
+        # if args.risk_score_map_vis:
+        #     risk_score_display = np.copy(proj_risk_score) - np.pi/2
+        #     risk_score_display[proj_mask == 0] = 0.0  # 将无效像素设为0
+            
+        #     risk_score_vis_save_path = os.path.join(args.vis_dir, 'risk_score_map',
+        #                                         f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_theta_new")
+            
+        #     if not os.path.exists(risk_score_vis_save_path):
+        #         os.makedirs(risk_score_vis_save_path)
+
+        #     risk_score_vis_name = f"scene_{scene_indice}_risk_score_map_{i}.png"
+
+        #     plt.imsave(os.path.join(risk_score_vis_save_path, risk_score_vis_name),
+        #                -risk_score_display, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+            
+        # if args.scale_map_vis:
+        #     scale_display = np.copy(proj_scale)
+
+        #     valid_mask = scale_display >= 0
+
+        #     # 将用于可视化的尺度值裁切到 [0.5, 1.5] 范围
+        #     scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.85, 1.15)
+
+        #     # 将尺度的分界线从 1 移至 0（scale - 1）
+        #     deviations = np.zeros_like(scale_display, dtype=np.float32)
+        #     deviations[valid_mask] = scale_display[valid_mask] - 1.0
+
+        #     # 分别处理大于0和小于0的部分
+        #     pos_mask = deviations > 0
+        #     neg_mask = deviations < 0
+
+        #     # 初始化归一化后的显示数组
+        #     normalized_display = np.zeros_like(deviations, dtype=np.float32)
+
+        #     # 处理大于1的尺度
+        #     if np.any(pos_mask):
+        #         pos_devs = deviations[pos_mask]
+        #         pos_max = pos_devs.max()
+        #         pos_min = pos_devs.min()
+        #         if pos_max > pos_min >= 0:
+        #             normalized_display[pos_mask] = (pos_devs - pos_min) / (pos_max - pos_min)  # 归一化到 [0,1]
+        #         else:
+        #             normalized_display[pos_mask] = 0.0  # 如果没有变化，设为0
+
+        #     # 处理小于1的尺度
+        #     if np.any(neg_mask):
+        #         neg_devs = deviations[neg_mask]
+        #         neg_max = neg_devs.max()
+        #         neg_min = neg_devs.min()
+        #         if neg_min < neg_max <= 0:
+        #             normalized_display[neg_mask] = (neg_devs - neg_min) / (neg_max - neg_min) - 1.0  # 归一化到 [-1,0]
+        #             # normalized_display[neg_mask] = neg_devs / abs(neg_min)  # 归一化到 [-1,0]
+        #         else:
+        #             normalized_display[neg_mask] = 0.0  # 如果没有变化，设为0
+
+        #     # # 对无效像素赋值为0
+        #     normalized_display[~valid_mask] = 0.0
+            
+        #     scale_map_vis_save_path = os.path.join(args.vis_dir, 'scale_map',
+        #                                         f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}")
+        #     if not os.path.exists(scale_map_vis_save_path):
+        #         os.makedirs(scale_map_vis_save_path)
+
+        #     out_name = f"scene_{scene_indice}_scale_map_{i}.png"
+        #     out_path = os.path.join(scale_map_vis_save_path, out_name)
+
+        #     plt.imsave(out_path, -normalized_display, cmap='seismic', vmin=-1, vmax=1)
 
         # TODO: 处理 depth map 的可视化:
         if args.depth_map_vis:
@@ -643,7 +672,7 @@ def main(args):
           Sorted by timestamp. {len(trainval_test_infos)} items in total.")
 
     with open(os.path.join(args.pkl_save_path,
-                           f"nusc_{args.trainval_test_split}_infos_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_new.pkl"),'wb') as f:
+                           f"nusc_{args.trainval_test_split}_infos_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson.pkl"),'wb') as f:
         pickle.dump(trainval_test_infos, f)
     print(f"Saved nusc_trainval_infos.pkl to {args.pkl_save_path}")
 
