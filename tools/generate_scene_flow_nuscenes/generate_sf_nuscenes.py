@@ -98,9 +98,9 @@ def build_psr_samples(points_local,
     return np.asarray(samp.points, dtype=np.float32)
 
 def estimate_n_samples_from_wlh(wlh,
-                                base_density=800.0,   # 每 m^2 的点数（经验值）
-                                min_pts=1500,
-                                max_pts=40000):
+                                base_density=1600.0,   # 每 m^2 的点数（经验值）
+                                min_pts=4000,
+                                max_pts=120000):
     """
     根据 bbox 尺寸 w,l,h 估算需要的采样点数。
     采用表面积近似: S ~= w*l + l*h + w*h (与建议一致)
@@ -117,13 +117,13 @@ def estimate_psr_depth_from_wlh(wlh):
     """
     max_dim = float(np.max(wlh))
     if max_dim < 1.0:   # traffic cone / 行人等小目标
-        return 9
-    elif max_dim < 2.5: # 轿车/摩托/自行车等
         return 10
-    elif max_dim < 5.0: # 卡车/巴士等较大目标
+    elif max_dim < 2.5: # 轿车/摩托/自行车等
         return 11
-    else:
+    elif max_dim < 5.0: # 卡车/巴士等较大目标
         return 12
+    else:
+        return 13
 
 def pick_voxel_from_wlh(wlh, frac=0.02, vmin=0.005, vmax=0.05):
     min_edge = float(np.min(wlh))
@@ -384,11 +384,11 @@ def main(nusc, val_list, indice, args):
             continue
 
         wlh = token2dims.get(token, np.array([2.0, 4.0, 1.6], dtype=np.float32))
-        n_samp  = estimate_n_samples_from_wlh(wlh, base_density=800.0, min_pts=1500, max_pts=40000)
+        n_samp  = estimate_n_samples_from_wlh(wlh)
         d_level = estimate_psr_depth_from_wlh(wlh)
 
         # 自适应体素：最小边的 2%，并限制在 [5mm, 5cm]
-        voxel_down = pick_voxel_from_wlh(wlh, frac=0.02, vmin=0.005, vmax=0.05)
+        voxel_down = pick_voxel_from_wlh(wlh, frac=0.01, vmin=0.002, vmax=0.02)
 
         object_token2samples_local[token] = build_psr_samples(
             pts_local,
@@ -404,7 +404,7 @@ def main(nusc, val_list, indice, args):
     static_samples_local = build_psr_samples(lidar_pc, 
                                              depth=12, 
                                              min_density_q=0.10, 
-                                             n_samples=500000)
+                                             n_samples=1500000)
 
     for i in trange(1, len(dict_list), desc="Processing frames"):
 
@@ -522,7 +522,6 @@ def main(nusc, val_list, indice, args):
 
         i = i + 1
         continue
-
 
 def save_ply(points, name):
     point_cloud_original = o3d.geometry.PointCloud()

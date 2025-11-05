@@ -9,6 +9,81 @@ from PIL import Image
 from utils.draw import scale2rgb, orientation2rgb
 import cv2
 
+import cv2
+import numpy as np
+
+def _local_min_with_horizontal_wrap(depth_for_min: np.ndarray, ksize: int) -> np.ndarray:
+    """
+    用拼接的方式实现“水平环绕”的局部最小深度：
+      1) 水平方向把右边 r 列接到左边、左边 r 列接到右边；
+      2) 竖直方向只做复制式 padding（不环绕）；
+      3) 在扩展后的图上做一次 erode；
+      4) 裁回原始区域。
+    """
+    H, W = depth_for_min.shape
+    r = ksize // 2
+    # 1) 水平 wrap：左右各拼接 r 列
+    left  = depth_for_min[:, -r:]           # 右边 r 列接到左边
+    right = depth_for_min[:, :r]            # 左边 r 列接到右边
+    hcat  = np.concatenate([left, depth_for_min, right], axis=1)  # [H, W+2r]
+
+    # 2) 垂直方向复制 padding，保证卷积核不会触到最外层边界
+    #    上下各 pad r 行；水平方向已经拼接过，不再 pad
+    hvr = np.pad(hcat, ((r, r), (0, 0)), mode='edge')  # [H+2r, W+2r]
+
+    # 3) 腐蚀（最小滤波），此时不需要 wrap 边界，随便用一个受支持的边界类型即可
+    kernel = np.ones((ksize, ksize), np.uint8)
+    local_min_pad = cv2.erode(hvr.astype(np.float32), kernel, iterations=1,
+                              borderType=cv2.BORDER_CONSTANT)
+
+    # 4) 裁回原始区域
+    local_min = local_min_pad[r:r+H, r:r+W]
+    return local_min
+
+def suppress_occlusions_by_local_min(proj_range,
+                                     proj_scale,
+                                     proj_risk_score,
+                                     proj_xyz,
+                                     proj_idx,
+                                     proj_mask,
+                                     ksize: int = 3,
+                                     delta_abs: float = 0.5,
+                                     alpha: float = 1.08,
+                                     wrap_horizontal: bool = True):
+    """
+    基于“局部最小深度”的遮挡抑制。若某像素深度相较邻域最小深度显著更远
+    （> delta_abs 或 > alpha * local_min），则置为无效。
+    """
+    assert ksize % 2 == 1 and ksize >= 3, "ksize 必须为奇数且 >=3"
+    H, W = proj_range.shape
+    INF = np.float32(1e6)
+
+    # 只在有效像素上参与最小化；无效像素设成一个极大值
+    depth_for_min = np.where((proj_mask == 1) & (proj_range > 0), proj_range, INF).astype(np.float32)
+
+    if wrap_horizontal:
+        local_min = _local_min_with_horizontal_wrap(depth_for_min, ksize)
+    else:
+        # 不 wrap 的版本：直接在原图上做腐蚀（使用受支持的边界类型）
+        kernel = np.ones((ksize, ksize), np.uint8)
+        local_min = cv2.erode(depth_for_min, kernel, iterations=1,
+                              borderType=cv2.BORDER_REPLICATE)
+
+    valid = (proj_mask == 1) & (proj_range > 0)
+    farther_abs = (proj_range - local_min) > np.float32(delta_abs)
+    farther_rel = proj_range > (np.float32(alpha) * local_min)
+
+    occluded = valid & (farther_abs & farther_rel)
+    if np.any(occluded):
+        proj_mask[occluded] = 0
+        proj_range[occluded] = -1.0
+        proj_scale[occluded] = -1.0
+        proj_risk_score[occluded] = 0.0
+        proj_xyz[occluded] = -1.0
+        proj_idx[occluded] = -1
+
+    return proj_range, proj_scale, proj_risk_score, proj_xyz, proj_idx, proj_mask
+
 def compute_percentage_in_range(data_frame, t):
     """
     计算 data_frame 中位于 [1-t, 1+t] 区间的数值占总数的百分比。
@@ -201,6 +276,17 @@ def range_projection(points, scales, risk_score, H=160, W=1920, fov_up=10.0, fov
 
     # 创建掩码
     proj_mask = (proj_idx >= 0).astype(np.int32)
+
+    # 通过后处理解决遮挡问题
+    (proj_range,
+     proj_scale,
+     proj_risk_score,
+     proj_xyz,
+     proj_idx,
+     proj_mask) = suppress_occlusions_by_local_min(
+         proj_range, proj_scale, proj_risk_score, proj_xyz, proj_idx, proj_mask,
+         ksize=5, delta_abs=0.5, alpha=1.08, wrap_horizontal=True
+     )
 
     return proj_range, proj_scale, proj_risk_score, proj_xyz, proj_idx, proj_mask
 
@@ -502,7 +588,7 @@ def main(args):
         }
 
         range_image_save_path = os.path.join(args.gt_map_save_path,
-                                             f'range_image_all_frames_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson',
+                                             f'range_image_all_frames_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson_scene0',
                                              current_sf_record['folder_name'])
         if not os.path.exists(range_image_save_path):
             os.makedirs(range_image_save_path)
@@ -575,7 +661,7 @@ def main(args):
 
             vis = scale2rgb(scale_display)*255.0
             scale_map_vis_save_path = os.path.join(args.vis_dir, 'scale_map',
-                                    f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson")
+                                    f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson_scene0")
             if not os.path.exists(scale_map_vis_save_path):
                 os.makedirs(scale_map_vis_save_path)
             cv2.imwrite(os.path.join(scale_map_vis_save_path, f"scene_{scene_indice}_scale_map_{i}.png"), vis)
@@ -589,7 +675,7 @@ def main(args):
             risk_vis = orientation2rgb(risk_score_display)*255.0
             risk_vis = cv2.cvtColor(risk_vis.astype(np.uint8), cv2.COLOR_RGB2BGR)
             risk_score_vis_save_path = os.path.join(args.vis_dir, 'risk_score_map',
-                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson")
+                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson_scene0")
             if not os.path.exists(risk_score_vis_save_path):
                 os.makedirs(risk_score_vis_save_path)
             cv2.imwrite(os.path.join(risk_score_vis_save_path, f"scene_{scene_indice}_risk_score_map_{i}.png"), risk_vis)
@@ -672,7 +758,7 @@ def main(args):
           Sorted by timestamp. {len(trainval_test_infos)} items in total.")
 
     with open(os.path.join(args.pkl_save_path,
-                           f"nusc_{args.trainval_test_split}_infos_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson.pkl"),'wb') as f:
+                           f"nusc_{args.trainval_test_split}_infos_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_poisson_scene0.pkl"),'wb') as f:
         pickle.dump(trainval_test_infos, f)
     print(f"Saved nusc_trainval_infos.pkl to {args.pkl_save_path}")
 
