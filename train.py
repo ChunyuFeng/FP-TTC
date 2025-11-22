@@ -278,7 +278,7 @@ def main():
                 sd = ckpt
 
             # 只挑出 cnet/featnet/corrnet 的参数
-            prefixes = ('cnet.', 'featnet.', 'corrnet.')
+            prefixes = ('cnet.', 'featnet.', 'corrnet.','conv_corr_rvt_in.','conv_corr_rvt_out.')
             filtered = {}
             for k, v in sd.items():
                 if any(k.startswith(pref) for pref in prefixes):

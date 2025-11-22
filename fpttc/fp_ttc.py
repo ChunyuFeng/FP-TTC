@@ -76,7 +76,8 @@ class FpTTC(nn.Module):
                                              dim_out = feature_channels+1)
         self.scale_net = ScaleNet(num_scales      = num_scales,
                                  feature_channels = feature_channels,
-                                 upsample_factor  = upsample_factor,
+                                #  upsample_factor  = upsample_factor,
+                                 upsample_factor  = 2,
                                  num_head         = 4,
                                  scale_level      = num_scales, 
                                  reg_refine       = reg_refine, 
@@ -110,7 +111,8 @@ class FpTTC(nn.Module):
                 num_level=num_views,          # 相机数 = 6
                 num_points=K_bins,            # 深度 bins 数
                 fov_up=8.0,
-                fov_down=-15.0
+                fov_down=-15.0,
+                input_hw=(320,640)
             )
             for _ in range(num_scales)
         ])
@@ -124,7 +126,8 @@ class FpTTC(nn.Module):
             num_level=num_views,
             num_points=K_bins,
             fov_up=8.0,
-            fov_down=-15.0
+            fov_down=-15.0,
+            input_hw=(320,640)
         )
         
 
@@ -144,6 +147,8 @@ class FpTTC(nn.Module):
         
         # ----- 预处理 -----
         img0, img1 = normalize_img(img_prev, img_curr)         # [B,V,3,H,W] -> normed
+        depth_prev = F.interpolate(depth_prev, scale_factor=(1,2,2), mode='trilinear', align_corners=False)
+        depth_curr = F.interpolate(depth_curr, scale_factor=(1,2,2), mode='trilinear', align_corners=False)
         rgbd0 = torch.cat([img0, depth_prev], dim=2)           # [B,V,4,H,W]
         rgbd1 = torch.cat([img1, depth_curr], dim=2)           # [B,V,4,H,W]
         B, V, C, H_img, W_img = rgbd0.shape
