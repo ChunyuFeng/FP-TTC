@@ -27,10 +27,11 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple
 
 from fpttc.fp_ttc import FpTTC
-from utils.draw import scale2rgb, orientation2rgb
+from utils.draw import scale2rgb, orientation2rgb, visual_scale_map_range_image
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
 from dataloader.dataset import build_frame_mapping, build_frame_mapping_fast
 from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
+import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser()
 
@@ -38,12 +39,13 @@ torch.backends.cuda.matmul.allow_tf32 = True          # 让 TF32 生效
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True                 # 固定输入尺寸时很有效
 
-FAST_DEPTH_INPUT = 192          # 224→192 常见性价比更高
-FAST_PIXEL_STRIDE = 4           # 原来是 2，进一步减半 CPU 开销
-FAST_RANGE_H, FAST_RANGE_W = 32, 384   # 40x480 → 32x384
+FAST_DEPTH_INPUT = 224          # 224→192 常见性价比更高
+FAST_PIXEL_STRIDE = 2           # 原来是 2，进一步减半 CPU 开销
+FAST_RANGE_H, FAST_RANGE_W = 40, 480   # 40x480 → 32x384
 
 # bfloat16 精度略低，速度更快；float16 精度稍高，但速度稍慢；时间约差 30~40 ms
-AMP_DTYPE = torch.bfloat16      
+# AMP_DTYPE = torch.bfloat16
+AMP_DTYPE = torch.float16  
 
 # Dataset & evaluation parameters
 parser.add_argument('--checkpoint_dir', default='tmp', type=str)
@@ -337,10 +339,15 @@ def main():
             risk_prediction_array = risk_pred[0].squeeze(0).cpu().numpy()
 
             # new vis method
-            scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
-            vis = scale2rgb(scale_vis)
-            vis = vis*255.0
-            cv2.imwrite(os.path.join(output_dir, f"new_pred_scale_{idx}.png"), vis)
+            # scale_vis = np.clip(scale_prediction_array, 0.0, 2.0)
+            # vis = scale2rgb(scale_vis)
+            # vis = vis*255.0
+            # cv2.imwrite(os.path.join(output_dir, f"new_pred_scale_{idx}.png"), vis)
+
+            scale_prediction_mask = (scale_prediction_array > 0.3) & (scale_prediction_array < 2.0)
+            normalized_pred_scale = visual_scale_map_range_image(scale_prediction_array, scale_prediction_mask)
+            plt.imsave(os.path.join(output_dir, f"new_pred_scale_{idx}.png"),
+                   -normalized_pred_scale, cmap='seismic', vmin=-1, vmax=1)
 
             orien = np.clip(risk_prediction_array, 0.0, np.pi)
             orien_vis = orientation2rgb(orien)

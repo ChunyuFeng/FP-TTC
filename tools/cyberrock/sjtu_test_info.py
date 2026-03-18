@@ -227,8 +227,8 @@ def main():
     for i in range(1, frame_count):
         seq = rectified_img_dict[channels[0]]['sequence'][i]
 
-        if seq < 24399 or seq > 24707:
-            continue
+        # if seq < 24399 or seq > 24707:
+        #     continue
 
         prev_data, curr_data = {}, {}
         for ch in channels:

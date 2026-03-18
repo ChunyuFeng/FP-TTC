@@ -1,0 +1,23 @@
+name: fpttc_py39
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.9
+  # --- PyTorch + CUDA ---
+  - pytorch=1.13.1
+  - torchvision=0.14.1
+  - torchaudio=0.13.1
+  - pytorch-cuda=11.7
+
+  # --- Scientific stack (ABI sensitive) ---
+  - numpy=1.24.3
+  - scipy=1.10.1
+  - matplotlib=3.5.3
+
+  - pip
+  - pip:
+      - -r requirements-pip.txt
+      # --- mmcv-full 用 pip 按官方 wheel 装（避免源码编译）---
+      # 注意：environment.yml 里 pip 不方便加 -f，所以 mmcv 建议在创建环境后单独执行安装命令（见后面流程）
