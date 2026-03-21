@@ -18,8 +18,8 @@ from mmcv.ops.points_in_boxes import (points_in_boxes_all, points_in_boxes_cpu,
 from scipy.spatial.transform import Rotation
 from tqdm import trange
 
-import open3d.visualization.gui as gui
-from open3d.visualization import O3DVisualizer
+# import open3d.visualization.gui as gui
+# from open3d.visualization import O3DVisualizer
 
 def load_pcd_from_file(pcd_file_path):
 
@@ -45,54 +45,54 @@ def load_pcd_from_file(pcd_file_path):
 
 
 
-def visualize_prev_frame(filtered_prev_object_points_list,
-                         filtered_prev_object_boxes_list):
-    # 1. 准备几何体列表
-    vis_geoms = []
-    for idx, (pts, box) in enumerate(zip(filtered_prev_object_points_list,
-                                         filtered_prev_object_boxes_list)):
-        # 1.1 点云
-        pcd_obj = o3d.geometry.PointCloud()
-        pcd_obj.points = o3d.utility.Vector3dVector(pts[:, :3])
-        pcd_obj.paint_uniform_color(np.random.uniform(0, 1, size=3))
-        vis_geoms.append((f"pcd_{idx}", pcd_obj))
+# def visualize_prev_frame(filtered_prev_object_points_list,
+#                          filtered_prev_object_boxes_list):
+#     # 1. 准备几何体列表
+#     vis_geoms = []
+#     for idx, (pts, box) in enumerate(zip(filtered_prev_object_points_list,
+#                                          filtered_prev_object_boxes_list)):
+#         # 1.1 点云
+#         pcd_obj = o3d.geometry.PointCloud()
+#         pcd_obj.points = o3d.utility.Vector3dVector(pts[:, :3])
+#         pcd_obj.paint_uniform_color(np.random.uniform(0, 1, size=3))
+#         vis_geoms.append((f"pcd_{idx}", pcd_obj))
 
-        # 1.2 线框
-        corners = box.corners().T
-        lines = [
-            [0,1],[1,2],[2,3],[3,0],
-            [4,5],[5,6],[6,7],[7,4],
-            [0,4],[1,5],[2,6],[3,7]
-        ]
-        colors = [[1,0,0] for _ in lines]
-        line_set = o3d.geometry.LineSet(
-            points=o3d.utility.Vector3dVector(corners),
-            lines=o3d.utility.Vector2iVector(lines)
-        )
-        line_set.colors = o3d.utility.Vector3dVector(colors)
-        vis_geoms.append((f"bbox_{idx}", line_set))
+#         # 1.2 线框
+#         corners = box.corners().T
+#         lines = [
+#             [0,1],[1,2],[2,3],[3,0],
+#             [4,5],[5,6],[6,7],[7,4],
+#             [0,4],[1,5],[2,6],[3,7]
+#         ]
+#         colors = [[1,0,0] for _ in lines]
+#         line_set = o3d.geometry.LineSet(
+#             points=o3d.utility.Vector3dVector(corners),
+#             lines=o3d.utility.Vector2iVector(lines)
+#         )
+#         line_set.colors = o3d.utility.Vector3dVector(colors)
+#         vis_geoms.append((f"bbox_{idx}", line_set))
 
-    # 2. 初始化 GUI
-    gui.Application.instance.initialize()
+#     # 2. 初始化 GUI
+#     gui.Application.instance.initialize()
 
-    # 3. 创建 CPU GUI 可视化窗口
-    vis = O3DVisualizer("SceneFlow 上一帧预览", 1024, 768)
-    vis.show_settings = True
+#     # 3. 创建 CPU GUI 可视化窗口
+#     vis = O3DVisualizer("SceneFlow 上一帧预览", 1024, 768)
+#     vis.show_settings = True
 
-    # 4. 添加所有几何体（注意传入 name, geometry）
-    for name, geom in vis_geoms:
-        vis.add_geometry(name, geom)
+#     # 4. 添加所有几何体（注意传入 name, geometry）
+#     for name, geom in vis_geoms:
+#         vis.add_geometry(name, geom)
 
-    # 5. 在每个 bbox 顶面中心加文字
-    for idx, box in enumerate(filtered_prev_object_boxes_list):
-        corners = box.corners().T
-        top_center = corners[4:8].mean(axis=0)
-        top_center[2] += 0.1
-        vis.add_3d_label(top_center, box.name)
+#     # 5. 在每个 bbox 顶面中心加文字
+#     for idx, box in enumerate(filtered_prev_object_boxes_list):
+#         corners = box.corners().T
+#         top_center = corners[4:8].mean(axis=0)
+#         top_center[2] += 0.1
+#         vis.add_3d_label(top_center, box.name)
 
-    # 6. 把窗口注册到 Application 并运行
-    gui.Application.instance.add_window(vis)
-    gui.Application.instance.run()
+#     # 6. 把窗口注册到 Application 并运行
+#     gui.Application.instance.add_window(vis)
+#     gui.Application.instance.run()
 
 
 def run_poisson(pcd, depth, n_threads, min_density=None):
@@ -174,25 +174,155 @@ def lidar_to_world_to_lidar(pc,lidar_calibrated_sensor,lidar_ego_pose,
     return pc
 
 
+def dedup_static_ground_layers(points_xyz,
+                               grid_size,
+                               ground_z_max,
+                               min_points_per_cell,
+                               cell_z_span_max):
+    keep_mask = np.ones(points_xyz.shape[0], dtype=bool)
+
+    if points_xyz.shape[0] == 0:
+        return keep_mask, {
+            'ground_candidate_count': 0,
+            'collapsed_cell_count': 0,
+            'removed_point_count': 0,
+        }
+
+    ground_candidate_indices = np.flatnonzero(points_xyz[:, 2] < ground_z_max)
+    if ground_candidate_indices.size == 0:
+        return keep_mask, {
+            'ground_candidate_count': 0,
+            'collapsed_cell_count': 0,
+            'removed_point_count': 0,
+        }
+
+    ground_points = points_xyz[ground_candidate_indices]
+    grid_x = np.floor(ground_points[:, 0] / grid_size).astype(np.int32)
+    grid_y = np.floor(ground_points[:, 1] / grid_size).astype(np.int32)
+    grid_coords = np.stack([grid_x, grid_y], axis=1)
+
+    _, inverse = np.unique(grid_coords, axis=0, return_inverse=True)
+    sort_order = np.argsort(inverse, kind='mergesort')
+    sorted_group_ids = inverse[sort_order]
+    sorted_ground_indices = ground_candidate_indices[sort_order]
+    sorted_ground_z = ground_points[sort_order, 2]
+
+    group_starts = np.flatnonzero(np.r_[True, sorted_group_ids[1:] != sorted_group_ids[:-1]])
+    group_counts = np.diff(np.r_[group_starts, sorted_group_ids.size])
+    group_mins = np.minimum.reduceat(sorted_ground_z, group_starts)
+    group_maxs = np.maximum.reduceat(sorted_ground_z, group_starts)
+    group_spans = group_maxs - group_mins
+
+    collapsed_cell_count = 0
+    removed_point_count = 0
+
+    for start, count, span in zip(group_starts, group_counts, group_spans):
+        if count < min_points_per_cell or span > cell_z_span_max:
+            continue
+
+        group_slice = slice(start, start + count)
+        group_indices = sorted_ground_indices[group_slice]
+        group_z = sorted_ground_z[group_slice]
+        median_z = np.median(group_z)
+        representative_offset = int(np.argmin(np.abs(group_z - median_z)))
+        representative_index = group_indices[representative_offset]
+
+        keep_mask[group_indices] = False
+        keep_mask[representative_index] = True
+
+        collapsed_cell_count += 1
+        removed_point_count += count - 1
+
+    return keep_mask, {
+        'ground_candidate_count': int(ground_candidate_indices.size),
+        'collapsed_cell_count': int(collapsed_cell_count),
+        'removed_point_count': int(removed_point_count),
+    }
+
+
+def get_bbox_family(category_name):
+    if category_name.startswith('vehicle.') and category_name not in {'vehicle.bicycle', 'vehicle.motorcycle'}:
+        return 'vehicle'
+    if category_name in {'vehicle.bicycle', 'vehicle.motorcycle'}:
+        return 'two_wheeler'
+    if category_name.startswith('human.pedestrian.'):
+        return 'pedestrian'
+    if category_name.startswith('movable_object.'):
+        return 'small_object'
+    return 'fallback'
+
+
+def build_separation_boxes(base_gt_bbox_3d,
+                           object_categories,
+                           bbox_adjustment_mode,
+                           global_bbox_dilation,
+                           global_bbox_shift):
+    separation_gt_bbox_3d = base_gt_bbox_3d.copy()
+
+    if bbox_adjustment_mode == 'global':
+        separation_gt_bbox_3d[:, :3] += global_bbox_shift
+        separation_gt_bbox_3d[:, 3:6] += global_bbox_dilation
+        return separation_gt_bbox_3d
+
+    if bbox_adjustment_mode != 'class_aware':
+        raise ValueError(f"Unsupported bbox_adjustment_mode={bbox_adjustment_mode}")
+
+    family_ratio = {
+        'vehicle': np.asarray([0.25, 0.15, 0.20], dtype=np.float32),
+        'two_wheeler': np.asarray([0.15, 0.12, 0.15], dtype=np.float32),
+        'pedestrian': np.asarray([0.08, 0.08, 0.10], dtype=np.float32),
+        'small_object': np.asarray([0.10, 0.10, 0.10], dtype=np.float32),
+        'fallback': np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+    }
+    family_cap = {
+        'vehicle': np.asarray([0.50, 0.50, 0.30], dtype=np.float32),
+        'two_wheeler': np.asarray([0.12, 0.12, 0.12], dtype=np.float32),
+        'pedestrian': np.asarray([0.05, 0.05, 0.10], dtype=np.float32),
+        'small_object': np.asarray([0.05, 0.05, 0.08], dtype=np.float32),
+        'fallback': np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+    }
+
+    dims = separation_gt_bbox_3d[:, 3:6]
+    effective_dilation = np.zeros_like(dims, dtype=np.float32)
+    effective_shift = np.zeros((separation_gt_bbox_3d.shape[0], 3), dtype=np.float32)
+
+    for i, category_name in enumerate(object_categories):
+        family = get_bbox_family(category_name)
+        effective_dilation[i] = np.minimum(family_cap[family], family_ratio[family] * dims[i])
+
+        height = float(dims[i, 2])
+        if family == 'vehicle':
+            effective_shift[i, 2] = min(0.15, 0.10 * height)
+        elif family == 'two_wheeler':
+            effective_shift[i, 2] = min(0.05, 0.05 * height)
+
+    separation_gt_bbox_3d[:, :3] += effective_shift
+    separation_gt_bbox_3d[:, 3:6] += effective_dilation
+    return separation_gt_bbox_3d
+
+
 def main(nusc, val_list, indice, args):
 
     save_path = args.save_path
     data_root = args.dataroot
+    bbox_dilation = np.asarray(args.bbox_dilation, dtype=np.float32)
+    bbox_shift = np.asarray(args.bbox_shift, dtype=np.float32)
     # learning_map = nuscenesyaml['learning_map']
 
     my_scene = nusc.scene[indice]
     sensor = 'LIDAR_TOP'
 
-    if args.split == 'train':
-        if my_scene['token'] in val_list:
-            return
-    elif args.split == 'val':
-        if my_scene['token'] not in val_list:
-            return
-    elif args.split == 'all':
-        pass
-    else:
-        raise NotImplementedError
+    if not args.scene_list_file:
+        if args.split == 'train':
+            if my_scene['token'] in val_list:
+                return
+        elif args.split == 'val':
+            if my_scene['token'] not in val_list:
+                return
+        elif args.split == 'all':
+            pass
+        else:
+            raise NotImplementedError
 
     # load the first sample to start
     first_sample_token = my_scene['first_sample_token']
@@ -226,8 +356,13 @@ def main(nusc, val_list, indice, args):
         gt_bbox_3d = np.concatenate([locs, dims, rots], axis=1).astype(np.float32)
         gt_bbox_3d[:, 6] += np.pi / 2.
         gt_bbox_3d[:, 2] -= dims[:, 2] / 2.
-        # gt_bbox_3d[:, 2] = gt_bbox_3d[:, 2] - 0.1  # Move the bbox slightly down in the z direction
-        # gt_bbox_3d[:, 3:6] = gt_bbox_3d[:, 3:6] * 1.1 # Slightly expand the bbox to wrap all object points
+        separation_gt_bbox_3d = build_separation_boxes(
+            gt_bbox_3d,
+            object_category,
+            args.bbox_adjustment_mode,
+            bbox_dilation,
+            bbox_shift,
+        )
 
         ############################# get LiDAR points with semantics ##########################
         pc_file_name = lidar_data['filename'] # load LiDAR names
@@ -246,7 +381,7 @@ def main(nusc, val_list, indice, args):
 
         ############################# cut out movable object points and masks ##########################
         points_in_boxes = points_in_boxes_cpu(torch.from_numpy(pc0[:, :3][np.newaxis, :, :]),
-                                              torch.from_numpy(gt_bbox_3d[np.newaxis, :]))
+                                              torch.from_numpy(separation_gt_bbox_3d[np.newaxis, :]))
         object_points_list = []
         j = 0
         while j < points_in_boxes.shape[-1]:
@@ -260,10 +395,10 @@ def main(nusc, val_list, indice, args):
         points_mask = ~(points_in_boxes[0])
 
         ############################# get point mask of the vehicle itself ##########################
-        ego_range = [3.0, 3.0, 3.0] # remove points within 3m of the vehicle itself
-        oneself_mask = torch.from_numpy((np.abs(pc0[:, 0]) > ego_range[0]) |
-                                        (np.abs(pc0[:, 1]) > ego_range[1]) |
-                                        (np.abs(pc0[:, 2]) > ego_range[2]))
+        self_range = [3.0, 3.0, 3.0] # remove points within 3m of the vehicle itself
+        oneself_mask = torch.from_numpy((np.abs(pc0[:, 0]) > self_range[0]) |
+                                        (np.abs(pc0[:, 1]) > self_range[1]) |
+                                        (np.abs(pc0[:, 2]) > self_range[2]))
 
         ############################# get static scene segment ##########################
         points_mask = points_mask & oneself_mask
@@ -396,19 +531,59 @@ def main(nusc, val_list, indice, args):
         object_points_dict[query_object_token] = np.concatenate(object_points_dict[query_object_token],
                                                                 axis=0)
 
-    object_points_xyz = []
-    for key in object_points_dict.keys():
-        point_cloud = object_points_dict[key]
-        object_points_xyz.append(point_cloud[:,:3])
+    object_points_xyz_by_token = {}
+    for object_token, point_cloud in object_points_dict.items():
+        object_points_xyz_by_token[object_token] = point_cloud[:, :3]
 
-    for i in trange(1, len(dict_list), desc="Processing frames"):
+    if args.keyframe_only:
+        keyframe_indices = [i for i, frame_dict in enumerate(dict_list) if frame_dict['is_key_frame']]
+        frame_pairs = [(keyframe_indices[i - 1], keyframe_indices[i]) for i in range(1, len(keyframe_indices))]
+        progress_desc = "Processing key frames"
+        scene_flow_subdir = 'scene_flow_key_frames'
+    else:
+        frame_pairs = [(i - 1, i) for i in range(1, len(dict_list))]
+        progress_desc = "Processing frames"
+        scene_flow_subdir = 'scene_flow_all_frames'
 
-        prev_dict = dict_list[i-1]
-        curr_dict = dict_list[i]
+    for prev_idx, curr_idx in tqdm(frame_pairs, desc=progress_desc):
+
+        prev_dict = dict_list[prev_idx]
+        curr_dict = dict_list[curr_idx]
 
         ################## concatenate static point cloud ########################
-        lidar_pc_slice_list = [dict['lidar_pc'] for dict in dict_list]
+        if args.static_context_mode == 'scene':
+            static_dict_list = dict_list
+        elif args.static_context_mode == 'local':
+            window_start = max(0, min(prev_idx, curr_idx) - args.static_context_radius)
+            window_end = min(len(dict_list), max(prev_idx, curr_idx) + args.static_context_radius + 1)
+            static_dict_list = dict_list[window_start:window_end]
+        else:
+            raise ValueError(f"Unsupported static_context_mode={args.static_context_mode}")
+
+        lidar_pc_slice_list = [frame_dict['lidar_pc'] for frame_dict in static_dict_list]
         lidar_pc_slice = np.concatenate(lidar_pc_slice_list, axis=1).T
+
+        if args.static_ground_dedup == 'bev':
+            static_keep_mask, dedup_stats = dedup_static_ground_layers(
+                lidar_pc_slice[:, :3],
+                grid_size=args.static_ground_grid_size,
+                ground_z_max=args.static_ground_z_max,
+                min_points_per_cell=args.static_ground_min_points_per_cell,
+                cell_z_span_max=args.static_ground_cell_z_span_max,
+            )
+            static_point_count_before = lidar_pc_slice.shape[0]
+            lidar_pc_slice = lidar_pc_slice[static_keep_mask]
+            static_point_count_after = lidar_pc_slice.shape[0]
+            print(
+                "Static ground dedup "
+                f"scene={indice} prev_idx={prev_idx} curr_idx={curr_idx} "
+                f"static_before={static_point_count_before} static_after={static_point_count_after} "
+                f"ground_candidates={dedup_stats['ground_candidate_count']} "
+                f"collapsed_cells={dedup_stats['collapsed_cell_count']} "
+                f"removed_duplicates={dedup_stats['removed_point_count']}"
+            )
+        elif args.static_ground_dedup != 'off':
+            raise ValueError(f"Unsupported static_ground_dedup={args.static_ground_dedup}")
 
         # ################## concatenate object points ########################
         # obj_pc_slice_list = [dict['object_points_list'] for dict in dict_list[i-N:i+N+1]]
@@ -448,19 +623,8 @@ def main(nusc, val_list, indice, args):
         gt_bbox_3d[:, 2] -= dims[:, 2] / 2.
         gt_bbox_3d[:, 2] = gt_bbox_3d[:, 2]
         gt_bbox_3d[:, 3:6] = gt_bbox_3d[:, 3:6]
-        rots = gt_bbox_3d[:, 6:7]
-        locs = gt_bbox_3d[:, 0:3]
-
-        ################## place object points into corresponding bboxes ##############
-        prev_object_points_list = []
-        for j, object_token in enumerate(prev_dict['object_tokens']):
-            for k, object_token_in_zoo in enumerate(object_token_zoo):
-                if object_token == object_token_in_zoo:
-                    points = object_points_xyz[k]
-                    Rot = Rotation.from_euler('z', rots[j], degrees=False)
-                    rotated_object_points = Rot.apply(points)
-                    points = rotated_object_points + locs[j]
-                    prev_object_points_list.append(points)
+        prev_rots = gt_bbox_3d[:, 6:7]
+        prev_locs = gt_bbox_3d[:, 0:3]
 
         ################## load bboxes of current frame ##############
         lidar_path, curr_boxes, _ = nusc.get_sample_data(curr_dict['lidar_token'])
@@ -473,43 +637,50 @@ def main(nusc, val_list, indice, args):
         gt_bbox_3d[:, 2] -= dims[:, 2] / 2.
         gt_bbox_3d[:, 2] = gt_bbox_3d[:, 2]
         gt_bbox_3d[:, 3:6] = gt_bbox_3d[:, 3:6]
-        rots = gt_bbox_3d[:, 6:7]
-        locs = gt_bbox_3d[:, 0:3]
+        curr_rots = gt_bbox_3d[:, 6:7]
+        curr_locs = gt_bbox_3d[:, 0:3]
 
-        ################## place the points into corresponding bboxes ##############
-        curr_object_points_list = []
+        ################## place aligned object points into corresponding bboxes ##############
+        prev_box_idx_by_token = {}
+        for j, object_token in enumerate(prev_dict['object_tokens']):
+            if object_token not in prev_box_idx_by_token:
+                prev_box_idx_by_token[object_token] = j
+
+        curr_box_idx_by_token = {}
         for j, object_token in enumerate(curr_dict['object_tokens']):
-            for k, object_token_in_zoo in enumerate(object_token_zoo):
-                if object_token == object_token_in_zoo:
-                    points = object_points_xyz[k]
-                    Rot = Rotation.from_euler('z', rots[j], degrees=False)
-                    rotated_object_points = Rot.apply(points)
-                    points = rotated_object_points + locs[j]
-                    curr_object_points_list.append(points)
+            if object_token not in curr_box_idx_by_token:
+                curr_box_idx_by_token[object_token] = j
 
-        ################## get the intersection of current and next object points list ##############
-        # Find intersection of object tokens between previous and current frames
-        intersection_object_tokens = set(prev_dict['object_tokens']).intersection(curr_dict['object_tokens'])
+        common_object_tokens = []
+        seen_common_tokens = set()
+        for object_token in prev_dict['object_tokens']:
+            if object_token in seen_common_tokens:
+                continue
+            if object_token not in curr_box_idx_by_token:
+                continue
+            if object_token not in object_points_xyz_by_token:
+                continue
+            common_object_tokens.append(object_token)
+            seen_common_tokens.add(object_token)
 
-        # Create masks for filtering object points
-        prev_obj_mask = [token in intersection_object_tokens for token in prev_dict['object_tokens']]
-        curr_obj_mask = [token in intersection_object_tokens for token in curr_dict['object_tokens']]
-
-        # Filter prev object points based on the mask
         filtered_prev_object_points_list = []
         filtered_prev_object_boxes_list = []
-        for j, prev_object_point in enumerate(prev_object_points_list):
-            if prev_obj_mask[j]:
-                filtered_prev_object_points_list.append(prev_object_point)
-                filtered_prev_object_boxes_list.append(prev_boxes[j])
-
-        # Filter curr object points based on the mask
         filtered_curr_object_points_list = []
         filtered_curr_object_boxes_list = []
-        for j, curr_object_point in enumerate(curr_object_points_list):
-            if curr_obj_mask[j]:
-                filtered_curr_object_points_list.append(curr_object_point)
-                filtered_curr_object_boxes_list.append(curr_boxes[j])
+        for object_token in common_object_tokens:
+            prev_box_idx = prev_box_idx_by_token[object_token]
+            curr_box_idx = curr_box_idx_by_token[object_token]
+            canonical_object_points = object_points_xyz_by_token[object_token]
+
+            prev_rot = Rotation.from_euler('z', prev_rots[prev_box_idx], degrees=False)
+            prev_object_points = prev_rot.apply(canonical_object_points) + prev_locs[prev_box_idx]
+            filtered_prev_object_points_list.append(prev_object_points)
+            filtered_prev_object_boxes_list.append(prev_boxes[prev_box_idx])
+
+            curr_rot = Rotation.from_euler('z', curr_rots[curr_box_idx], degrees=False)
+            curr_object_points = curr_rot.apply(canonical_object_points) + curr_locs[curr_box_idx]
+            filtered_curr_object_points_list.append(curr_object_points)
+            filtered_curr_object_boxes_list.append(curr_boxes[curr_box_idx])
         
         # visualize_prev_frame(filtered_prev_object_points_list,
         #                             filtered_prev_object_boxes_list)
@@ -527,6 +698,17 @@ def main(nusc, val_list, indice, args):
             curr_scene_points = np.concatenate([curr_point_cloud, curr_temp])
         except:
             curr_scene_points = curr_point_cloud
+
+        if prev_scene_points.shape[0] != curr_scene_points.shape[0]:
+            raise RuntimeError(
+                "Aligned scene point count mismatch before range cropping: "
+                f"scene_indice={indice}, prev_idx={prev_idx}, curr_idx={curr_idx}, "
+                f"prev_static={len(prev_point_cloud)}, curr_static={len(curr_point_cloud)}, "
+                f"prev_objects={len(filtered_prev_object_points_list)}, "
+                f"curr_objects={len(filtered_curr_object_points_list)}, "
+                f"common_tokens={len(common_object_tokens)}, "
+                f"prev_points={prev_scene_points.shape[0]}, curr_points={curr_scene_points.shape[0]}"
+            )
 
         ################## remain points with a spatial range ##############
         prev_range_mask = (np.abs(prev_scene_points[:, 0]) < 50) & (np.abs(prev_scene_points[:, 1]) < 50.0) \
@@ -556,23 +738,64 @@ def main(nusc, val_list, indice, args):
 
 
         ################## save the scene points and object points  ########################
+        prev_scene_points = prev_scene_points.astype(np.float32, copy=False)
+        curr_scene_points = curr_scene_points.astype(np.float32, copy=False)
+
         pc_file_name_folder = curr_dict['pc_file_name'].replace('.pcd.bin', '')
         pc_file_name_folder = f"scene_{indice}_{pc_file_name_folder}"
-        dirs = os.path.join(save_path, 'scene_flow_all_frames/', pc_file_name_folder)
+        dirs = os.path.join(save_path, scene_flow_subdir, pc_file_name_folder)
         if not os.path.exists(dirs):
             os.makedirs(dirs)
 
         np.save(os.path.join(dirs, 'pc_prev.npy'), prev_scene_points)
         np.save(os.path.join(dirs, 'pc_curr.npy'), curr_scene_points)
 
-        i = i + 1
-        continue
-
 
 def save_ply(points, name):
     point_cloud_original = o3d.geometry.PointCloud()
     point_cloud_original.points = o3d.utility.Vector3dVector(points[:,:3])
     o3d.io.write_point_cloud("{}.ply".format(name), point_cloud_original)
+
+
+def load_scene_names(scene_list_file):
+    scene_names = []
+    with open(scene_list_file, 'r') as file:
+        for line in file:
+            scene_name = line.strip()
+            if not scene_name or scene_name.startswith('#'):
+                continue
+            scene_names.append(scene_name)
+    return scene_names
+
+
+def resolve_scene_indices(nusc, scene_names):
+    scene_index_by_name = {scene['name']: idx for idx, scene in enumerate(nusc.scene)}
+
+    missing_scene_names = [scene_name for scene_name in scene_names if scene_name not in scene_index_by_name]
+    if missing_scene_names:
+        missing_str = ', '.join(missing_scene_names[:10])
+        if len(missing_scene_names) > 10:
+            missing_str += ', ...'
+        raise ValueError(f"Unknown scene names in scene list: {missing_str}")
+
+    selected_scene_indices = []
+    seen_scene_names = set()
+    duplicate_scene_names = []
+    for scene_name in scene_names:
+        if scene_name in seen_scene_names:
+            duplicate_scene_names.append(scene_name)
+            continue
+        seen_scene_names.add(scene_name)
+        selected_scene_indices.append(scene_index_by_name[scene_name])
+
+    if duplicate_scene_names:
+        duplicate_scene_names = sorted(set(duplicate_scene_names))
+        duplicate_str = ', '.join(duplicate_scene_names[:10])
+        if len(duplicate_scene_names) > 10:
+            duplicate_str += ', ...'
+        print(f"Ignoring duplicate scene names from scene list: {duplicate_str}")
+
+    return selected_scene_indices
 
 
 if __name__ == '__main__':
@@ -586,6 +809,30 @@ if __name__ == '__main__':
     parse.add_argument('--end', type=int, default=2)
     parse.add_argument('--dataroot', type=str, default='./Datasets/nuscenes/')
     parse.add_argument('--nusc_val_list', type=str, default='./tools/generate_scene_flow_nuscenes/nuscenes_val_list.txt')
+    parse.add_argument('--scene_list_file', type=str, default=None,
+                       help='Optional text file containing one scene name per line, e.g. scene-0001.')
+    parse.add_argument('--keyframe_only', action='store_true',
+                       help='Only export scene flow pairs between consecutive annotated LiDAR key frames.')
+    parse.add_argument('--bbox_adjustment_mode', type=str, default='global', choices=['global', 'class_aware'],
+                       help='How to enlarge boxes for static/dynamic separation. class_aware ignores --bbox_dilation and --bbox_shift.')
+    parse.add_argument('--bbox_dilation', type=float, nargs=3, default=[0.0, 0.0, 0.0],
+                       help='Optional bbox dilation added to box w/l/h before separating dynamic and static points.')
+    parse.add_argument('--bbox_shift', type=float, nargs=3, default=[0.0, 0.0, 0.0],
+                       help='Optional xyz shift applied to the separation-stage boxes after converting to box format.')
+    parse.add_argument('--static_context_mode', type=str, default='scene', choices=['scene', 'local'],
+                       help='Static background aggregation mode: whole scene or local window around the current pair.')
+    parse.add_argument('--static_context_radius', type=int, default=10,
+                       help='Number of sweeps on each side when static_context_mode=local.')
+    parse.add_argument('--static_ground_dedup', type=str, default='off', choices=['off', 'bev'],
+                       help='Optional de-layering for near-ground static background points before prev/curr transforms.')
+    parse.add_argument('--static_ground_grid_size', type=float, default=0.15,
+                       help='XY grid size in meters for static ground de-layering.')
+    parse.add_argument('--static_ground_z_max', type=float, default=-1.0,
+                       help='Only static points below this z in the first-frame lidar coordinate are considered ground.')
+    parse.add_argument('--static_ground_min_points_per_cell', type=int, default=3,
+                       help='Minimum points in one BEV cell before static ground de-layering is applied.')
+    parse.add_argument('--static_ground_cell_z_span_max', type=float, default=0.4,
+                       help='Only collapse BEV cells whose ground candidate z span is at most this value.')
     args=parse.parse_args()
 
     if args.dataset=='nuscenes':
@@ -612,6 +859,23 @@ if __name__ == '__main__':
     # with open(label_mapping, 'r') as stream:
     #     nuscenesyaml = yaml.safe_load(stream)
 
-    for i in range(args.start,args.end):
-        print('processing sequecne:', i)
+    if args.scene_list_file:
+        scene_names = load_scene_names(args.scene_list_file)
+        if not scene_names:
+            raise ValueError(f"No valid scene names found in {args.scene_list_file}")
+
+        selected_scene_indices = resolve_scene_indices(nusc, scene_names)
+        print(
+            f"Using custom scene list from {args.scene_list_file} with {len(selected_scene_indices)} scenes. "
+            f"Ignoring --split={args.split!r} and --start/--end for scene selection."
+        )
+    else:
+        if args.start < 0 or args.end > len(nusc.scene) or args.start >= args.end:
+            raise ValueError(
+                f"Invalid scene index range [{args.start}, {args.end}) for {len(nusc.scene)} available scenes."
+            )
+        selected_scene_indices = list(range(args.start, args.end))
+
+    for i in selected_scene_indices:
+        print(f"processing sequecne: {i} ({nusc.scene[i]['name']})")
         main(nusc, val_list, indice=i, args=args)
