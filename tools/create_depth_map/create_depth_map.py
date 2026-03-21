@@ -10,6 +10,7 @@ from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
 from PIL import Image
 from tools.cyberrock.sjtu_test_info import undistort_image
+from utils.nusc_paths import make_nusc_relative_path
 
 # 读取旧外参
 # front -> pandar:
@@ -161,7 +162,7 @@ def main(args):
                 np.save(depth_save_path, depth)
 
                 # 将 depth 路径信息添加到 info 中
-                info['prev_camera_data'][channel]['depth_pred'] = depth_save_path
+                info['prev_camera_data'][channel]['depth_pred'] = make_nusc_relative_path(depth_save_path)
 
                 # # 归一化深度图到 [0,255]
                 # depth_vis = np.clip(depth, 0, max_depth) / max_depth * 255
@@ -194,7 +195,7 @@ def main(args):
                 np.save(depth_save_path, depth)
                 
                 # 将 depth 路径信息添加到 info 中
-                info['curr_camera_data'][channel]['depth_pred'] = depth_save_path
+                info['curr_camera_data'][channel]['depth_pred'] = make_nusc_relative_path(depth_save_path)
                 
             data_new.append(info)
 
@@ -246,7 +247,7 @@ def main(args):
                 np.save(depth_save_path, depth)
 
                 # 将 depth 路径信息添加到 info 中
-                info['prev_camera_data'][channel]['depth_pred'] = depth_save_path
+                info['prev_camera_data'][channel]['depth_pred'] = make_nusc_relative_path(depth_save_path)
 
                 # # 归一化深度图到 [0,255]
                 # depth_vis = np.clip(depth, 0, max_depth) / max_depth * 255
@@ -277,7 +278,7 @@ def main(args):
                 np.save(depth_save_path, depth)
                 
                 # 将 depth 路径信息添加到 info 中
-                info['curr_camera_data'][channel]['depth_pred'] = depth_save_path
+                info['curr_camera_data'][channel]['depth_pred'] = make_nusc_relative_path(depth_save_path)
                 
         #     data_new.append(info)
         

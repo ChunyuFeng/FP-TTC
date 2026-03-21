@@ -13,6 +13,7 @@ from dataloader.utils.geometry import get_geometry, range_projection_with_mappin
 import matplotlib.pyplot as plt
 from scipy.ndimage import distance_transform_edt
 from fpttc.scale_net.utils.spherical import build_lidar_to_camera_projection
+from utils.nusc_paths import resolve_nusc_path
 
 class nuScenes_range_image(data.Dataset):
     def __init__(self,
@@ -26,6 +27,7 @@ class nuScenes_range_image(data.Dataset):
         # self.root = root
         self.train_info_path = train_info_path
         self.train_info_file = train_info_file
+        self.dataset_root = osp.dirname(osp.normpath(self.train_info_path))
         self.data = None  # 用于存储从 pkl 文件中加载的数据
         # self.train_location = train_location
 
@@ -71,16 +73,14 @@ class nuScenes_range_image(data.Dataset):
         # 结合 DepthAnything 预测的 Depth Pred Map，提前计算每一个像素坐标对应的 Range View 坐标
 
         for i in tqdm(range(len(self.data)), desc='Loading nuScenes Range Image Dataset'):
-
-            if self.data[i]['scene_indice'] == '10':
-                continue
             
             # 1. 模型 Input
             self.image_list.append([self.data[i]['prev_camera_data'],
                                     self.data[i]['curr_camera_data']])
             
             # 2. Ground Truth Range Image —— Scale Map, Risk Score Map, Depth Map
-            range_image_path = os.path.join(self.data[i]['gt_map_path'], 'range_image_curr.npy')
+            range_image_dir = resolve_nusc_path(self.data[i]['gt_map_path'], self.dataset_root)
+            range_image_path = os.path.join(str(range_image_dir), 'range_image_curr.npy')
             if not osp.exists(range_image_path):
                 raise FileNotFoundError(f"Range image file {range_image_path} does not exist.")
             range_image = np.load(range_image_path, allow_pickle=True).item()
@@ -106,22 +106,32 @@ class nuScenes_range_image(data.Dataset):
         curr_surr_view_depths = {}
 
         camera_channels = self.camera_channels    
-        path_prefix = './Datasets/nuscenes/'
-
         # 1. 按照相机通道读取相邻帧的图像和深度预测结果
         for channel in camera_channels:
             # 1）读取相邻帧的图像
-            prev_surr_view_imgs_path     = os.path.join(path_prefix, self.image_list[index][0][channel]['filename'])
+            prev_surr_view_imgs_path = resolve_nusc_path(
+                self.image_list[index][0][channel]['filename'],
+                self.dataset_root,
+            )
             prev_surr_view_imgs[channel] = Image.open(prev_surr_view_imgs_path)
 
-            curr_surr_view_imgs_path     = os.path.join(path_prefix, self.image_list[index][1][channel]['filename'])
+            curr_surr_view_imgs_path = resolve_nusc_path(
+                self.image_list[index][1][channel]['filename'],
+                self.dataset_root,
+            )
             curr_surr_view_imgs[channel] = Image.open(curr_surr_view_imgs_path)
 
             # 2) 读取相邻帧的 Depth Pred Map (DepthAnythingV2 Metric)
-            prev_surr_view_depths_path     = self.image_list[index][0][channel]['depth_pred']
+            prev_surr_view_depths_path = resolve_nusc_path(
+                self.image_list[index][0][channel]['depth_pred'],
+                self.dataset_root,
+            )
             prev_surr_view_depths[channel] = np.load(prev_surr_view_depths_path)
 
-            curr_surr_view_depths_path     = self.image_list[index][1][channel]['depth_pred']
+            curr_surr_view_depths_path = resolve_nusc_path(
+                self.image_list[index][1][channel]['depth_pred'],
+                self.dataset_root,
+            )
             curr_surr_view_depths[channel] = np.load(curr_surr_view_depths_path)
 
         # 2. 获取 ground truth 的 scale map、risk score map 和 depth map

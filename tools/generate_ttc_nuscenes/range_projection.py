@@ -6,6 +6,10 @@ from nuscenes.nuscenes import NuScenes
 import matplotlib.pyplot as plt
 import argparse
 from PIL import Image
+from utils.nusc_paths import make_nusc_relative_path
+
+CAMERA_CHANNELS = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
+                   'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
 
 def compute_percentage_in_range(data_frame, t):
     """
@@ -91,6 +95,179 @@ def extract_timestamp(folder_name):
     except Exception as e:
         print(f"无法从 {folder_name} 中提取时间戳: {e}")
         return None
+
+def infer_output_variant(scene_flow_path):
+    scene_flow_dir = os.path.basename(os.path.normpath(scene_flow_path))
+    if scene_flow_dir.startswith('scene_flow_'):
+        return scene_flow_dir[len('scene_flow_'):]
+    if 'key_frame' in scene_flow_dir:
+        return 'key_frames'
+    if 'all_frame' in scene_flow_dir:
+        return 'all_frames'
+    return scene_flow_dir or 'scene_flow'
+
+def load_scene_names(scene_list_file):
+    scene_names = []
+    with open(scene_list_file, 'r') as file:
+        for line in file:
+            scene_name = line.strip()
+            if not scene_name or scene_name.startswith('#'):
+                continue
+            scene_names.append(scene_name)
+    return scene_names
+
+def resolve_scene_indices(nusc, scene_names):
+    scene_index_by_name = {scene['name']: idx for idx, scene in enumerate(nusc.scene)}
+
+    missing_scene_names = [scene_name for scene_name in scene_names if scene_name not in scene_index_by_name]
+    if missing_scene_names:
+        missing_str = ', '.join(missing_scene_names[:10])
+        if len(missing_scene_names) > 10:
+            missing_str += ', ...'
+        raise ValueError(f"Unknown scene names in scene list: {missing_str}")
+
+    selected_scene_indices = []
+    seen_scene_names = set()
+    duplicate_scene_names = []
+    for scene_name in scene_names:
+        if scene_name in seen_scene_names:
+            duplicate_scene_names.append(scene_name)
+            continue
+        seen_scene_names.add(scene_name)
+        selected_scene_indices.append(scene_index_by_name[scene_name])
+
+    if duplicate_scene_names:
+        duplicate_scene_names = sorted(set(duplicate_scene_names))
+        duplicate_str = ', '.join(duplicate_scene_names[:10])
+        if len(duplicate_scene_names) > 10:
+            duplicate_str += ', ...'
+        print(f"Ignoring duplicate scene names from scene list: {duplicate_str}")
+
+    return selected_scene_indices
+
+
+def resolve_target_scene_indices(nusc, args):
+    if args.scene_list_file:
+        scene_names = load_scene_names(args.scene_list_file)
+        if not scene_names:
+            raise ValueError(f"No valid scene names found in {args.scene_list_file}")
+        target_scene_indices = {str(scene_idx) for scene_idx in resolve_scene_indices(nusc, scene_names)}
+        if args.scene_indices:
+            print(
+                f"Using custom scene list from {args.scene_list_file}; ignoring --scene_indices={args.scene_indices!r}."
+            )
+        return target_scene_indices
+
+    if args.scene_indices:
+        return {str(scene_idx) for scene_idx in args.scene_indices}
+
+    return None
+
+
+def collect_scene_flow_folders(scene_flow_path, target_scene_indices=None):
+    folders_with_timestamps = []
+    for folder_name in os.listdir(scene_flow_path):
+        full_path = os.path.join(scene_flow_path, folder_name)
+        if not os.path.isdir(full_path):
+            continue
+
+        folder = folder_name[:-4] if folder_name.endswith('.pcd') else folder_name
+        try:
+            scene_indice = folder.split('_')[1]
+        except IndexError:
+            continue
+
+        if target_scene_indices is not None and scene_indice not in target_scene_indices:
+            continue
+
+        timestamp = extract_timestamp(folder)
+        if timestamp is None:
+            continue
+
+        folders_with_timestamps.append((folder, timestamp, scene_indice))
+
+    folders_with_timestamps.sort(key=lambda x: x[1])
+    return folders_with_timestamps
+
+
+def iter_scene_samples(nusc, scene_index):
+    scene = nusc.scene[scene_index]
+    sample = nusc.get('sample', scene['first_sample_token'])
+    samples = []
+    while True:
+        samples.append(sample)
+        if sample['next'] == '':
+            break
+        sample = nusc.get('sample', sample['next'])
+    return samples
+
+
+def build_scene_flow_lut_global(nusc, folders_with_timestamps):
+    lidar_sweep_not_found_in_nusc_count = 0
+    scene_flow_lut = []
+    for folder, timestamp, scene_indice in folders_with_timestamps:
+        lidar_sample_data = find_lidar_top_sample_data(nusc, timestamp)
+        if lidar_sample_data:
+            lidar_record = dict(lidar_sample_data)
+            lidar_record['folder_name'] = folder
+            lidar_record['scene_indice'] = scene_indice
+            scene_flow_lut.append(lidar_record)
+        else:
+            lidar_sweep_not_found_in_nusc_count += 1
+    return scene_flow_lut, lidar_sweep_not_found_in_nusc_count
+
+
+def build_scene_flow_lut_single_scene(nusc, folders_with_timestamps, scene_index):
+    scene_samples = iter_scene_samples(nusc, scene_index)
+    lidar_by_timestamp = {}
+    for sample in scene_samples:
+        lidar_sample_data = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+        lidar_by_timestamp[lidar_sample_data['timestamp']] = lidar_sample_data
+
+    lidar_sweep_not_found_in_nusc_count = 0
+    scene_flow_lut = []
+    for folder, timestamp, scene_indice in folders_with_timestamps:
+        lidar_sample_data = lidar_by_timestamp.get(timestamp)
+        if lidar_sample_data:
+            lidar_record = dict(lidar_sample_data)
+            lidar_record['folder_name'] = folder
+            lidar_record['scene_indice'] = scene_indice
+            scene_flow_lut.append(lidar_record)
+        else:
+            lidar_sweep_not_found_in_nusc_count += 1
+
+    return scene_flow_lut, lidar_sweep_not_found_in_nusc_count, scene_samples
+
+
+def build_matched_frame_records_single_scene(nusc, scene_samples, scene_flow_lut):
+    scene_flow_by_timestamp = {record['timestamp']: record for record in scene_flow_lut}
+    matched_frame_records = []
+
+    for sample in scene_samples:
+        lidar_sample_data = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+        lidar_record = scene_flow_by_timestamp.get(lidar_sample_data['timestamp'])
+        if lidar_record is None:
+            continue
+
+        camera_data_combined = {}
+        is_complete_surround_view = True
+        for camera_channel in CAMERA_CHANNELS:
+            camera_token = sample['data'].get(camera_channel)
+            if not camera_token:
+                is_complete_surround_view = False
+                break
+            camera_data_combined[camera_channel] = nusc.get('sample_data', camera_token)
+
+        if not is_complete_surround_view:
+            continue
+
+        matched_frame_records.append({
+            'camera': camera_data_combined,
+            'lidar': lidar_record
+        })
+
+    matched_frame_records.sort(key=lambda x: x['camera']['CAM_BACK_LEFT']['timestamp'])
+    return matched_frame_records
 
 # 获取 LIDAR_TOP 对应的 sample data
 def find_lidar_top_sample_data(nusc, timestamp):
@@ -283,43 +460,60 @@ def compute_radical_component(points_prev, points_curr):
 
 def main(args):
 
-    if args.trainval_test_split == 'trainval':
-        print("Creating TrainVal Info ...")
-    elif args.trainval_test_split == 'test':
-        print("Creating Test Info ...")
-    else:
-        raise ValueError("Invalid trainval_test_split value. Must be 'trainval' or 'test'.")
+    split_display_name = {
+        'train': 'Train',
+        'val': 'Val',
+        'test': 'Test',
+    }.get(args.trainval_test_split)
+    if split_display_name is None:
+        raise ValueError("Invalid trainval_test_split value. Must be 'train', 'val' or 'test'.")
+    print(f"Creating {split_display_name} Info ...")
+
+    output_variant = infer_output_variant(args.scene_flow_path)
+    range_image_width = args.image_size[1] * 6
+    range_image_dir_name = (
+        f'range_image_{output_variant}_{args.image_size[0]}_{range_image_width}_fov_{args.fov[0]}_{args.fov[1]}'
+    )
+    pkl_file_name = (
+        f'nusc_{args.trainval_test_split}_infos_{output_variant}_{args.image_size[0]}_{range_image_width}_fov_'
+        f'{args.fov[0]}_{args.fov[1]}.pkl'
+    )
+
+    target_scene_indices = resolve_target_scene_indices(nusc, args)
+    if target_scene_indices is not None:
+        print(f"目标场景过滤集合: {sorted(target_scene_indices)}")
 
     ################################################ 创建场景流 LUT ################################################
-    # folder name 包含了时间戳信息，读取所有的文件夹名称
-    folder_names = [folder_name[:-4] if folder_name.endswith('.pcd') else folder_name
-                    for folder_name in os.listdir(args.scene_flow_path)
-                    if os.path.isdir(os.path.join(args.scene_flow_path, folder_name))]
+    folders_with_timestamps = collect_scene_flow_folders(args.scene_flow_path, target_scene_indices)
+    if not folders_with_timestamps:
+        raise RuntimeError(
+            f"No scene flow folders matched the requested scenes under {args.scene_flow_path}"
+        )
 
-    # 提取folder name中的时间戳信息，并将timestamp和folder name绑定在一起
-    folders_with_timestamps = [(folder_name, extract_timestamp(folder_name)) for folder_name in folder_names if
-                               extract_timestamp(folder_name) is not None]
+    single_scene_fast_path = (
+        target_scene_indices is not None
+        and len(target_scene_indices) == 1
+        and output_variant == 'key_frames'
+    )
+    scene_samples = None
+    if single_scene_fast_path:
+        target_scene_index = int(next(iter(target_scene_indices)))
+        print(
+            f"Using single-scene fast path for scene index {target_scene_index} "
+            f"({nusc.scene[target_scene_index]['name']})."
+        )
+        scene_flow_lut, lidar_sweep_not_found_in_nusc_count, scene_samples = build_scene_flow_lut_single_scene(
+            nusc, folders_with_timestamps, target_scene_index
+        )
+    else:
+        scene_flow_lut, lidar_sweep_not_found_in_nusc_count = build_scene_flow_lut_global(
+            nusc, folders_with_timestamps
+        )
 
-    # 按照时间戳进行排序
-    folders_with_timestamps.sort(key=lambda x: x[1])
-
-    # 提取排序后的文件夹名称和对应的 LIDAR_TOP token
-    # token信息暂时没有使用
-    lidar_sweep_not_found_in_nusc = []
-    lidar_sweep_not_found_in_nusc_count = 0
-    scene_flow_lut = []
-    # count = 0
-    for folder, timestamp in folders_with_timestamps:
-        lidar_sample_data = find_lidar_top_sample_data(nusc, timestamp)
-        scene_indice = folder.split('_')[1]
-        if lidar_sample_data:
-            lidar_sample_data['folder_name'] = folder
-            lidar_sample_data['scene_indice'] = scene_indice
-            scene_flow_lut.append(lidar_sample_data)
-        else:
-            # lidar_sweep_not_found_in_nusc.append(folder)
-            lidar_sweep_not_found_in_nusc_count += 1
     print(f"场景流 LUT 已创建完成，已按照时间戳排序，共有 {len(scene_flow_lut)} 条数据")
+
+    if not scene_flow_lut:
+        raise RuntimeError(f"No scene flow data found under {args.scene_flow_path}")
 
     if lidar_sweep_not_found_in_nusc_count > 0:
         print(f"在 NuScenes 数据集中找不到的 LIDAR sweeps 数量: {lidar_sweep_not_found_in_nusc_count}")
@@ -335,69 +529,67 @@ def main(args):
     # 提取时间戳信息
     lidar_timestamps = [record['timestamp'] for record in scene_flow_lut]
 
-    # 定义6个相机通道
-    camera_channels = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT',
-                       'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']
+    if single_scene_fast_path:
+        matched_frame_records = build_matched_frame_records_single_scene(nusc, scene_samples, scene_flow_lut)
+    else:
+        # 获取 LIDAR_TOP 时间戳范围内的相机数据
+        camera_data_within_timestamp_range = {}
+        timestamp_range = [lidar_timestamps[0], lidar_timestamps[-1]]
+        for camera_channel in CAMERA_CHANNELS:
+            camera_data_within_timestamp_range[camera_channel] = \
+                find_matching_camera_sweep_in_nusc(nusc, timestamp_range, camera_channel)
 
-    # 获取 LIDAR_TOP 时间戳范围内的相机数据
-    camera_data_within_timestamp_range = {}
-    timestamp_range = [lidar_timestamps[0], lidar_timestamps[-1]]
-    for camera_channel in camera_channels:
-        camera_data_within_timestamp_range[camera_channel] = \
-            find_matching_camera_sweep_in_nusc(nusc, timestamp_range, camera_channel)
+        matched_frame_records = []
 
-    camera_lut = []
-    # nuscenes 数据集中，激光雷达数据的频率为20hz，相机数据的频率为12hz
-    # 保留与图像数据对应的激光雷达数据
-    lidar_data_matched_with_images = []
+        # 对6个相机通道的数据按照时间戳进行排序
+        for camera_channel in CAMERA_CHANNELS:
+            camera_data = camera_data_within_timestamp_range[camera_channel] or []
+            camera_data.sort(key=lambda x: x['timestamp'])
+            camera_data_within_timestamp_range[camera_channel] = camera_data
 
-    # camera_data_dict = {}
-    # for camera_channel, camera_data in camera_data_within_timestamp_range.items():
-    #     camera_data_dict[camera_channel] = []
-    #     for data in camera_data:
-    #         camera_data_dict[camera_channel].append(data)
+        # 以 CAM_BACK_LEFT 为基准，向前查找属于同一组数据的 6 帧图像
+        for camera_data_bl in camera_data_within_timestamp_range['CAM_BACK_LEFT']:
+            # 检查 CAM_BACK_LEFT 时间戳前后 25ms 内是否有 LIDAR_TOP 数据
+            # 如果没有，说明这一组图像没有对应的 LIDAR_TOP 数据，跳过
+            timestamp_range = [camera_data_bl['timestamp'] - 25 * 1e3, camera_data_bl['timestamp'] + 25 * 1e3]
+            lidar_data = find_matching_sf_sweep_in_lut(scene_flow_lut, timestamp_range)
+            if not lidar_data:
+                continue
 
-    # 对6个相机通道的数据按照时间戳进行排序
-    for camera_channel in camera_channels:
-        camera_data_within_timestamp_range[camera_channel].sort(key=lambda x: x['timestamp'])
+            camera_data_combined = {}
+            camera_data_combined['CAM_BACK_LEFT'] = camera_data_bl
+            target_timestamp = camera_data_bl['timestamp']
 
-    # 以 CAM_BACK_LEFT 为基准，向前查找属于同一组数据的 6 帧图像
-    for camera_data_bl in camera_data_within_timestamp_range['CAM_BACK_LEFT']:
-        # 检查 CAM_BACK_LEFT 时间戳前后 25ms 内是否有 LIDAR_TOP 数据
-        # 如果没有，说明这一组图像没有对应的 LIDAR_TOP 数据，跳过
-        timestamp_range = [camera_data_bl['timestamp'] - 25 * 1e3, camera_data_bl['timestamp'] + 25 * 1e3]
-        lidar_data = find_matching_sf_sweep_in_lut(scene_flow_lut, timestamp_range)
-        if not lidar_data:
-            continue
+            # 查找 CAM_BACK_LEFT 前 50ms 内的相机数据
+            for camera_channel in ['CAM_BACK', 'CAM_BACK_RIGHT', 'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']:
+                # 同一组数据的 6 帧图像时间戳差值在 50 ms 以内
+                matched_cam = find_surround_view_images_for_same_frame(
+                    camera_data_within_timestamp_range[camera_channel], target_timestamp, delta_timestamp=50*1e3)
+                if matched_cam:
+                    camera_data_combined[camera_channel] = matched_cam
 
-        camera_data_combined = {}
-        camera_data_combined['CAM_BACK_LEFT'] = camera_data_bl
-        target_timestamp = camera_data_bl['timestamp']
+            # 检查 camera_data_combined 的 6 个相机通道中是否都有数据
+            is_complete_surround_view = (len(camera_data_combined) == 6)
+            if is_complete_surround_view:
+                matched_frame_records.append({
+                    'camera': camera_data_combined,
+                    'lidar': lidar_data
+                })
 
-        # 查找 CAM_BACK_LEFT 前 50ms 内的相机数据
-        for camera_channel in ['CAM_BACK', 'CAM_BACK_RIGHT', 'CAM_FRONT_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT']:
-            # 同一组数据的 6 帧图像时间戳差值在 50 ms 以内
-            matched_cam = find_surround_view_images_for_same_frame(
-                camera_data_within_timestamp_range[camera_channel], target_timestamp, delta_timestamp=50*1e3)
-            if matched_cam:
-                camera_data_combined[camera_channel] = matched_cam
+    # 保持相机组与对应的场景流样本一一绑定后再排序，避免两侧分别排序造成错位。
+    matched_frame_records.sort(key=lambda x: x['camera']['CAM_BACK_LEFT']['timestamp'])
 
-        # 检查 camera_data_combined 的 6 个相机通道中是否都有数据
-        is_complete_surround_view = (len(camera_data_combined) == 6)
-        if is_complete_surround_view:
-            camera_lut.append(camera_data_combined)
-            lidar_data_matched_with_images.append(lidar_data)
-
-    # 对组合好的6通道相机数据按照时间戳进行排序
-    camera_lut = sorted(camera_lut, key=lambda x: x['CAM_BACK_LEFT']['timestamp'])
-    lidar_data_matched_with_images = sorted(lidar_data_matched_with_images, key=lambda x: x['timestamp'])
+    if not matched_frame_records:
+        raise RuntimeError("No complete surround-view camera groups matched to scene-flow data.")
 
     # 相邻两组数据进行组合，打包成可以直接用于训练的格式
     trainval_test_infos = []
-    for i in tqdm(range(1, len(camera_lut)), desc="Combining camera and scene flow data"):
+    for i in tqdm(range(1, len(matched_frame_records)), desc="Combining camera and scene flow data"):
         # 取出连续两组数据
-        previous_surround_view_data = camera_lut[i-1]
-        current_surround_view_data = camera_lut[i]
+        previous_frame_record = matched_frame_records[i - 1]
+        current_frame_record = matched_frame_records[i]
+        previous_surround_view_data = previous_frame_record['camera']
+        current_surround_view_data = current_frame_record['camera']
 
         # 取出时间戳信息
         camera_timestamp_1 = previous_surround_view_data['CAM_BACK_LEFT']['timestamp']
@@ -406,21 +598,24 @@ def main(args):
         # 计算时间戳差值
         time_diff_cam = camera_timestamp_2 - camera_timestamp_1
 
-        # 每秒内的数据分布:
-        # LiDAR  20hz: | x x x x x x x x x x x x x x x x x x x x |
-        # Camera 12hz: | x   x   x x   x   x x   x   x x   x   x |  
-        #              | x<->x<->x x<->x<->x x<->x<->x x<->x<->x |  只选择100ms间隔的图像对
-        # 如果时间戳差值小于 75 毫秒或者大于 125 毫秒，则跳过
-        # 50 ms 为激光雷达的采样间隔，25 ms 为余量
-        if time_diff_cam > (50*2+25) * 1e3 or time_diff_cam < (50*1+25) * 1e3:
+        # 取出 scene flow 数据
+        previous_sf_record = previous_frame_record['lidar']
+        current_sf_record = current_frame_record['lidar']
+
+        # 禁止跨 scene 组合相邻样本。
+        if previous_sf_record['scene_indice'] != current_sf_record['scene_indice']:
             continue
 
-        # 相邻帧图像数据的时间戳差值为 n*50 ms
-        time_diff_ratio = round(time_diff_cam / (50*1e3))
+        time_diff_sf = current_sf_record['timestamp'] - previous_sf_record['timestamp']
 
-        # 取出 scene flow 数据
-        previous_sf_record = lidar_data_matched_with_images[i-1]
-        current_sf_record = lidar_data_matched_with_images[i]
+        if time_diff_sf <= 0:
+            continue
+
+        # 只保留与相邻 scene-flow 时间差一致的图像对。
+        if abs(time_diff_cam - time_diff_sf) > 50 * 1e3:
+            continue
+
+        time_diff_ratio = time_diff_cam / time_diff_sf
 
         scene_indice = current_sf_record['scene_indice']
 
@@ -428,22 +623,21 @@ def main(args):
         #     continue
 
         # 读取 scene flow 数据
-        if (not os.path.exists(os.path.join(args.scene_flow_path, current_sf_record['folder_name'], 'pc_prev.npy'))
-                or not os.path.exists(os.path.join(args.scene_flow_path, current_sf_record['folder_name'], 'pc_curr.npy'))):
-            i = i + 1
+        current_scene_flow_path = os.path.join(args.scene_flow_path, current_sf_record['folder_name'])
+        points_prev_path = os.path.join(current_scene_flow_path, 'pc_prev.npy')
+        points_curr_path = os.path.join(current_scene_flow_path, 'pc_curr.npy')
+        if (not os.path.exists(points_prev_path)
+                or not os.path.exists(points_curr_path)):
             continue
-        points_prev = np.load(os.path.join(args.scene_flow_path, current_sf_record['folder_name'], 'pc_prev.npy'))
-        points_curr = np.load(os.path.join(args.scene_flow_path, current_sf_record['folder_name'], 'pc_curr.npy'))
-        # 对 scene flow 数据进行时间插值
-        # sf = pc3 - pc1; sf' = time_diff_ratio * sf; pc3' = pc1 + sf'
-        # => pc3' = pc1 + time_diff_ratio * (pc3 - pc1)
-        # => pc3' = time_diff_ratio * pc3 + (1 - time_diff_ratio) * pc1
-        points_prev = points_curr - time_diff_ratio * (points_curr - points_prev)
-        # points_curr = time_diff_ratio * points_curr + (1 - time_diff_ratio) * points_prev
+
+        points_prev = np.load(points_prev_path)
+        points_curr = np.load(points_curr_path)
+        # 对 scene flow 数据进行时间插值/外推，使其对齐当前图像对的时间间隔。
+        points_prev_aligned = points_curr - time_diff_ratio * (points_curr - points_prev)
 
         # 计算激光雷达坐标系下的尺度
         # depth 为 x-y 平面上距原点的距离
-        depth_xy_prev = np.linalg.norm(points_prev[:, :2], axis=1)
+        depth_xy_prev = np.linalg.norm(points_prev_aligned[:, :2], axis=1)
         depth_xy_curr = np.linalg.norm(points_curr[:, :2], axis=1)
 
         # 避免除以零
@@ -453,15 +647,15 @@ def main(args):
         # 用径向速度作为风险系数
         # risk_score = compute_radical_component(points_prev, points_curr)
         # 用运动矢量和径向之间的角度作为风险系数
-        risk_score = compute_radical_angle(points_prev, points_curr, motion_thresh=0.005)
+        risk_score = compute_radical_angle(points_prev_aligned, points_curr, motion_thresh=0.005)
 
         # Range Projection，将 scale 和 risk_score 投影到 Range Image 上
         proj_range, proj_scale, proj_risk_score, proj_xyz, proj_idx, proj_mask = range_projection(
-            points_prev,
+            points_prev_aligned,
             scales,
             risk_score,
             H=args.image_size[0],
-            W=args.image_size[1]*6,
+            W=range_image_width,
             fov_up=args.fov[0], # nuscenes 使用的 LiDAR fov
             fov_down=-args.fov[1]  # nuscenes 使用的 LiDAR fov
         )
@@ -471,7 +665,7 @@ def main(args):
             scales,
             risk_score,
             H=args.image_size[0],
-            W=args.image_size[1]*6,
+            W=range_image_width,
             fov_up=args.fov[0], # nuscenes 使用的 LiDAR fov
             fov_down=-args.fov[1]  # nuscenes 使用的 LiDAR fov
         )
@@ -495,23 +689,22 @@ def main(args):
         }
 
         range_image_save_path = os.path.join(args.gt_map_save_path,
-                                             f'range_image_all_frames_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_new',
+                                             range_image_dir_name,
                                              current_sf_record['folder_name'])
-        if not os.path.exists(range_image_save_path):
-            os.makedirs(range_image_save_path)
+        os.makedirs(range_image_save_path, exist_ok=True)
         
         # 保存 range image 为 npy 文件
         np.save(os.path.join(range_image_save_path, 'range_image_prev.npy'), range_image_prev)
         np.save(os.path.join(range_image_save_path, 'range_image_curr.npy'), range_image_curr)
 
         # 读取 LiDAR 和 Camera 对应的标定信息，作为 sensor_metas 传入网络
-        camera_calib = {}
-        camera_pose = {}
+        prev_camera_calib = {}
+        prev_camera_pose = {}
         # prev 帧的标定信息
-        for camera_channel in camera_channels:
+        for camera_channel in CAMERA_CHANNELS:
             camera_data = previous_surround_view_data[camera_channel]
-            camera_calib[camera_channel] = nusc.get('calibrated_sensor', camera_data['calibrated_sensor_token'])
-            camera_pose[camera_channel] = nusc.get('ego_pose', camera_data['ego_pose_token'])
+            prev_camera_calib[camera_channel] = nusc.get('calibrated_sensor', camera_data['calibrated_sensor_token'])
+            prev_camera_pose[camera_channel] = nusc.get('ego_pose', camera_data['ego_pose_token'])
         lidar_calib = nusc.get('calibrated_sensor', previous_sf_record['calibrated_sensor_token'])
         lidar_pose = nusc.get('ego_pose', previous_sf_record['ego_pose_token'])
         sensor_metas_prev = {
@@ -520,16 +713,18 @@ def main(args):
                 'ego_pose': lidar_pose,
             },
             'camera':{
-                'calibrated_sensor': camera_calib,
-                'ego_pose': camera_pose,
+                'calibrated_sensor': prev_camera_calib,
+                'ego_pose': prev_camera_pose,
             }
         }
 
         # curr 帧的标定信息
-        for camera_channel in camera_channels:
+        curr_camera_calib = {}
+        curr_camera_pose = {}
+        for camera_channel in CAMERA_CHANNELS:
             camera_data = current_surround_view_data[camera_channel]
-            camera_calib[camera_channel] = nusc.get('calibrated_sensor', camera_data['calibrated_sensor_token'])
-            camera_pose[camera_channel] = nusc.get('ego_pose', camera_data['ego_pose_token'])
+            curr_camera_calib[camera_channel] = nusc.get('calibrated_sensor', camera_data['calibrated_sensor_token'])
+            curr_camera_pose[camera_channel] = nusc.get('ego_pose', camera_data['ego_pose_token'])
 
         lidar_calib = nusc.get('calibrated_sensor', current_sf_record['calibrated_sensor_token'])
         lidar_pose = nusc.get('ego_pose', current_sf_record['ego_pose_token'])
@@ -539,21 +734,24 @@ def main(args):
                 'ego_pose': lidar_pose,
             },
             'camera':{
-                'calibrated_sensor': camera_calib,
-                'ego_pose': camera_pose,
+                'calibrated_sensor': curr_camera_calib,
+                'ego_pose': curr_camera_pose,
             }
         }
 
         info = {
             'prev_camera_data': previous_surround_view_data,
             'curr_camera_data': current_surround_view_data,
-            'prev_lidar_data': lidar_data_matched_with_images[i-1], 
-            'curr_lidar_data': lidar_data_matched_with_images[i],
+            'prev_lidar_data': previous_sf_record,
+            'curr_lidar_data': current_sf_record,
             'sensor_metas_prev': sensor_metas_prev,
             'sensor_metas_curr': sensor_metas_curr,
-            'gt_map_path': range_image_save_path,
-            'scene_flow_path': os.path.join(args.scene_flow_path, current_sf_record['folder_name']),
-            'scene_indice': scene_indice
+            'gt_map_path': make_nusc_relative_path(range_image_save_path),
+            'scene_flow_path': make_nusc_relative_path(current_scene_flow_path),
+            'scene_indice': scene_indice,
+            'time_diff_cam_us': time_diff_cam,
+            'time_diff_sf_us': time_diff_sf,
+            'time_diff_ratio': time_diff_ratio,
         }
         
         trainval_test_infos.append(info)
@@ -565,10 +763,9 @@ def main(args):
             risk_score_display[proj_mask == 0] = 0.0  # 将无效像素设为0
             
             risk_score_vis_save_path = os.path.join(args.vis_dir, 'risk_score_map',
-                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_theta_new")
+                                                f"{output_variant}_{args.image_size[0]}_{range_image_width}_fov_{args.fov[0]}_{args.fov[1]}_theta")
             
-            if not os.path.exists(risk_score_vis_save_path):
-                os.makedirs(risk_score_vis_save_path)
+            os.makedirs(risk_score_vis_save_path, exist_ok=True)
 
             risk_score_vis_name = f"scene_{scene_indice}_risk_score_map_{i}.png"
 
@@ -581,7 +778,7 @@ def main(args):
             valid_mask = scale_display >= 0
 
             # 将用于可视化的尺度值裁切到 [0.5, 1.5] 范围
-            scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.85, 1.15)
+            scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.5, 1.5)
 
             # 将尺度的分界线从 1 移至 0（scale - 1）
             deviations = np.zeros_like(scale_display, dtype=np.float32)
@@ -619,9 +816,8 @@ def main(args):
             normalized_display[~valid_mask] = 0.0
             
             scale_map_vis_save_path = os.path.join(args.vis_dir, 'scale_map',
-                                                f"{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}")
-            if not os.path.exists(scale_map_vis_save_path):
-                os.makedirs(scale_map_vis_save_path)
+                                                f"{output_variant}_{args.image_size[0]}_{range_image_width}_fov_{args.fov[0]}_{args.fov[1]}")
+            os.makedirs(scale_map_vis_save_path, exist_ok=True)
 
             out_name = f"scene_{scene_indice}_scale_map_{i}.png"
             out_path = os.path.join(scale_map_vis_save_path, out_name)
@@ -633,14 +829,13 @@ def main(args):
             raise NotImplementedError
         ###################################### 可视化 ######################################
     
-    # 对 camera_lut 和 lidar_data_matched_with_images 
+    os.makedirs(args.pkl_save_path, exist_ok=True)
     print(f"Succesfully created (Surround View Images Pair & Lidar Sample Data Pair & Scene Flow & Scale Map & Depth Map & Risk Score Map). \
           Sorted by timestamp. {len(trainval_test_infos)} items in total.")
 
-    with open(os.path.join(args.pkl_save_path,
-                           f"nusc_{args.trainval_test_split}_infos_{args.image_size[0]}_{args.image_size[1]*6}_fov_{args.fov[0]}_{args.fov[1]}_new.pkl"),'wb') as f:
+    with open(os.path.join(args.pkl_save_path, pkl_file_name), 'wb') as f:
         pickle.dump(trainval_test_infos, f)
-    print(f"Saved nusc_trainval_infos.pkl to {args.pkl_save_path}")
+    print(f"Saved {pkl_file_name} to {args.pkl_save_path}")
 
 if __name__ == "__main__":
     # NuScenes 数据集路径
@@ -648,7 +843,7 @@ if __name__ == "__main__":
                     verbose=True)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--scene_flow_path', type=str, default='./Datasets/nuscenes/0_scene_flow/scene_flow_all_frames',
+    parser.add_argument('--scene_flow_path', type=str, default='./Datasets/nuscenes/0_scene_flow/scene_flow_key_frames',
                        help='Path to scene flow data')
     parser.add_argument('--gt_map_save_path', type=str, default='./Datasets/nuscenes/1_gt_map',
                        help='Path to save ground truth, including scale map, depth map and risk score map')
@@ -660,8 +855,12 @@ if __name__ == "__main__":
                        help='image size for training')
     parser.add_argument('--fov', default=[10, 20], type=int, nargs='+',
                        help='LiDAR fov, [fov_up, fov_down], in degree')
-    parser.add_argument('--trainval_test_split', default='trainval', type=str,
-                       help='trainval and test split, can be trainval or test')
+    parser.add_argument('--trainval_test_split', default='train', type=str,
+                       help='Output split name, can be train, val or test')
+    parser.add_argument('--scene_list_file', default=None, type=str,
+                       help='Optional text file containing one scene name per line, e.g. scene-0001.')
+    parser.add_argument('--scene_indices', default=None, type=str, nargs='+',
+                       help='Optional scene indices to filter existing scene_flow_key_frames, e.g. --scene_indices 0 1')
     # parser.add_argument('--save_gt', default=False, type=bool,
     #                    help='Flag to control whether to save ground truth map (including scale map, depth map and risk score map)')
     parser.add_argument('--scale_map_vis', action='store_true',
