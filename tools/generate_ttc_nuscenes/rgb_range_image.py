@@ -3,6 +3,7 @@ from tqdm import tqdm
 import os
 import numpy as np
 import pickle
+from pathlib import Path
 from nuscenes.utils.geometry_utils import view_points
 import argparse
 from pyquaternion import Quaternion
@@ -11,6 +12,7 @@ import cv2
 import glob
 
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
+from utils.nusc_paths import infer_nusc_dataset_root, resolve_nusc_path
 
 augmentor = NuscRangeImageAugmentor(crop_size=(160, 320),
                                     do_flip=False,
@@ -200,7 +202,7 @@ def project_to_rgb_range_image0(proj_xyz,
         cam_pose = sensor_metas['camera']['ego_pose'][channel]
 
         # 加载相机图像并转为 numpy array
-        im = Image.open(os.path.join('./Datasets/nuscenes', cam_info['filename']))
+        im = Image.open(resolve_nusc_path(cam_info['filename']))
         im_arr = np.array(im)  # H_cam x W_cam x 3
 
         # 相机外参（反向变换）
@@ -381,6 +383,7 @@ def project_to_rgb_range_image(proj_xyz,
     return rgb_range
 
 def main(args):
+    dataset_root = infer_nusc_dataset_root(args.pkl_path)
 
     try:
         with open(args.pkl_path, "rb") as f:
@@ -392,7 +395,8 @@ def main(args):
         print(e)
 
     for idx, info in enumerate(tqdm(trainval_test_info, desc="Processing info")):
-        gt_map = np.load(os.path.join(info['gt_map_path'], 'range_image.npy'),
+        gt_map_path = resolve_nusc_path(info['gt_map_path'], dataset_root) / 'range_image.npy'
+        gt_map = np.load(gt_map_path,
                          allow_pickle=True).item()
         
         rgb_range_image = project_to_rgb_range_image(

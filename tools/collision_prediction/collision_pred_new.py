@@ -20,6 +20,7 @@ from utils.draw import (
     visual_scale_map_range_image,
     visual_risk_score_map_range_image
 )
+from utils.nusc_paths import resolve_nusc_path
 from collision_utils import (
     get_second_grad,
     get_ttc_var,
@@ -647,7 +648,7 @@ def overlay_surround_views(collisions, test_info, args, idx):
     """
     # 读取深度真值和相机元数据
     gt = np.load(
-        os.path.join(test_info['gt_map_path'], 'range_image_prev.npy'),
+        resolve_nusc_path(test_info['gt_map_path'], args.dataroot) / 'range_image_prev.npy',
         allow_pickle=True
     ).item()
     depth_map = gt['depth']

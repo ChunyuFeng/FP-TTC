@@ -19,6 +19,7 @@ from utils.draw import (
     scale2rgb,
     orientation2rgb
 )
+from utils.nusc_paths import resolve_nusc_path
 from collision_utils import (
     get_second_grad,
     get_ttc_var,
@@ -355,7 +356,7 @@ def overlay_surround_views(collisions, test_info, args, idx):
     在环视图上叠加碰撞点、裁剪、拼接并保存
     """
     gt = np.load(
-        os.path.join(test_info['gt_map_path'], 'range_image_prev.npy'),
+        resolve_nusc_path(test_info['gt_map_path'], args.dataroot) / 'range_image_prev.npy',
         allow_pickle=True
     ).item()
     depth_map = gt['depth']
@@ -530,7 +531,7 @@ def main():
 
             # ----- gt scale -----
             gt = np.load(
-                os.path.join(test_infos[idx]['gt_map_path'], 'range_image_prev.npy'),
+                resolve_nusc_path(test_infos[idx]['gt_map_path'], args.dataroot) / 'range_image_prev.npy',
                 allow_pickle=True
             ).item()
             gt_scale_map = gt['scale']
@@ -541,7 +542,7 @@ def main():
 
             # ----- gt risk -----
             gt = np.load(
-                os.path.join(test_infos[idx]['gt_map_path'], 'range_image_prev.npy'),
+                resolve_nusc_path(test_infos[idx]['gt_map_path'], args.dataroot) / 'range_image_prev.npy',
                 allow_pickle=True
             ).item()
             gt_risk_map = gt['risk_score']

@@ -3,10 +3,12 @@ from tqdm import tqdm
 import os
 import numpy as np
 import pickle
+from pathlib import Path
 from nuscenes.utils.geometry_utils import view_points
 import argparse
 from pyquaternion import Quaternion
 import time
+from utils.nusc_paths import infer_nusc_dataset_root, resolve_nusc_path
 
 def project_spherical_voxels_to_cameras(sensor_metas: dict,
                                         xyz: np.ndarray,
@@ -137,6 +139,7 @@ def build_spherical_voxels(H, W, R,
     return sph, xyz
 
 def main(args):
+    dataset_root = infer_nusc_dataset_root(args.pkl_path)
 
     try:
         with open(args.pkl_path, "rb") as f:
@@ -149,7 +152,8 @@ def main(args):
 
     for idx, info in enumerate(tqdm(trainval_test_info, desc="Processing info")):
         start = time.time()
-        gt_map = np.load(os.path.join(info['gt_map_path'], 'range_image.npy'),
+        gt_map_path = resolve_nusc_path(info['gt_map_path'], dataset_root) / 'range_image.npy'
+        gt_map = np.load(gt_map_path,
                          allow_pickle=True).item()
         H, W, R = 160, 1920, 16
         sph, xyz = build_spherical_voxels(

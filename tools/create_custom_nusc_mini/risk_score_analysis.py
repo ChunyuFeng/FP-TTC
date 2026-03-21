@@ -2,10 +2,12 @@ import pickle
 import argparse
 import os
 import shutil
+from pathlib import Path
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
+from utils.nusc_paths import infer_nusc_dataset_root, resolve_nusc_path
 
 def load_pkl_file(filepath):
     """
@@ -27,9 +29,10 @@ def main(args):
     max_val = []
     min_val = []
     if data is not None:
+        dataset_root = infer_nusc_dataset_root(args.pkl_file_path)
         data_length = len(data)
         for i in tqdm(range(data_length), desc="Processing data"):
-            gt_map_path = os.path.join(data[i]['gt_map_path'], 'range_image.npy') 
+            gt_map_path = resolve_nusc_path(data[i]['gt_map_path'], dataset_root) / 'range_image.npy'
             gt_map = np.load(gt_map_path, allow_pickle=True).item()
             scale_map = gt_map['scale']
             mask = (scale_map>0.3)&(scale_map<3.0)
