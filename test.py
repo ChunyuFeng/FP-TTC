@@ -32,6 +32,7 @@ from dataloader.utils.augmentor import NuscRangeImageAugmentor
 from dataloader.dataset import build_frame_mapping, build_frame_mapping_fast
 from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
 from utils.loss import get_loss_scale_map, get_loss_risk_score_map, compute_errs_ttc_from_scale, eval_orientation_and_highrisk_stats, reduce_metrics_across_frames
+from utils.nusc_paths import resolve_nusc_path
 
 parser = argparse.ArgumentParser()
 
@@ -116,8 +117,8 @@ parser.add_argument('--save_pred_npy', action='store_true',
                     help='Save prediction as .npy files for collision map generation')
 parser.add_argument('--pred_npy_dir', default='./Datasets/nuscenes/3_visualization/collision_pred',
                     type=str, help='Directory to save prediction .npy files')
-parser.add_argument('--test_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/nusc_trainval_infos_160_1920.pkl',
-                    type=str, help='Path to test info file (e.g., nusc_trainval_infos_160_1920.pkl)')
+parser.add_argument('--test_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/val/nusc_val_infos_key_frames_160_1920_fov_8_15.pkl',
+                    type=str, help='Path to test info file (e.g., nusc_val_infos_key_frames_160_1920_fov_8_15.pkl)')
 
 args = parser.parse_args()
 

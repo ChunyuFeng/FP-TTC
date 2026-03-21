@@ -21,6 +21,7 @@ from tqdm import tqdm
 from fpttc.scale_net.utils.spherical import build_spherical_voxels, project_voxel_to_camera
 from tools.cyberrock.sjtu_test_info import undistort_image, intersect_rois
 from PIL import ImageDraw
+from utils.nusc_paths import resolve_nusc_path
 parser = argparse.ArgumentParser()
 
 # Dataset & evaluation parameters
@@ -93,8 +94,8 @@ parser.add_argument('--save_pred_npy', action='store_true',
                     help='Save prediction as .npy files for collision map generation')
 parser.add_argument('--pred_npy_dir', default='./Datasets/nuscenes/3_visualization/collision_pred',
                     type=str, help='Directory to save prediction .npy files')
-parser.add_argument('--test_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/nusc_trainval_infos_160_1920.pkl',
-                    type=str, help='Path to test info file (e.g., nusc_trainval_infos_160_1920.pkl)')
+parser.add_argument('--test_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/val/nusc_val_infos_key_frames_160_1920_fov_8_15.pkl',
+                    type=str, help='Path to test info file (e.g., nusc_val_infos_key_frames_160_1920_fov_8_15.pkl)')
 
 args = parser.parse_args()
 
@@ -280,8 +281,14 @@ def main():
             prev_depth_pred_map = {}
             curr_depth_pred_map = {}
             for channel in camera_channels:
-                depth_pred_prev_path = test_entries[idx]['prev_camera_data'][channel]['depth_pred']
-                depth_pred_curr_path = test_entries[idx]['curr_camera_data'][channel]['depth_pred']
+                depth_pred_prev_path = resolve_nusc_path(
+                    test_entries[idx]['prev_camera_data'][channel]['depth_pred'],
+                    './Datasets/nuscenes',
+                )
+                depth_pred_curr_path = resolve_nusc_path(
+                    test_entries[idx]['curr_camera_data'][channel]['depth_pred'],
+                    './Datasets/nuscenes',
+                )
 
                 prev_depth_pred_map[channel] = np.load(depth_pred_prev_path)
                 curr_depth_pred_map[channel] = np.load(depth_pred_curr_path)
@@ -384,8 +391,14 @@ def main():
             prev_depth_pred_map = {}
             curr_depth_pred_map = {}
             for channel in camera_channels:
-                depth_pred_prev_path = test_entries[idx]['prev_camera_data'][channel]['depth_pred']
-                depth_pred_curr_path = test_entries[idx]['curr_camera_data'][channel]['depth_pred']
+                depth_pred_prev_path = resolve_nusc_path(
+                    test_entries[idx]['prev_camera_data'][channel]['depth_pred'],
+                    './Datasets/nuscenes',
+                )
+                depth_pred_curr_path = resolve_nusc_path(
+                    test_entries[idx]['curr_camera_data'][channel]['depth_pred'],
+                    './Datasets/nuscenes',
+                )
 
                 prev_depth_pred_map[channel] = np.load(depth_pred_prev_path)
                 curr_depth_pred_map[channel] = np.load(depth_pred_curr_path)

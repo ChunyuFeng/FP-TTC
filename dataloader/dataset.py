@@ -13,19 +13,21 @@ from dataloader.utils.geometry import get_geometry, range_projection_with_mappin
 import matplotlib.pyplot as plt
 from scipy.ndimage import distance_transform_edt
 from fpttc.scale_net.utils.spherical import build_lidar_to_camera_projection
+from utils.nusc_paths import infer_nusc_dataset_root, resolve_nusc_depth_pred_path, resolve_nusc_path
 
 class nuScenes_range_image(data.Dataset):
     def __init__(self,
                  aug_params=None,
                  split='training',
-                 train_info_path='./Datasets/nuscenes/2_trainval_test_infos',
-                 train_info_file='nusc_trainval_infos_160_1920.pkl'
+                 train_info_path='./Datasets/nuscenes/2_trainval_test_infos/train',
+                 train_info_file='nusc_train_infos_key_frames_160_1920_fov_8_15.pkl'
                  ):
         self.aug_params = aug_params
         self.split = split
         # self.root = root
         self.train_info_path = train_info_path
         self.train_info_file = train_info_file
+        self.dataset_root = infer_nusc_dataset_root(self.train_info_path)
         self.data = None  # 用于存储从 pkl 文件中加载的数据
         # self.train_location = train_location
 
@@ -70,17 +72,15 @@ class nuScenes_range_image(data.Dataset):
         # 在加载数据集时离线构建 spherical voxel grid
         # 结合 DepthAnything 预测的 Depth Pred Map，提前计算每一个像素坐标对应的 Range View 坐标
 
-        for i in tqdm(range(len(self.data)-1794), desc='Loading nuScenes Range Image Dataset'):
-
-            if self.data[i]['scene_indice'] == '10':
-                continue
+        for i in tqdm(range(len(self.data)), desc='Loading nuScenes Range Image Dataset'):
             
             # 1. 模型 Input
             self.image_list.append([self.data[i]['prev_camera_data'],
                                     self.data[i]['curr_camera_data']])
             
             # 2. Ground Truth Range Image —— Scale Map, Risk Score Map, Depth Map
-            range_image_path = os.path.join(self.data[i]['gt_map_path'], 'range_image_curr.npy')
+            range_image_dir = resolve_nusc_path(self.data[i]['gt_map_path'], self.dataset_root)
+            range_image_path = os.path.join(str(range_image_dir), 'range_image_curr.npy')
             if not osp.exists(range_image_path):
                 raise FileNotFoundError(f"Range image file {range_image_path} does not exist.")
             range_image = np.load(range_image_path, allow_pickle=True).item()
@@ -91,9 +91,13 @@ class nuScenes_range_image(data.Dataset):
             # 3. 环视图像 (cam_idx, u, v) 与 range image (u, v) 之间的映射关系
             #    通过 DepthAnything 预测的 Depth Pred Map + 内外参 计算得到
             proj_range_prev, proj_pix_prev, sensor_metas_prev = build_frame_mapping(self.data, 'nusc', 'prev', None,
-                                                                                    self.affine_matrix, i, H_r=40, W_r=480)
+                                                                                    self.affine_matrix, i,
+                                                                                    dataset_root=self.dataset_root,
+                                                                                    H_r=40, W_r=480)
             proj_range_curr, proj_pix_curr, sensor_metas_curr = build_frame_mapping(self.data, 'nusc', 'curr', None,
-                                                                                    self.affine_matrix, i, H_r=40, W_r=480)
+                                                                                    self.affine_matrix, i,
+                                                                                    dataset_root=self.dataset_root,
+                                                                                    H_r=40, W_r=480)
             self.proj_list.append([proj_pix_prev, proj_pix_curr])
             sensor_metas = {'prev': sensor_metas_prev, 'curr': sensor_metas_curr}
             self.sensor_meta_list.append(sensor_metas)
@@ -110,22 +114,32 @@ class nuScenes_range_image(data.Dataset):
         curr_surr_view_depths = {}
 
         camera_channels = self.camera_channels    
-        path_prefix = './Datasets/nuscenes/'
-
         # 1. 按照相机通道读取相邻帧的图像和深度预测结果
         for channel in camera_channels:
             # 1）读取相邻帧的图像
-            prev_surr_view_imgs_path     = os.path.join(path_prefix, self.image_list[index][0][channel]['filename'])
+            prev_surr_view_imgs_path = resolve_nusc_path(
+                self.image_list[index][0][channel]['filename'],
+                self.dataset_root,
+            )
             prev_surr_view_imgs[channel] = Image.open(prev_surr_view_imgs_path)
 
-            curr_surr_view_imgs_path     = os.path.join(path_prefix, self.image_list[index][1][channel]['filename'])
+            curr_surr_view_imgs_path = resolve_nusc_path(
+                self.image_list[index][1][channel]['filename'],
+                self.dataset_root,
+            )
             curr_surr_view_imgs[channel] = Image.open(curr_surr_view_imgs_path)
 
             # 2) 读取相邻帧的 Depth Pred Map (DepthAnythingV2 Metric)
-            prev_surr_view_depths_path     = self.image_list[index][0][channel]['depth_pred']
+            prev_surr_view_depths_path = resolve_nusc_depth_pred_path(
+                self.image_list[index][0][channel],
+                self.dataset_root,
+            )
             prev_surr_view_depths[channel] = np.load(prev_surr_view_depths_path)
 
-            curr_surr_view_depths_path     = self.image_list[index][1][channel]['depth_pred']
+            curr_surr_view_depths_path = resolve_nusc_depth_pred_path(
+                self.image_list[index][1][channel],
+                self.dataset_root,
+            )
             curr_surr_view_depths[channel] = np.load(curr_surr_view_depths_path)
 
         # 2. 获取 ground truth 的 scale map、risk score map 和 depth map
@@ -202,7 +216,8 @@ class nuScenes_range_image(data.Dataset):
 
 
 def build_frame_mapping(data, dataset_key, frame_key, depth_map,
-                        affine_matrix, idx, H_r=40, W_r=480, visualize=False):
+                        affine_matrix, idx, dataset_root='./Datasets/nuscenes',
+                        H_r=40, W_r=480, visualize=False):
     """
     读取该帧的相机深度预测结果，以及内外参信息，将其反投影到 LiDAR 坐标系
     并进行 range projection，得到 range image 的投影坐标
@@ -238,7 +253,10 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
 
         elif dataset_key == 'nusc':
             # # 读取 idx 帧、cam_idx 相机的 depth pred map
-            depth_pred_path = data[idx][f'{frame_key}_camera_data'][channel]['depth_pred']
+            depth_pred_path = resolve_nusc_depth_pred_path(
+                data[idx][f'{frame_key}_camera_data'][channel],
+                dataset_root,
+            )
             depth_map  = np.load(depth_pred_path)  # (H_img, W_img)
             proj_matrix, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
                 data[idx][f'sensor_metas_{frame_key}'],
@@ -579,8 +597,8 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
 
     if args.stage == 'nuscenes_range_image':
         aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
-        train_info_file = 'nusc_trainval_infos_160_1920_fov_8_15_dpt.pkl'
-        train_info_path = './Datasets/nuscenes/2_trainval_test_infos'
+        train_info_file = 'nusc_train_infos_key_frames_160_1920_fov_8_15.pkl'
+        train_info_path = './Datasets/nuscenes/2_trainval_test_infos/train'
 
         nuscenes = nuScenes_range_image(aug_params,
                                         train_info_file=train_info_file,
