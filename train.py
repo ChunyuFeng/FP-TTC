@@ -33,6 +33,26 @@ parser.add_argument('--image_size', default=[384, 512], type=int, nargs='+',
                     help='image size for training')
 parser.add_argument('--padding_factor', default=16, type=int,
                     help='the input should be divisible by padding_factor, otherwise do padding or resizing')
+parser.add_argument('--train_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/train', type=str,
+                    help='path to the train pkl directory')
+parser.add_argument('--train_info_file', default='nusc_train_infos_key_frames_160_1920_fov_8_15.pkl', type=str,
+                    help='train pkl file name')
+parser.add_argument('--val_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/val', type=str,
+                    help='path to the val pkl directory')
+parser.add_argument('--val_info_file', default='nusc_val_infos_key_frames_160_1920_fov_8_15.pkl', type=str,
+                    help='val pkl file name')
+parser.add_argument('--require_complete_depth', action='store_true',
+                    help='only keep samples whose 12 depth maps all exist')
+parser.add_argument('--max_train_samples', default=None, type=int,
+                    help='limit the number of train samples after filtering')
+parser.add_argument('--proj_cache_root',
+                    default='./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_hardproj_v1',
+                    type=str,
+                    help='root directory of precomputed proj_pix cache')
+parser.add_argument('--val_proj_cache_root',
+                    default='./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_hardproj_v1',
+                    type=str,
+                    help='root directory of precomputed val proj_pix cache')
 
 # evaluation
 parser.add_argument('--eval', action='store_true',
@@ -54,9 +74,12 @@ parser.add_argument('--grad_clip', default=1.0, type=float)
 parser.add_argument('--num_steps', default=100000, type=int)
 parser.add_argument('--seed', default=326, type=int)
 parser.add_argument('--summary_freq', default=100, type=int)
-parser.add_argument('--val_freq', default=10000, type=int)
+parser.add_argument('--val_freq', default=1, type=int)
 parser.add_argument('--save_ckpt_freq', default=10000, type=int)
 parser.add_argument('--save_latest_ckpt_freq', default=1000, type=int)
+parser.add_argument('--val_batch_size', default=1, type=int)
+parser.add_argument('--save_best', default=True, action=argparse.BooleanOptionalAction,
+                    help='save best checkpoint based on validation loss')
 
 # resume pretrained model or resume training
 parser.add_argument('--resume', default=None, type=str,
@@ -259,7 +282,12 @@ def main():
     if is_main_process():
         print('Start Loading ...')
 
-    dataset = datasets.fetch_dataloader(args) 
+    train_dataset = datasets.fetch_dataloader(args)
+    val_dataset = datasets.fetch_val_dataloader(args)
+
+    if is_main_process():
+        print(f"Train samples: {len(train_dataset)}")
+        print(f"Val samples:   {len(val_dataset)}")
     
     # stage 1: train scale branch
     if args.train_stage in ('scale', 'both'):
@@ -323,7 +351,8 @@ def main():
 
         # 2) compute scale loss
         trainer = TTCTrainer(model       = model,
-                             dataset     = dataset,
+                             dataset     = train_dataset,
+                             val_dataset = val_dataset,
                              optimizer   = optimizer,
                              args        = args,
                              start_epoch = start_epoch,
@@ -362,7 +391,8 @@ def main():
         print(f"Training risk branch for {args.risk_epochs} epochs...")
         # 2) compute risk loss
         trainer = TTCTrainer(model       = model,
-                             dataset     = dataset,
+                             dataset     = train_dataset,
+                             val_dataset = val_dataset,
                              optimizer   = optimizer,
                              args        = args,
                              start_epoch = start_epoch,

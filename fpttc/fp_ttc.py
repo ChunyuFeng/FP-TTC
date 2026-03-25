@@ -103,13 +103,11 @@ class FpTTC(nn.Module):
 
         # ----- 预处理 -----
         img0, img1 = normalize_img(img_prev, img_curr)         # [B,V,3,H,W] -> normed
-        rgbd0 = torch.cat([img0, depth_prev], dim=2)           # [B,V,4,H,W]
-        rgbd1 = torch.cat([img1, depth_curr], dim=2)           # [B,V,4,H,W]
-        B, V, C, H_img, W_img = rgbd0.shape
+        B, V, C, H_img, W_img = img0.shape
 
         # 合并视角到 batch 维，一次性提特征
-        x0 = rgbd0.view(B*V, C, H_img, W_img)
-        x1 = rgbd1.view(B*V, C, H_img, W_img)
+        x0 = img0.view(B*V, C, H_img, W_img)
+        x1 = img1.view(B*V, C, H_img, W_img)
         # extract_feature 会在内部 cat([x0, x1], 0) -> cnet -> 多尺度 -> chunk 回来
         prev_lvls_flat, curr_lvls_flat = self.extract_feature(x0, x1, branch=None)  # list[T][B*V,C,Hs,Ws]
 

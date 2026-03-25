@@ -26,6 +26,7 @@ from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_load
 
 class TTCTrainer(object):
     def __init__(self, model, dataset, optimizer, args, start_epoch, device,
+                val_dataset=None,
                 parallel=False, time_stamp=None, 
                 neptune_run=None, scale_only=False):
         self.model = model
@@ -48,6 +49,16 @@ class TTCTrainer(object):
                                            shuffle     = False, 
                                            pin_memory  = True, 
                                            num_workers = args.num_workers)
+        self.val_loader = None
+        if val_dataset is not None:
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=args.val_batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                drop_last=False,
+                pin_memory=True,
+            )
 
         if self.scale_only:
             self.epoch = args.scale_epochs
@@ -94,11 +105,15 @@ class TTCTrainer(object):
         self.iters = 0
 
         self.neptune_run = neptune_run
+        self.val_freq = max(1, args.val_freq)
+        self.save_best = args.save_best
+        self.best_val_loss = float('inf')
+        self.out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
+        self.best_ckpt_name = 'best_scale.pth.tar' if self.scale_only else 'best_risk.pth.tar'
 
 
     def train(self):
-        out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
-        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(self.out_dir, exist_ok=True)
 
         if is_main_process():
             for i, pg in enumerate(self.optimizer.param_groups):
@@ -110,23 +125,29 @@ class TTCTrainer(object):
             self.loss_per_epoch = 0
             self.loss_sum_per_epoch = 0
             self.iters = 0
-            self.train_epoch(epoch)
+            train_loss = self.train_epoch(epoch)
+            val_loss = None
+            if self.val_loader is not None and epoch % self.val_freq == 0:
+                val_loss = self.validate_epoch(epoch)
 
             if is_main_process():
                 if (epoch < self.epoch and epoch % self.checkpoint_interval == 0):
-                    checkpoint = {
-                        "net": self.model.state_dict(),
-                        'optimizer': self.optimizer.state_dict(),
-                        "epoch": epoch + 1
-                    }
-                    # # 用当前的时间戳为模型保存路径命名
                     if self.scale_only:
-                        temp_pth = os.path.join(out_dir, f'{epoch}_scale.pth.tar')
+                        temp_pth = os.path.join(self.out_dir, f'{epoch}_scale.pth.tar')
                     else:
-                        temp_pth = os.path.join(out_dir, f'{epoch}.pth.tar')
-                    torch.save(checkpoint, temp_pth)
+                        temp_pth = os.path.join(self.out_dir, f'{epoch}.pth.tar')
+                    self._save_checkpoint(temp_pth, epoch)
 
-                print("Loss in epoch", epoch, ":", self.loss_per_epoch / max(1, self.iters))
+                if self.save_best and val_loss is not None and val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    best_path = os.path.join(self.out_dir, self.best_ckpt_name)
+                    self._save_checkpoint(best_path, epoch)
+                    print(f"Best checkpoint updated: {best_path} (val_loss={val_loss:.6f})")
+
+                print("Train loss in epoch", epoch, ":", train_loss)
+                if val_loss is not None:
+                    print("Val loss in epoch", epoch, ":", val_loss)
+                    print("Best val loss so far:", self.best_val_loss)
                 for i, pg in enumerate(self.optimizer.param_groups):
                     print(f"  param group {i} lr = {pg['lr']:.3e}")
 
@@ -140,7 +161,6 @@ class TTCTrainer(object):
         epoch_loss = 0
         steps = 0
 
-        out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
         save_index = 1000
         for i, data in enumerate(self.train_loader):
             
@@ -228,8 +248,8 @@ class TTCTrainer(object):
                     pred_scale_valid_mask = scale_np > 0
                     normalized_pred = visual_scale_map_range_image(scale_np, pred_scale_valid_mask)
 
-                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
-                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
+                    plt.imsave(os.path.join(self.out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
+                    plt.imsave(os.path.join(self.out_dir, f"{epoch}_{i}_gt.png"), -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
 
                 else: 
                     gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
@@ -243,8 +263,8 @@ class TTCTrainer(object):
                     normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np, None)
 
                     # 保存可视化结果
-                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), -normalized_pred_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), -normalized_gt_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+                    plt.imsave(os.path.join(self.out_dir, f"{epoch}_{i}_pred_risk.png"), -normalized_pred_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+                    plt.imsave(os.path.join(self.out_dir, f"{epoch}_{i}_gt_risk.png"), -normalized_gt_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
 
             loss_last = None
             # If an auxiliary loss (loss_last) is available, use it for reporting.
@@ -287,6 +307,78 @@ class TTCTrainer(object):
             for group_idx, pg in enumerate(self.optimizer.param_groups):
                 tag = f"train/epoch_learning_rate_group_{group_idx}"
                 self.neptune_run[tag].append(pg["lr"], step=epoch)
+
+        return avg_loss
+
+    @torch.no_grad()
+    def validate_epoch(self, epoch):
+        if self.val_loader is None:
+            return None
+
+        if is_main_process():
+            print(f"Validation epoch {epoch} ...")
+
+        self.model.eval()
+        total_loss = 0.0
+        total_steps = 0
+
+        for data in self.val_loader:
+            (prev_surr_view_imgs_tensor,
+             curr_surr_view_imgs_tensor,
+             prev_surr_view_depths_tensor,
+             curr_surr_view_depths_tensor,
+             proj_pix_prev_tensor,
+             proj_pix_curr_tensor,
+             gt_scale_map_with_mask,
+             gt_risk_score_map_with_mask) = data
+
+            prev_surr_view_imgs_tensor   = prev_surr_view_imgs_tensor.to(self.device)
+            curr_surr_view_imgs_tensor   = curr_surr_view_imgs_tensor.to(self.device)
+            prev_surr_view_depths_tensor = prev_surr_view_depths_tensor.to(self.device)
+            curr_surr_view_depths_tensor = curr_surr_view_depths_tensor.to(self.device)
+            proj_pix_prev_tensor         = proj_pix_prev_tensor.to(self.device)
+            proj_pix_curr_tensor         = proj_pix_curr_tensor.to(self.device)
+            gt_scale_map_with_mask       = gt_scale_map_with_mask.to(self.device)
+            gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
+
+            model_ref = self.model.module if hasattr(self.model, "module") else self.model
+            _, _, loss_s, loss_r = model_ref.forward_with_loss(
+                img_prev                    = prev_surr_view_imgs_tensor,
+                img_curr                    = curr_surr_view_imgs_tensor,
+                depth_prev                  = prev_surr_view_depths_tensor,
+                depth_curr                  = curr_surr_view_depths_tensor,
+                proj_pix_prev               = proj_pix_prev_tensor,
+                proj_pix_curr               = proj_pix_curr_tensor,
+                gt_scale_map_with_mask      = gt_scale_map_with_mask,
+                gt_risk_score_map_with_mask = gt_risk_score_map_with_mask,
+                attn_type                   = self.attn_type,
+                attn_splits_list            = self.attn_splits_list,
+                corr_radius_list            = self.corr_radius_list,
+                prop_radius_list            = self.prop_radius_list,
+                num_reg_refine              = self.num_reg_refine,
+                scale_only                  = self.scale_only
+            )
+
+            loss = loss_s if self.scale_only else loss_r
+            total_loss += loss.item()
+            total_steps += 1
+
+        avg_loss = total_loss / max(1, total_steps)
+        self.model.train()
+
+        if self.neptune_run is not None and is_main_process():
+            tag = "val/epoch_loss_scale" if self.scale_only else "val/epoch_loss_risk"
+            self.neptune_run[tag].append(avg_loss, step=epoch)
+
+        return avg_loss
+
+    def _save_checkpoint(self, path, epoch):
+        checkpoint = {
+            "net": self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            "epoch": epoch + 1
+        }
+        torch.save(checkpoint, path)
     
     def _weighted_loss(self, keys_s, keys_r, loss_s, loss_r, model_ref):
         """

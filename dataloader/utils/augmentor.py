@@ -1,16 +1,12 @@
 import numpy as np
 import random
-import math
 from PIL import Image
 
 import cv2
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
 
-import torch
 from torchvision.transforms import ColorJitter
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
 
 class FlowAugmentor:
     def __init__(self, crop_size, min_scale=-0.2, max_scale=0.5, do_flip=True):
