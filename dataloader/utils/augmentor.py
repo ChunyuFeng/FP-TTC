@@ -579,12 +579,24 @@ class NuscAugmentor:
         return np.ascontiguousarray(img)
 
 class NuscRangeImageAugmentor:
-    def __init__(self, crop_size, do_flip=False, rotate=False, rotate_prob=0.1, rotate_angle=90):
+    def __init__(self, crop_size, do_flip=False, rotate=False, rotate_prob=0.1, rotate_angle=90,
+                 color_aug=False, color_aug_params=None):
         self.crop_size = crop_size
         self.do_flip = do_flip
         self.rotate = rotate
         self.rotate_prob = rotate_prob
         self.rotate_angle = rotate_angle
+        self.color_aug = color_aug
+        if self.color_aug:
+            from torchvision import transforms as T
+            params = color_aug_params or {}
+            self.color_jitter = T.ColorJitter(
+                brightness=params.get('brightness', 0.3),
+                contrast=params.get('contrast', 0.3),
+                saturation=params.get('saturation', 0.3),
+                hue=params.get('hue', 0.1),
+            )
+            self.grayscale = T.RandomGrayscale(p=params.get('grayscale_prob', 0.02))
 
     def sample_params(self, img_size):
         # 统一采样一次 resize, crop, flip, rotate 参数
@@ -764,6 +776,14 @@ class NuscRangeImageAugmentor:
         return M
 
 
+    def _apply_color_aug(self, img_np):
+        """Apply color jitter + random grayscale to a uint8 HWC numpy array."""
+        from PIL import Image as PILImage
+        pil_img = PILImage.fromarray(img_np)
+        pil_img = self.color_jitter(pil_img)
+        pil_img = self.grayscale(pil_img)
+        return np.array(pil_img)
+
     def __call__(self, surr_view_imgs, params=None):
         # params=None 时自动 sampling
         first_img = next(iter(surr_view_imgs.values()))
@@ -773,6 +793,18 @@ class NuscRangeImageAugmentor:
         for channel, img in surr_view_imgs.items():
             processed = self.apply_affine(img, params)
             surr_view_imgs[channel] = np.array(processed)
+        # 对 RGB 图像应用颜色增强（不对 depth 应用）
+        if self.color_aug:
+            # 采样一次随机参数，对所有视角应用相同的 color transform
+            # 通过设置相同的 seed 保证 pair consistency
+            seed = np.random.randint(0, 2**31)
+            for channel in surr_view_imgs:
+                arr = surr_view_imgs[channel]
+                if arr.ndim == 3 and arr.shape[2] == 3:  # only RGB, skip depth
+                    import torch
+                    torch.manual_seed(seed)
+                    np.random.seed(seed % (2**31))
+                    surr_view_imgs[channel] = self._apply_color_aug(arr)
         return surr_view_imgs, params
 
 # class NuscRangeImageAugmentor:

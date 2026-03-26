@@ -24,6 +24,61 @@ from PIL import Image
 from .draw import visual_scale_map_range_image, visual_risk_score_map_range_image
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
 
+
+def _normalize_to_uint8(array):
+    array = np.asarray(array, dtype=np.float32)
+    if array.size == 0:
+        return np.zeros(array.shape, dtype=np.uint8)
+    min_value = float(np.min(array))
+    max_value = float(np.max(array))
+    if max_value > min_value:
+        array = (array - min_value) / (max_value - min_value)
+    else:
+        array = np.zeros_like(array, dtype=np.float32)
+    return np.clip(array * 255.0, 0, 255).astype(np.uint8)
+
+
+def _feature_pca_rgb(feature_tensor):
+    feature = feature_tensor.detach().float().cpu().numpy()
+    c, h, w = feature.shape
+    flat = feature.reshape(c, -1).T
+    flat = flat - flat.mean(axis=0, keepdims=True)
+
+    if flat.shape[0] == 0 or flat.shape[1] == 0 or np.allclose(flat, 0.0):
+        return np.zeros((h, w, 3), dtype=np.uint8)
+
+    try:
+        _, _, vt = np.linalg.svd(flat, full_matrices=False)
+        basis = vt[:3].T
+        proj = flat @ basis
+    except np.linalg.LinAlgError:
+        proj = flat[:, :min(3, flat.shape[1])]
+
+    if proj.shape[1] < 3:
+        proj = np.pad(proj, ((0, 0), (0, 3 - proj.shape[1])), mode='constant')
+
+    proj = proj.reshape(h, w, 3)
+    channels = [_normalize_to_uint8(proj[..., idx]) for idx in range(3)]
+    return np.stack(channels, axis=-1)
+
+
+def _feature_norm_rgb(feature_tensor, cmap_name='viridis'):
+    feature = feature_tensor.detach().float().cpu().numpy()
+    norm_map = np.linalg.norm(feature, axis=0)
+    norm_map = _normalize_to_uint8(norm_map).astype(np.float32) / 255.0
+    colored = plt.get_cmap(cmap_name)(norm_map)[..., :3]
+    return np.clip(colored * 255.0, 0, 255).astype(np.uint8)
+
+
+def _rgb_tensor_to_uint8(image_tensor):
+    image = image_tensor.detach().float().cpu().permute(1, 2, 0).numpy()
+    return np.clip(image, 0, 255).astype(np.uint8)
+
+
+def _make_horizontal_montage(image_list):
+    return np.concatenate(image_list, axis=1)
+
+
 class TTCTrainer(object):
     def __init__(self, model, dataset, optimizer, args, start_epoch, device,
                 val_dataset=None,
@@ -81,20 +136,28 @@ class TTCTrainer(object):
         self.start_epoch = start_epoch
         
         steps_per_epoch = int(len(self.train_loader))
-        #print(self.epoch, len(self.train_loader), self.batch_size, steps_per_epoch)
+        self.grad_accum_steps = getattr(args, 'grad_accum_steps', 1)
         starte = -1
         if self.start_epoch>0:
             starte = self.start_epoch - 1
         
+        # 构建每个 param group 的 max_lr 列表（支持分层学习率）
+        max_lr_list = [pg.get('max_lr', args.lr) for pg in self.optimizer.param_groups]
+        pct_start = getattr(args, 'pct_start', 0.05)
+
+        # 若 grad_accum > 1，每 " grad_accum_steps 次 forward" 才算 1 步 scheduler
+        effective_steps = steps_per_epoch // self.grad_accum_steps
+        effective_steps = max(effective_steps, 1)
+
         self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=args.lr,
+            max_lr=max_lr_list,
             epochs=self.epoch,
-            steps_per_epoch=steps_per_epoch,
-            pct_start=0.05,
+            steps_per_epoch=effective_steps,
+            pct_start=pct_start,
             cycle_momentum=False,
             anneal_strategy='cos',
-            last_epoch=max(steps_per_epoch*starte,-1),
+            last_epoch=max(effective_steps*starte,-1),
         )
 
         self.device = device
@@ -123,6 +186,9 @@ class TTCTrainer(object):
         self.best_val_loss = float('inf')
         self.out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
         self.best_ckpt_name = 'best_scale.pth.tar' if self.scale_only else 'best_risk.pth.tar'
+        self.debug_visualize_projection = bool(getattr(args, 'debug_visualize_projection', False))
+        self.debug_visualize_dir = getattr(args, 'debug_visualize_dir', None)
+        self._projection_debug_saved = False
 
 
     def train(self):
@@ -196,10 +262,19 @@ class TTCTrainer(object):
             gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
             # affine_matrix                = affine_matrix.to(self.device)
 
-            self.optimizer.zero_grad()
+            capture_projection_debug = (
+                self.debug_visualize_projection
+                and (not self._projection_debug_saved)
+                and epoch == 0
+                and i == 0
+                and is_main_process()
+            )
+
+            if i % self.grad_accum_steps == 0:
+                self.optimizer.zero_grad()
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
             if hasattr(self.model, "module"):
-                scale, risk_score, loss_s, loss_r = self.model.module.forward_with_loss(
+                model_outputs = self.model.module.forward_with_loss(
                     img_prev                      = prev_surr_view_imgs_tensor,
                     img_curr                      = curr_surr_view_imgs_tensor,
                     depth_prev                    = prev_surr_view_depths_tensor,
@@ -213,10 +288,11 @@ class TTCTrainer(object):
                     corr_radius_list              = self.corr_radius_list,
                     prop_radius_list              = self.prop_radius_list,
                     num_reg_refine                = self.num_reg_refine,
-                    scale_only                    = self.scale_only
+                    scale_only                    = self.scale_only,
+                    return_debug                  = capture_projection_debug,
                 )
             else:
-                scale, risk_score, loss_s, loss_r = self.model.forward_with_loss(
+                model_outputs = self.model.forward_with_loss(
                     img_prev                      = prev_surr_view_imgs_tensor,
                     img_curr                      = curr_surr_view_imgs_tensor,
                     depth_prev                    = prev_surr_view_depths_tensor,
@@ -230,17 +306,39 @@ class TTCTrainer(object):
                     corr_radius_list              = self.corr_radius_list,
                     prop_radius_list              = self.prop_radius_list,
                     num_reg_refine                = self.num_reg_refine,
-                    scale_only                    = self.scale_only
+                    scale_only                    = self.scale_only,
+                    return_debug                  = capture_projection_debug,
                 )
+
+            debug_dict = None
+            if capture_projection_debug:
+                scale, risk_score, loss_s, loss_r, debug_dict = model_outputs
+            else:
+                scale, risk_score, loss_s, loss_r = model_outputs
             
             loss = loss_s if self.scale_only else loss_r
 
+            # 支持 gradient accumulation
+            if self.grad_accum_steps > 1:
+                loss = loss / self.grad_accum_steps
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-            self.optimizer.step()
-            self.lr_scheduler.step()
+
+            if (i + 1) % self.grad_accum_steps == 0 or (i + 1) == len(self.train_loader):
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                self.optimizer.step()
+                self.lr_scheduler.step()
             epoch_loss += loss.item()
             steps += 1
+
+            if capture_projection_debug and debug_dict is not None:
+                self._save_projection_debug(
+                    prev_surr_view_imgs_tensor[:1],
+                    curr_surr_view_imgs_tensor[:1],
+                    debug_dict,
+                    batch_index=i,
+                )
+                self._projection_debug_saved = True
 
             ### 可视化结果
             
@@ -322,6 +420,48 @@ class TTCTrainer(object):
                 self.neptune_run[tag].append(pg["lr"], step=epoch)
 
         return avg_loss
+
+    def _save_projection_debug(self, prev_imgs, curr_imgs, debug_dict, batch_index):
+        output_dir = self.debug_visualize_dir
+        if output_dir is None:
+            output_dir = os.path.join(self.out_dir, 'debug_projection')
+        os.makedirs(output_dir, exist_ok=True)
+
+        prev_rgb = [_rgb_tensor_to_uint8(prev_imgs[0, cam_idx]) for cam_idx in range(prev_imgs.shape[1])]
+        curr_rgb = [_rgb_tensor_to_uint8(curr_imgs[0, cam_idx]) for cam_idx in range(curr_imgs.shape[1])]
+        Image.fromarray(_make_horizontal_montage(prev_rgb)).save(
+            os.path.join(output_dir, f'train_batch{batch_index}_prev_rgb.png')
+        )
+        Image.fromarray(_make_horizontal_montage(curr_rgb)).save(
+            os.path.join(output_dir, f'train_batch{batch_index}_curr_rgb.png')
+        )
+
+        for frame_name, feat_key, range_key in [
+            ('prev', 'multi_level_feats_prev', 'multi_level_ranges_prev'),
+            ('curr', 'multi_level_feats_curr', 'multi_level_ranges_curr'),
+        ]:
+            for scale_idx, feat_level in enumerate(debug_dict[feat_key]):
+                view_pca = []
+                view_norm = []
+                for cam_idx in range(feat_level.shape[1]):
+                    view_feature = feat_level[0, cam_idx]
+                    view_pca.append(_feature_pca_rgb(view_feature))
+                    view_norm.append(_feature_norm_rgb(view_feature))
+
+                Image.fromarray(_make_horizontal_montage(view_pca)).save(
+                    os.path.join(output_dir, f'{frame_name}_scale{scale_idx}_views_pca.png')
+                )
+                Image.fromarray(_make_horizontal_montage(view_norm)).save(
+                    os.path.join(output_dir, f'{frame_name}_scale{scale_idx}_views_norm.png')
+                )
+
+                range_feature = debug_dict[range_key][scale_idx][0]
+                Image.fromarray(_feature_pca_rgb(range_feature)).save(
+                    os.path.join(output_dir, f'{frame_name}_scale{scale_idx}_range_pca.png')
+                )
+                Image.fromarray(_feature_norm_rgb(range_feature)).save(
+                    os.path.join(output_dir, f'{frame_name}_scale{scale_idx}_range_norm.png')
+                )
 
     @torch.no_grad()
     def validate_epoch(self, epoch):

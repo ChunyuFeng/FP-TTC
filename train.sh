@@ -17,12 +17,16 @@ VAL_INFO_PATH="${VAL_INFO_PATH:-./Datasets/nuscenes/2_trainval_test_infos/val}"
 VAL_INFO_FILE="${VAL_INFO_FILE:-nusc_val_infos_key_frames_160_1920_fov_8_15.pkl}"
 PROJ_CACHE_ROOT="${PROJ_CACHE_ROOT:-./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_hardproj_v1}"
 VAL_PROJ_CACHE_ROOT="${VAL_PROJ_CACHE_ROOT:-./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_hardproj_v1}"
-SCALE_CKPT="${SCALE_CKPT:-pretrained/fpttc_mix.pth.tar}"
+SCALE_CKPT="${SCALE_CKPT:-pretrained/hardproj_rgbdinput_1000y.pth.tar}"
 
 SCALE_EPOCHS="${SCALE_EPOCHS:-500}"
 VAL_FREQ="${VAL_FREQ:-5}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
+LR="${LR:-8e-5}"
+PCT_START="${PCT_START:-0.08}"
+NEW_MODULE_LR_MULT="${NEW_MODULE_LR_MULT:-5.0}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 
 torchrun \
   --standalone \
@@ -45,7 +49,10 @@ torchrun \
   --attn_splits_list 2 8 \
   --corr_radius_list -1 4 \
   --prop_radius_list -1 1 \
-  --lr 4e-5 \
+  --lr "${LR}" \
+  --pct_start "${PCT_START}" \
+  --new_module_lr_mult "${NEW_MODULE_LR_MULT}" \
+  --grad_accum_steps "${GRAD_ACCUM_STEPS}" \
   --batch_size 1 \
   --num_workers "${NUM_WORKERS}" \
   --image_size 160 320 \

@@ -681,7 +681,9 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
     train_dataset = None
 
     if args.stage == 'nuscenes_range_image':
-        aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
+        aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False,
+                      'rotate_prob': 0.1, 'rotate_angle': 90,
+                      'color_aug': True}
         train_info_file = args.train_info_file
         train_info_path = args.train_info_path
 

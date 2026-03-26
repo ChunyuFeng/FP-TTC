@@ -83,6 +83,10 @@ parser.add_argument('--save_best', dest='save_best', action='store_true',
 parser.add_argument('--no_save_best', dest='save_best', action='store_false',
                     help='disable saving best checkpoint based on validation loss')
 parser.set_defaults(save_best=True)
+parser.add_argument('--debug_visualize_projection', action='store_true',
+                    help='save one-time debug visualization for project_views_to_range during training')
+parser.add_argument('--debug_visualize_dir', default=None, type=str,
+                    help='optional output directory for projection debug images')
 
 # resume pretrained model or resume training
 parser.add_argument('--resume', default=None, type=str,
@@ -176,6 +180,14 @@ parser.add_argument(
     help='path to pretrained scale‑only model (.pth or .pth.tar)'
 )
 
+# 学习率调度
+parser.add_argument('--pct_start', type=float, default=0.05,
+                    help='OneCycleLR warmup fraction (default: 0.05)')
+parser.add_argument('--new_module_lr_mult', type=float, default=5.0,
+                    help='LR multiplier for randomly-initialized modules (e.g. conv_corr)')
+parser.add_argument('--grad_accum_steps', type=int, default=1,
+                    help='gradient accumulation steps (default: 1, no accumulation)')
+
 # neptune
 parser.add_argument('--neptune', action='store_true',
                     help='use neptune for logging')
@@ -195,26 +207,57 @@ else:
 
 def build_optimizer(model, args):
     """
-    构造只作用于 requires_grad=True 参数的 AdamW 优化器
-
-    Args:
-      model:  FpTTC 模型实例
-      args:  包含 lr, weight_decay 等超参数的命令行 args
+    构造分层学习率的 AdamW 优化器。
+    预训练模块 (cnet/featnet/corrnet/scale_net/risk_net) 使用基础 LR，
+    随机初始化模块 (conv_corr/conv_corr_risk) 使用 LR * new_module_lr_mult。
     """
-    max_lr = args.lr
-    ini_lr = max_lr / 25
-    min_lr = ini_lr / 1e4
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    base_lr = args.lr
+    mult = getattr(args, 'new_module_lr_mult', 5.0)
+
+    # 随机初始化模块的前缀（从 hardproj_rgbdinput 加载时这些模块因 4ch→3ch 或其他原因未能加载）
+    new_module_prefixes = ('conv_corr.', 'conv_corr_risk.')
+
+    pretrained_params = []
+    new_params = []
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        bare_name = name.replace('module.', '', 1) if name.startswith('module.') else name
+        if any(bare_name.startswith(pref) for pref in new_module_prefixes):
+            new_params.append(p)
+        else:
+            pretrained_params.append(p)
+
+    param_groups = []
+    if pretrained_params:
+        max_lr_pt = base_lr
+        ini_lr_pt = max_lr_pt / 25
+        min_lr_pt = ini_lr_pt / 1e4
+        param_groups.append({
+            "params": pretrained_params,
+            "max_lr": max_lr_pt,
+            "initial_lr": ini_lr_pt,
+            "min_lr": min_lr_pt,
+        })
+    if new_params:
+        max_lr_new = base_lr * mult
+        ini_lr_new = max_lr_new / 25
+        min_lr_new = ini_lr_new / 1e4
+        param_groups.append({
+            "params": new_params,
+            "max_lr": max_lr_new,
+            "initial_lr": ini_lr_new,
+            "min_lr": min_lr_new,
+        })
+
+    if is_main_process():
+        print(f"[Optimizer] {len(pretrained_params)} pretrained params @ LR={base_lr:.1e}")
+        print(f"[Optimizer] {len(new_params)} new params @ LR={base_lr * mult:.1e} (x{mult})")
+
     optimizer = torch.optim.AdamW(
-        [
-            {
-                "params": trainable_params,
-                "max_lr": max_lr,
-                "initial_lr": ini_lr,
-                "min_lr": min_lr
-            }
-        ],
-        lr=max_lr, weight_decay=args.weight_decay)
+        param_groups,
+        lr=base_lr, weight_decay=args.weight_decay)
     return optimizer
 
 def main():
@@ -294,38 +337,56 @@ def main():
     
     # stage 1: train scale branch
     if args.train_stage in ('scale', 'both'):
-        ########################### LOAD PRETRAINED SCALE MODEL ###########################
+        ########################### LOAD PRETRAINED MODEL ###########################
         if args.scale_pretrained_ckpt is not None:
             ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
             # 提取 state_dict
             if 'model' in ckpt:
                 sd = ckpt['model']
             elif 'net' in ckpt:
-                # 去掉 DDP 的 module. 前缀
                 sd = {k.replace('module.', ''): v for k, v in ckpt['net'].items()}
             elif 'state_dict' in ckpt:
                 sd = ckpt['state_dict']
             else:
                 sd = ckpt
 
-            # 只挑出 cnet/featnet/corrnet 的参数
-            prefixes = ('cnet.', 'featnet.', 'corrnet.')
+            # 处理 cnet.conv1.weight 的 RGBD(4ch) → RGB(3ch) 裁剪
+            conv1_key = 'cnet.conv1.weight'
+            model_dict = model.state_dict()
+            if conv1_key in sd and conv1_key in model_dict:
+                ckpt_shape = sd[conv1_key].shape   # e.g. [64, 4, 7, 7]
+                model_shape = model_dict[conv1_key].shape  # e.g. [64, 3, 7, 7]
+                if ckpt_shape[1] != model_shape[1] and ckpt_shape[1] > model_shape[1]:
+                    if is_main_process():
+                        print(f"[PRETRAINED] Trimming {conv1_key}: {list(ckpt_shape)} → {list(model_shape)} (keeping first {model_shape[1]} input channels)")
+                    sd[conv1_key] = sd[conv1_key][:, :model_shape[1], :, :]
+
+            # 过滤掉 shape 不匹配的 key（安全兜底）
             filtered = {}
+            skipped = []
             for k, v in sd.items():
-                if any(k.startswith(pref) for pref in prefixes):
-                    filtered[k] = v
+                if k in model_dict:
+                    if v.shape == model_dict[k].shape:
+                        filtered[k] = v
+                    else:
+                        skipped.append((k, list(v.shape), list(model_dict[k].shape)))
+                # 跳过 checkpoint 中有但 model 中没有的 key（unexpected）
 
             # 注入到当前模型里
-            model_dict = model.state_dict()
             model_dict.update(filtered)
             load_info = model.load_state_dict(model_dict, strict=False)
             if is_main_process():
                 loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
-                print(f"[SCALE-INIT] Loaded {len(loaded)} keys for scale backbone:")
-                for k in sorted(loaded):
-                    print("   ", k)
-                if load_info.missing_keys:
-                    print(f"[SCALE-INIT] Missing keys: {load_info.missing_keys}")
+                print(f"[PRETRAINED] Loaded {len(loaded)}/{len(model_dict)} keys from {args.scale_pretrained_ckpt}")
+                if skipped:
+                    print(f"[PRETRAINED] Skipped {len(skipped)} shape-mismatched keys:")
+                    for k, s1, s2 in skipped:
+                        print(f"    {k}: ckpt={s1} vs model={s2}")
+                missing_in_ckpt = [k for k in model_dict if k not in sd]
+                if missing_in_ckpt:
+                    print(f"[PRETRAINED] {len(missing_in_ckpt)} keys not in checkpoint (random init):")
+                    for k in sorted(missing_in_ckpt):
+                        print(f"    {k}")
             ##########################################################################
         # 1) freeze risk branch
         freeze_prefixes = (

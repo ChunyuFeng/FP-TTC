@@ -97,7 +97,8 @@ class FpTTC(nn.Module):
         corr_radius_list,
         prop_radius_list,
         num_reg_refine,
-        scale_only
+        scale_only,
+        return_debug=False,
     ):
         t0 = time.perf_counter()
 
@@ -184,6 +185,15 @@ class FpTTC(nn.Module):
         t3 = time.perf_counter()
         # print(f"projection to range-view time: {t3 - t2:.4f} s")
 
+        debug_dict = None
+        if return_debug:
+            debug_dict = {
+                'multi_level_feats_prev': multi_level_feats_prev,
+                'multi_level_feats_curr': multi_level_feats_curr,
+                'multi_level_ranges_prev': multi_level_ranges_prev,
+                'multi_level_ranges_curr': multi_level_ranges_curr,
+            }
+
         # ----- 预测（两分支）-----
         # scale 分支
         corr_encoded_s = self.conv_corr(corr_range)
@@ -194,6 +204,8 @@ class FpTTC(nn.Module):
             corr_encoded_s, multi_level_ranges_prev, multi_level_ranges_curr, initial_scale
         )
         if scale_only:
+            if return_debug:
+                return scales, None, debug_dict
             return scales, None
 
         # risk 分支
@@ -207,6 +219,8 @@ class FpTTC(nn.Module):
         t4 = time.perf_counter()
         # print(f"scale & risk prediction time: {t4 - t3:.4f} s")
 
+        if return_debug:
+            return scales, risk_score, debug_dict
         return scales, risk_score
 
 
@@ -225,10 +239,11 @@ class FpTTC(nn.Module):
             corr_radius_list,              # List[int]
             prop_radius_list,              # List[int]
             num_reg_refine,                # int
-            scale_only
+            scale_only,
+            return_debug=False,
         ):
 
-        scales, risks = self.forward(
+        outputs = self.forward(
             img_prev         = img_prev,
             img_curr         = img_curr,
             depth_prev       = depth_prev,
@@ -241,13 +256,22 @@ class FpTTC(nn.Module):
             prop_radius_list = prop_radius_list,
             num_reg_refine   = num_reg_refine,
             scale_only       = scale_only,
+            return_debug     = return_debug,
         )
+        if return_debug:
+            scales, risks, debug_dict = outputs
+        else:
+            scales, risks = outputs
         if scale_only:
             # 仅计算尺度分支的损失
             loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
+            if return_debug:
+                return scales, None, loss_s, None, debug_dict
             return scales, None, loss_s, None
         else:
             loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
+            if return_debug:
+                return None, risks, None, loss_r, debug_dict
             return None, risks, None, loss_r
 
     def extract_feature(self, im0, im1, branch):
