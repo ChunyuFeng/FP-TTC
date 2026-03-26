@@ -187,6 +187,9 @@ parser.add_argument('--new_module_lr_mult', type=float, default=5.0,
                     help='LR multiplier for randomly-initialized modules (e.g. conv_corr)')
 parser.add_argument('--grad_accum_steps', type=int, default=1,
                     help='gradient accumulation steps (default: 1, no accumulation)')
+parser.add_argument('--loss_weight_alpha', type=float, default=0.0,
+                    help='distance-based loss reweighting alpha; 0=off, recommended 2~5 '
+                         '(higher = more weight on pixels far from scale=1.0)')
 
 # neptune
 parser.add_argument('--neptune', action='store_true',
@@ -290,11 +293,20 @@ def main():
         if 'model' in checkpoint:
             sd = checkpoint['model']
         elif 'net' in checkpoint:
-            sd = {k.replace('module.', ''): v for k, v in checkpoint['net'].items()}
+            sd = checkpoint['net']
         elif 'state_dict' in checkpoint:
             sd = checkpoint['state_dict']
         else:
             sd = checkpoint
+
+        # 让 checkpoint key 与 model key 对齐（自适应处理 module. 前缀）
+        model_keys = set(model.state_dict().keys())
+        model_has_module = any(k.startswith('module.') for k in model_keys)
+        ckpt_has_module = any(k.startswith('module.') for k in sd)
+        if model_has_module and not ckpt_has_module:
+            sd = {'module.' + k: v for k, v in sd.items()}
+        elif not model_has_module and ckpt_has_module:
+            sd = {k.replace('module.', '', 1): v for k, v in sd.items()}
 
         # 2) 载入并接收加载报告
         load_info = model.load_state_dict(sd, strict=False)
@@ -344,15 +356,23 @@ def main():
             if 'model' in ckpt:
                 sd = ckpt['model']
             elif 'net' in ckpt:
-                sd = {k.replace('module.', ''): v for k, v in ckpt['net'].items()}
+                sd = ckpt['net']
             elif 'state_dict' in ckpt:
                 sd = ckpt['state_dict']
             else:
                 sd = ckpt
 
-            # 处理 cnet.conv1.weight 的 RGBD(4ch) → RGB(3ch) 裁剪
-            conv1_key = 'cnet.conv1.weight'
+            # 让 checkpoint key 与 model key 对齐（自适应处理 module. 前缀）
             model_dict = model.state_dict()
+            model_has_module = any(k.startswith('module.') for k in model_dict)
+            ckpt_has_module = any(k.startswith('module.') for k in sd)
+            if model_has_module and not ckpt_has_module:
+                sd = {'module.' + k: v for k, v in sd.items()}
+            elif not model_has_module and ckpt_has_module:
+                sd = {k.replace('module.', '', 1): v for k, v in sd.items()}
+
+            # 处理 cnet.conv1.weight 的 RGBD(4ch) → RGB(3ch) 裁剪
+            conv1_key = 'module.cnet.conv1.weight' if model_has_module else 'cnet.conv1.weight'
             if conv1_key in sd and conv1_key in model_dict:
                 ckpt_shape = sd[conv1_key].shape   # e.g. [64, 4, 7, 7]
                 model_shape = model_dict[conv1_key].shape  # e.g. [64, 3, 7, 7]

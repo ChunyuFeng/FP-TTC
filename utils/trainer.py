@@ -137,6 +137,7 @@ class TTCTrainer(object):
         
         steps_per_epoch = int(len(self.train_loader))
         self.grad_accum_steps = getattr(args, 'grad_accum_steps', 1)
+        self.loss_weight_alpha = getattr(args, 'loss_weight_alpha', 0.0)
         starte = -1
         if self.start_epoch>0:
             starte = self.start_epoch - 1
@@ -289,6 +290,7 @@ class TTCTrainer(object):
                     prop_radius_list              = self.prop_radius_list,
                     num_reg_refine                = self.num_reg_refine,
                     scale_only                    = self.scale_only,
+                    loss_weight_alpha             = self.loss_weight_alpha,
                     return_debug                  = capture_projection_debug,
                 )
             else:
@@ -307,6 +309,7 @@ class TTCTrainer(object):
                     prop_radius_list              = self.prop_radius_list,
                     num_reg_refine                = self.num_reg_refine,
                     scale_only                    = self.scale_only,
+                    loss_weight_alpha             = self.loss_weight_alpha,
                     return_debug                  = capture_projection_debug,
                 )
 

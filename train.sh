@@ -27,6 +27,7 @@ LR="${LR:-8e-5}"
 PCT_START="${PCT_START:-0.08}"
 NEW_MODULE_LR_MULT="${NEW_MODULE_LR_MULT:-5.0}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+LOSS_WEIGHT_ALPHA="${LOSS_WEIGHT_ALPHA:-3.0}"
 
 torchrun \
   --standalone \
@@ -53,6 +54,7 @@ torchrun \
   --pct_start "${PCT_START}" \
   --new_module_lr_mult "${NEW_MODULE_LR_MULT}" \
   --grad_accum_steps "${GRAD_ACCUM_STEPS}" \
+  --loss_weight_alpha "${LOSS_WEIGHT_ALPHA}" \
   --batch_size 1 \
   --num_workers "${NUM_WORKERS}" \
   --image_size 160 320 \

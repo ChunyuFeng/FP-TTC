@@ -370,8 +370,8 @@ def flow_uv_to_colors(u, v, convert_to_bgr=False):
 def visual_scale_map_range_image(scale_map, valid_mask, colormap_name='seismic'):
     scale_display = np.copy(scale_map)
 
-    # 将用于可视化的尺度值裁切到 [0.5, 1.5] 范围
-    scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.85, 1.15)
+    # 将用于可视化的尺度值裁切到 [0.5, 1.5] 范围 (适配 Δt=0.5s)
+    scale_display[valid_mask] = np.clip(scale_display[valid_mask], 0.5, 1.5)
 
     # 将尺度的分界线从 1 移至 0（scale - 1）
     deviations = np.zeros_like(scale_display, dtype=np.float32)
@@ -458,31 +458,31 @@ def scale2rgb(scale):
     """
     H, W = scale.shape
 
-    # 1) 定义 9 个边界点
+    # 1) 定义 9 个边界点 (适配 Δt=0.5s: scale = 1 - Δt/TTC)
     bounds = np.array([
-        0.0,     # 边界 0
-        0.9,     # 边界 1
-        0.9667,  # 边界 2
-        0.98,    # 边界 3
-        1.0,     # 边界 4
-        1.02,    # 边界 5
-        1.0333,  # 边界 6
-        1.1,     # 边界 7
-        2.0      # 边界 8
+        0.0,      # 边界 0
+        0.5,      # 边界 1  @ TTC =  1s   (1 - 0.5/1)
+        0.8333,   # 边界 2  @ TTC =  3s   (1 - 0.5/3)
+        0.9,      # 边界 3  @ TTC =  5s   (1 - 0.5/5)
+        1.0,      # 边界 4  @ TTC =  inf
+        1.1,      # 边界 5  @ TTC = -5s   (1 - 0.5/(-5))
+        1.1667,   # 边界 6  @ TTC = -3s   (1 - 0.5/(-3))
+        1.5,      # 边界 7  @ TTC = -1s   (1 - 0.5/(-1))
+        2.5       # 边界 8
     ], dtype=np.float32)
 
     # 2) 为每个边界点指定一个 RGB 颜色
     #    这样在区间 i=[bounds[i],bounds[i+1]] 内，颜色由 colors[i] → colors[i+1] 渐变
     colors = np.array([
         [0.0, 0.0, 0.0],   # 黑     @ 0.0      @ TTC = 0
-        [0.0, 0.0, 1.0],   # 蓝     @ 0.9      @ TTC = 1
-        [1.0, 0.0, 0.0],   # 红     @ 0.9667   @ TTC = 3
-        [1.0, 0.0, 1.0],   # 品红   @ 0.98     @ TTC = 5
+        [0.0, 0.0, 1.0],   # 蓝     @ 0.5      @ TTC = 1s
+        [1.0, 0.0, 0.0],   # 红     @ 0.8333   @ TTC = 3s
+        [1.0, 0.0, 1.0],   # 品红   @ 0.9      @ TTC = 5s
         [0.0, 1.0, 0.0],   # 绿     @ 1.0      @ TTC = inf
-        [0.0, 1.0, 1.0],   # 青     @ 1.02     @ TTC = -5 (负向 TTC，障碍物远离，不会碰撞)
-        [1.0, 1.0, 0.0],   # 黄     @ 1.0333   @ TTC = -3
-        [1.0, 1.0, 1.0],   # 白     @ 1.1      @ TTC = -1（TTC < -1 时，障碍物远离，颜色变为白色）
-        [1.0, 1.0, 1.0],   # 白     @ 2.0    # 最后一段保持白色（TTC < -1 时，障碍物远离，颜色变为白色）
+        [0.0, 1.0, 1.0],   # 青     @ 1.1      @ TTC = -5s (障碍物远离)
+        [1.0, 1.0, 0.0],   # 黄     @ 1.1667   @ TTC = -3s
+        [1.0, 1.0, 1.0],   # 白     @ 1.5      @ TTC = -1s
+        [1.0, 1.0, 1.0],   # 白     @ 2.5      # 最后一段保持白色
     ], dtype=np.float32)
 
     # 3) 展平并为每个像素找到它属于哪个区间

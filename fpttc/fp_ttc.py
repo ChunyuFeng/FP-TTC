@@ -240,6 +240,7 @@ class FpTTC(nn.Module):
             prop_radius_list,              # List[int]
             num_reg_refine,                # int
             scale_only,
+            loss_weight_alpha=0.0,
             return_debug=False,
         ):
 
@@ -264,7 +265,7 @@ class FpTTC(nn.Module):
             scales, risks = outputs
         if scale_only:
             # 仅计算尺度分支的损失
-            loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
+            loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask, loss_weight_alpha=loss_weight_alpha)
             if return_debug:
                 return scales, None, loss_s, None, debug_dict
             return scales, None, loss_s, None

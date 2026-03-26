@@ -300,28 +300,39 @@ def get_loss_mix(scale, gt_scale_with_mask):
     # 返回 sloss 作为最终的损失
     return sloss, valid
 
-def get_loss_scale_map(scale, gt_scale_with_mask):
-    # 移除单个维度，使所有张量形状为 (320, 640)
-    scale = scale.squeeze(1)  # 将形状从 [batch_size, 1, H, W] 压缩为 [batch_size, H, W]
-    gt_scale = gt_scale_with_mask[:,0,:,:]
-    mask = gt_scale_with_mask[:,1,:,:].bool()
+def get_loss_scale_map(scale, gt_scale_with_mask, loss_weight_alpha=0.0):
+    """Scale branch loss with optional distance-based reweighting.
+
+    When loss_weight_alpha > 0, each valid pixel is weighted by
+        w = 1 + alpha * |log(gt_scale)|
+    so pixels whose gt_scale deviates from 1.0 (i.e. log(gt_scale)!=0)
+    receive proportionally higher loss weight.  This counteracts the
+    GT distribution imbalance where ~70 % of pixels sit near scale≈1.0.
+    """
+    # 移除单个维度，使所有张量形状为 (B, H, W)
+    scale = scale.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
+    gt_scale = gt_scale_with_mask[:, 0, :, :]
+    mask = gt_scale_with_mask[:, 1, :, :].bool()
 
     if mask.sum() == 0:
+        print("[WARN]: Scale branch no valid area, return 0 loss")
         return scale.sum() * 0.0
-        print("[WARN]:Scale branch no valid area, return 0 loss")
-    
-    # with torch.no_grad():
-    #     print("scale before clamp:", scale.min().item(), scale.max().item())
 
-    # mask = mask & (scale>0)   
-    # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
-    epsilon = 1e-12  # 预防性的小值
-    log_scale = torch.log(scale + epsilon)
-    log_gt_scale = torch.log(gt_scale + epsilon)
+    # ---- 只在 masked (有效) 位置上计算，避免 log(负数) 产生 NaN ----
+    epsilon = 1e-6
+    log_scale_m    = torch.log(scale[mask] + epsilon)
+    log_gt_scale_m = torch.log(gt_scale[mask].clamp(min=epsilon))
 
-    # 计算 scale loss
-    loss = (log_scale - log_gt_scale).abs()
-    loss = loss[mask].mean()
+    # 逐像素 L1 loss (log 空间)
+    loss = (log_scale_m - log_gt_scale_m).abs()
+
+    if loss_weight_alpha > 0:
+        # distance-based reweighting: 远离 scale=1 的像素权重更大
+        with torch.no_grad():
+            w = 1.0 + loss_weight_alpha * log_gt_scale_m.abs()
+        loss = (loss * w).sum() / w.sum()
+    else:
+        loss = loss.mean()
 
     return loss
 
