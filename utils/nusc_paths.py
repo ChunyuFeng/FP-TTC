@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 from pathlib import Path
+from typing import Mapping, Optional, Union
 
 
 DEFAULT_NUSC_DATASET_ROOT = Path("./Datasets/nuscenes")
@@ -21,7 +20,10 @@ NUSC_PATH_ANCHORS = (
 )
 
 
-def resolve_nusc_path(path_value: str | Path | None, dataset_root: str | Path = DEFAULT_NUSC_DATASET_ROOT) -> Path | None:
+PathLike = Union[str, Path]
+
+
+def resolve_nusc_path(path_value: Optional[PathLike], dataset_root: PathLike = DEFAULT_NUSC_DATASET_ROOT) -> Optional[Path]:
     if path_value in (None, ""):
         return None
 
@@ -32,7 +34,7 @@ def resolve_nusc_path(path_value: str | Path | None, dataset_root: str | Path = 
     return Path(dataset_root) / path
 
 
-def resolve_nusc_depth_pred_path(camera_info: dict | None, dataset_root: str | Path = DEFAULT_NUSC_DATASET_ROOT) -> Path | None:
+def resolve_nusc_depth_pred_path(camera_info: Optional[Mapping], dataset_root: PathLike = DEFAULT_NUSC_DATASET_ROOT) -> Optional[Path]:
     if not camera_info:
         return None
 
@@ -48,7 +50,7 @@ def resolve_nusc_depth_pred_path(camera_info: dict | None, dataset_root: str | P
     return resolve_nusc_path(depth_rel, dataset_root)
 
 
-def make_nusc_relative_path(path_value: str | Path | None) -> str | None:
+def make_nusc_relative_path(path_value: Optional[PathLike]) -> Optional[str]:
     if path_value in (None, ""):
         return path_value
 
@@ -61,7 +63,7 @@ def make_nusc_relative_path(path_value: str | Path | None) -> str | None:
     return path.as_posix()
 
 
-def infer_nusc_dataset_root(path_value: str | Path) -> Path:
+def infer_nusc_dataset_root(path_value: PathLike) -> Path:
     path = Path(path_value)
     search_chain = [path] + list(path.parents)
     for candidate in search_chain:

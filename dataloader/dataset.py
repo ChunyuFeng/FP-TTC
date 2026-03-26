@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import numpy as np
 import torch
@@ -10,6 +8,7 @@ import pickle
 from glob import glob
 import os.path as osp
 from pathlib import Path
+from typing import Union
 from tqdm import tqdm
 
 from .utils.augmentor import NuscRangeImageAugmentor
@@ -27,11 +26,14 @@ CAMERA_CHANNELS = [
 DEFAULT_NUSC_PROJ_CACHE_NAME = 'nusc_150_keyframes_160x320_fov8_15_hardproj_v1'
 
 
-def _default_nusc_proj_cache_root(dataset_root: str | Path) -> Path:
+PathLike = Union[str, Path]
+
+
+def _default_nusc_proj_cache_root(dataset_root: PathLike) -> Path:
     return Path(dataset_root) / '5_proj_cache' / DEFAULT_NUSC_PROJ_CACHE_NAME
 
 
-def _infer_nusc_split_name(train_info_path: str | Path, train_info_file: str) -> str:
+def _infer_nusc_split_name(train_info_path: PathLike, train_info_file: str) -> str:
     path_name = Path(train_info_path).name.lower()
     if path_name in {'train', 'val', 'test'}:
         return path_name

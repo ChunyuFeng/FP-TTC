@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.nn.functional as F 
 import torch.distributed as dist
-from utils.dist import is_main_process
+from utils.dist import DistributedEvalSampler, is_main_process
 
 from PIL import Image
 from .draw import visual_scale_map_range_image, visual_risk_score_map_range_image
@@ -33,6 +33,7 @@ class TTCTrainer(object):
         self.parallel = parallel
         self.batch_size = args.batch_size
         self.train_sampler = None
+        self.val_sampler = None
         self.scale_only = scale_only
         if not self.parallel:
             self.train_loader = DataLoader(dataset, 
@@ -51,14 +52,26 @@ class TTCTrainer(object):
                                            num_workers = args.num_workers)
         self.val_loader = None
         if val_dataset is not None:
-            self.val_loader = DataLoader(
-                val_dataset,
-                batch_size=args.val_batch_size,
-                shuffle=False,
-                num_workers=args.num_workers,
-                drop_last=False,
-                pin_memory=True,
-            )
+            if not self.parallel:
+                self.val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=args.val_batch_size,
+                    shuffle=False,
+                    num_workers=args.num_workers,
+                    drop_last=False,
+                    pin_memory=True,
+                )
+            else:
+                self.val_sampler = DistributedEvalSampler(val_dataset)
+                self.val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=args.val_batch_size,
+                    sampler=self.val_sampler,
+                    shuffle=False,
+                    num_workers=args.num_workers,
+                    drop_last=False,
+                    pin_memory=True,
+                )
 
         if self.scale_only:
             self.epoch = args.scale_epochs
@@ -320,7 +333,7 @@ class TTCTrainer(object):
 
         self.model.eval()
         total_loss = 0.0
-        total_steps = 0
+        total_samples = 0
 
         for data in self.val_loader:
             (prev_surr_view_imgs_tensor,
@@ -360,10 +373,17 @@ class TTCTrainer(object):
             )
 
             loss = loss_s if self.scale_only else loss_r
-            total_loss += loss.item()
-            total_steps += 1
+            batch_samples = prev_surr_view_imgs_tensor.shape[0]
+            total_loss += loss.item() * batch_samples
+            total_samples += batch_samples
 
-        avg_loss = total_loss / max(1, total_steps)
+        if self.parallel and dist.is_available() and dist.is_initialized():
+            stats = torch.tensor([total_loss, total_samples], dtype=torch.float64, device=self.device)
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            total_loss = float(stats[0].item())
+            total_samples = int(stats[1].item())
+
+        avg_loss = total_loss / max(1, total_samples)
         self.model.train()
 
         if self.neptune_run is not None and is_main_process():

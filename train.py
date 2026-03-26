@@ -78,8 +78,11 @@ parser.add_argument('--val_freq', default=1, type=int)
 parser.add_argument('--save_ckpt_freq', default=10000, type=int)
 parser.add_argument('--save_latest_ckpt_freq', default=1000, type=int)
 parser.add_argument('--val_batch_size', default=1, type=int)
-parser.add_argument('--save_best', default=True, action=argparse.BooleanOptionalAction,
+parser.add_argument('--save_best', dest='save_best', action='store_true',
                     help='save best checkpoint based on validation loss')
+parser.add_argument('--no_save_best', dest='save_best', action='store_false',
+                    help='disable saving best checkpoint based on validation loss')
+parser.set_defaults(save_best=True)
 
 # resume pretrained model or resume training
 parser.add_argument('--resume', default=None, type=str,
