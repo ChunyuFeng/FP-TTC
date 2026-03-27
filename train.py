@@ -6,6 +6,9 @@ import torch
 import torch.nn.functional as F
 import argparse
 import datetime
+import json
+import socket
+import subprocess
 import torch.distributed as dist
 
 import dataloader.dataset as datasets
@@ -157,7 +160,7 @@ parser.add_argument('--risk_batch_size',  type=int, default=1,
 
 # depth-free / distillation
 parser.add_argument('--no_depth', action='store_true',
-                    help='train without depth input (3ch RGB only)')
+                    help='train without depth input (3ch RGB only); required on depthfree-rvt-v1')
 parser.add_argument('--use_teacher_distill', action='store_true',
                     help='use teacher (proj_pix hard projection) for distillation')
 parser.add_argument('--lambda_feat_distill', type=float, default=1.0,
@@ -168,6 +171,10 @@ parser.add_argument('--distill_end_pct', type=float, default=0.7,
                     help='fraction of training at which distillation weight reaches 0')
 parser.add_argument('--student_tail_epochs', type=int, default=0,
                     help='extra student-only fine-tuning epochs after distillation')
+parser.add_argument('--loss_weight_alpha', type=float, default=0.0,
+                    help='distance-based scale loss reweighting alpha; 0=off')
+parser.add_argument('--new_module_lr_mult', type=float, default=1.0,
+                    help='learning-rate multiplier for non-pretrained modules relative to args.lr')
 
 # 加载预训练的单分支模型：
 parser.add_argument(
@@ -193,6 +200,30 @@ else:
     device = torch.device("cuda", 0)
     parallel = False
 
+OLD_MODULE_PREFIXES = ('cnet.', 'featnet.', 'corrnet.')
+
+
+def strip_module_prefix(name):
+    return name[len('module.'):] if name.startswith('module.') else name
+
+
+def print_optimizer_group_summary(optimizer):
+    summaries = getattr(optimizer, '_fp_ttc_lr_group_summary', [])
+    if not summaries:
+        for i, pg in enumerate(optimizer.param_groups):
+            print(f"  param group {i} lr = {pg['lr']:.3e}")
+        return
+
+    for idx, summary in enumerate(summaries):
+        print(
+            f"  [{summary['name']}] group={idx} "
+            f"tensors={summary['tensor_count']} "
+            f"params={summary['parameter_count']} "
+            f"init_lr={summary['initial_lr']:.3e} "
+            f"max_lr={summary['max_lr']:.3e}"
+        )
+
+
 def build_optimizer(model, args):
     """
     构造只作用于 requires_grad=True 参数的 AdamW 优化器
@@ -201,21 +232,134 @@ def build_optimizer(model, args):
       model:  FpTTC 模型实例
       args:  包含 lr, weight_decay 等超参数的命令行 args
     """
-    max_lr = args.lr
-    ini_lr = max_lr / 25
-    min_lr = ini_lr / 1e4
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    old_max_lr = args.lr
+    old_ini_lr = old_max_lr / 25
+    old_min_lr = old_ini_lr / 1e4
+
+    new_max_lr = args.lr * args.new_module_lr_mult
+    new_ini_lr = new_max_lr / 25
+    new_min_lr = new_ini_lr / 1e4
+
+    grouped = {
+        'old': {
+            'params': [],
+            'prefixes': list(OLD_MODULE_PREFIXES),
+            'max_lr': old_max_lr,
+            'initial_lr': old_ini_lr,
+            'min_lr': old_min_lr,
+        },
+        'new': {
+            'params': [],
+            'prefixes': [],
+            'max_lr': new_max_lr,
+            'initial_lr': new_ini_lr,
+            'min_lr': new_min_lr,
+        },
+    }
+    tensor_counts = {'old': 0, 'new': 0}
+    param_counts = {'old': 0, 'new': 0}
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        bare_name = strip_module_prefix(name)
+        group_name = 'old' if any(bare_name.startswith(prefix) for prefix in OLD_MODULE_PREFIXES) else 'new'
+        grouped[group_name]['params'].append(p)
+        tensor_counts[group_name] += 1
+        param_counts[group_name] += p.numel()
+
+    param_groups = []
+    group_summary = []
+    for group_name in ('old', 'new'):
+        spec = grouped[group_name]
+        if not spec['params']:
+            continue
+        param_groups.append({
+            "params": spec['params'],
+            "lr": spec['initial_lr'],
+            "max_lr": spec['max_lr'],
+            "initial_lr": spec['initial_lr'],
+            "min_lr": spec['min_lr'],
+        })
+        group_summary.append({
+            'name': group_name,
+            'tensor_count': tensor_counts[group_name],
+            'parameter_count': int(param_counts[group_name]),
+            'max_lr': float(spec['max_lr']),
+            'initial_lr': float(spec['initial_lr']),
+            'min_lr': float(spec['min_lr']),
+            'module_prefixes': list(spec['prefixes']),
+        })
+
     optimizer = torch.optim.AdamW(
-        [
-            {
-                "params": trainable_params,
-                "max_lr": max_lr,
-                "initial_lr": ini_lr,
-                "min_lr": min_lr
-            }
-        ],
-        lr=max_lr, weight_decay=args.weight_decay)
+        param_groups,
+        lr=old_max_lr,
+        weight_decay=args.weight_decay,
+    )
+    optimizer._fp_ttc_lr_group_summary = group_summary
+    optimizer._fp_ttc_lr_group_names = [item['name'] for item in group_summary]
     return optimizer
+
+
+def align_state_dict_module_prefix(sd, model_keys):
+    """Align checkpoint keys to the current model keyspace with respect to DDP `module.` prefix."""
+    model_has_module = any(k.startswith('module.') for k in model_keys)
+    ckpt_has_module = any(k.startswith('module.') for k in sd.keys())
+
+    if model_has_module and not ckpt_has_module:
+        return {'module.' + k: v for k, v in sd.items()}
+    if not model_has_module and ckpt_has_module:
+        return {k.replace('module.', '', 1): v for k, v in sd.items()}
+    return sd
+
+
+def extract_checkpoint_state_dict(checkpoint):
+    if 'model' in checkpoint:
+        return checkpoint['model']
+    if 'net' in checkpoint:
+        return checkpoint['net']
+    if 'state_dict' in checkpoint:
+        return checkpoint['state_dict']
+    return checkpoint
+
+
+def build_load_report(label, path, sd, load_info, extra=None):
+    loaded_keys = sorted(set(sd.keys()) - set(load_info.unexpected_keys))
+    report = {
+        'label': label,
+        'path': path,
+        'loaded_key_count': len(loaded_keys),
+        'missing_key_count': len(load_info.missing_keys),
+        'unexpected_key_count': len(load_info.unexpected_keys),
+        'loaded_keys': loaded_keys,
+        'missing_keys': list(load_info.missing_keys),
+        'unexpected_keys': list(load_info.unexpected_keys),
+    }
+    if extra:
+        report.update(extra)
+    return report
+
+
+def write_json(path, payload):
+    with open(path, 'w') as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def get_git_metadata():
+    def _git_cmd(args):
+        try:
+            return subprocess.check_output(
+                ['git'] + args,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except Exception:
+            return None
+
+    return {
+        'commit': _git_cmd(['rev-parse', 'HEAD']),
+        'branch': _git_cmd(['rev-parse', '--abbrev-ref', 'HEAD']),
+    }
 
 def main():
 
@@ -223,6 +367,12 @@ def main():
         run = neptune.init_run(project="fengchunyu/FPTTC")
     else:
         run = None
+
+    if not args.no_depth:
+        raise ValueError(
+            "depthfree-rvt-v1 only supports RGB-only training. "
+            "Please pass --no_depth; the legacy RGBD / teacher-init forward is not maintained on this branch."
+        )
     
     model = FpTTC(
         num_scales             = args.num_scales,
@@ -238,26 +388,57 @@ def main():
     start_epoch = 0
 
     # 从预训练的模型加载参数
+    model_init_info = {
+        'no_depth': args.no_depth,
+        'use_teacher_distill': args.use_teacher_distill,
+        'resume': None,
+        'scale_pretrained_ckpt': None,
+        'optimizer_groups': {},
+    }
+
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device)
         if args.load_opt:
             optimizer = build_optimizer(model, args)
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            start_epoch = checkpoint.get('epoch', 0)
-
-        if 'model' in checkpoint:
-            sd = checkpoint['model']
-        elif 'net' in checkpoint:
-            sd = {k.replace('module.', ''): v for k, v in checkpoint['net'].items()}
-        elif 'state_dict' in checkpoint:
-            sd = checkpoint['state_dict']
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                start_epoch = checkpoint.get('epoch', 0)
+                optimizer_loaded = True
+            except ValueError as exc:
+                optimizer_loaded = False
+                if is_main_process():
+                    print(f"[WARN] Skipped optimizer state loading due to param-group mismatch: {exc}")
         else:
-            sd = checkpoint
+            optimizer_loaded = False
 
-        # 2) 载入并接收加载报告
+        sd = extract_checkpoint_state_dict(checkpoint)
+
+        model_keys = model.state_dict().keys()
+        sd = align_state_dict_module_prefix(sd, model_keys)
+
+        # 2) 处理 conv1 通道不匹配（4ch→3ch 截取 RGB）
+        conv1_key = 'module.cnet.conv1.weight' if any(k.startswith('module.') for k in model_keys) else 'cnet.conv1.weight'
+        if args.no_depth and conv1_key in sd:
+            ckpt_conv1 = sd[conv1_key]
+            if ckpt_conv1.shape[1] == 4:
+                sd[conv1_key] = ckpt_conv1[:, :3, :, :]
+                if is_main_process():
+                    print(f'[INFO] Sliced {conv1_key} from {ckpt_conv1.shape} to {sd[conv1_key].shape}')
+
+        # 3) 载入并接收加载报告
         load_info = model.load_state_dict(sd, strict=False)
+        model_init_info['resume'] = build_load_report(
+            label='resume',
+            path=args.resume,
+            sd=sd,
+            load_info=load_info,
+            extra={
+                'optimizer_loaded': bool(optimizer_loaded),
+                'resume_epoch': int(start_epoch),
+            },
+        )
 
-        # 3) 打印一下各类 key
+        # 4) 打印一下各类 key
         if is_main_process():
             # 成功匹配到的 keys = 原来 sd 里所有 keys，扣掉 “unexpected_keys”
             loaded_keys = set(sd.keys()) - set(load_info.unexpected_keys)
@@ -284,6 +465,18 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
 
     if is_main_process():
+        git_metadata = get_git_metadata()
+        write_json(os.path.join(out_dir, 'run_config.json'), {
+            'args': vars(args),
+            'git': git_metadata,
+            'time_stamp': time_stamp,
+            'out_dir': out_dir,
+            'hostname': socket.gethostname(),
+            'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+        })
+        write_json(os.path.join(out_dir, 'model_init.json'), model_init_info)
+
+    if is_main_process():
         print('Start Loading ...')
 
     dataset = datasets.fetch_dataloader(args) 
@@ -294,49 +487,61 @@ def main():
         if args.scale_pretrained_ckpt is not None:
             ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
             # 提取 state_dict
-            if 'model' in ckpt:
-                sd = ckpt['model']
-            elif 'net' in ckpt:
-                # 去掉 DDP 的 module. 前缀
-                sd = {k.replace('module.', ''): v for k, v in ckpt['net'].items()}
-            elif 'state_dict' in ckpt:
-                sd = ckpt['state_dict']
-            else:
-                sd = ckpt
+            sd = extract_checkpoint_state_dict(ckpt)
+
+            model_dict = model.state_dict()
+            model_keys = model_dict.keys()
+            sd = align_state_dict_module_prefix(sd, model_keys)
 
             # 只挑出 cnet/featnet/corrnet 的参数
-            prefixes = ('cnet.', 'featnet.', 'corrnet.')
+            if any(k.startswith('module.') for k in model_keys):
+                prefixes = ('module.cnet.', 'module.featnet.', 'module.corrnet.')
+            else:
+                prefixes = ('cnet.', 'featnet.', 'corrnet.')
             filtered = {}
             for k, v in sd.items():
                 if any(k.startswith(pref) for pref in prefixes):
                     filtered[k] = v
 
+            conv1_key = 'module.cnet.conv1.weight' if any(k.startswith('module.') for k in model_keys) else 'cnet.conv1.weight'
+            if args.no_depth and conv1_key in filtered:
+                ckpt_conv1 = filtered[conv1_key]
+                if ckpt_conv1.shape[1] == 4:
+                    filtered[conv1_key] = ckpt_conv1[:, :3, :, :]
+                    if is_main_process():
+                        print(
+                            f'[SCALE-INIT] Sliced {conv1_key} from '
+                            f'{ckpt_conv1.shape} to {filtered[conv1_key].shape}'
+                        )
+
             # 注入到当前模型里
-            model_dict = model.state_dict()
             model_dict.update(filtered)
             load_info = model.load_state_dict(model_dict, strict=False)
+            loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
+            model_init_info['scale_pretrained_ckpt'] = build_load_report(
+                label='scale_pretrained_ckpt',
+                path=args.scale_pretrained_ckpt,
+                sd=filtered,
+                load_info=load_info,
+                extra={
+                    'filtered_prefixes': list(prefixes),
+                    'filtered_key_count': len(filtered),
+                    'loaded_filtered_key_count': len(loaded),
+                },
+            )
             if is_main_process():
-                loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
+                write_json(os.path.join(out_dir, 'model_init.json'), model_init_info)
+            if is_main_process():
                 print(f"[SCALE-INIT] Loaded {len(loaded)} keys for scale backbone:")
                 for k in sorted(loaded):
                     print("   ", k)
                 if load_info.missing_keys:
                     print(f"[SCALE-INIT] Missing keys: {load_info.missing_keys}")
             ##########################################################################
-        # 1) freeze risk branch
-        if args.no_depth:
-            # depth-free: unfreeze featnet/corrnet so they adapt to 3ch input
-            freeze_prefixes = (
-                'cnet.',
-                'conv_corr_risk.', 'risk_net.',
-            )
-        else:
-            freeze_prefixes = (
-                # 
-                'cnet.', 'featnet.', 'corrnet.',
-                # risk branch
-                'conv_corr_risk.','risk_net.'
-            )
+        # 1) freeze risk branch only; shared trunk remains trainable
+        freeze_prefixes = (
+            'conv_corr_risk.', 'risk_net.',
+        )
 
         for name, p in model.named_parameters():
             # remove "module." prefix if using DDP
@@ -350,13 +555,24 @@ def main():
                 p.requires_grad = True
 
         optimizer = build_optimizer(model, args)
+        model_init_info['optimizer_groups']['scale'] = {
+            'new_module_lr_mult': float(args.new_module_lr_mult),
+            'old_module_prefixes': list(OLD_MODULE_PREFIXES),
+            'groups': getattr(optimizer, '_fp_ttc_lr_group_summary', []),
+        }
+        if is_main_process():
+            write_json(os.path.join(out_dir, 'model_init.json'), model_init_info)
 
         if is_main_process():
-            print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr'])      
+            print_optimizer_group_summary(optimizer)
 
         args.batch_size = args.scale_batch_size  # scale-only stage batch size
 
-        print(f"Training scale branch for {args.scale_epochs} epochs...")
+        total_scale_epochs = args.scale_epochs + args.student_tail_epochs
+        print(
+            f"Training scale branch for {total_scale_epochs} epochs "
+            f"(main={args.scale_epochs}, tail={args.student_tail_epochs})..."
+        )
 
         # 2) compute scale loss
         trainer = TTCTrainer(model       = model,
@@ -374,14 +590,16 @@ def main():
                              lambda_feat_distill = args.lambda_feat_distill,
                              lambda_corr_distill = args.lambda_corr_distill,
                              distill_end_pct     = args.distill_end_pct,
+                             student_tail_epochs = args.student_tail_epochs,
+                             loss_weight_alpha   = args.loss_weight_alpha,
                              )
         trainer.train()
 
     # stage 2: train risk branch
     if args.train_stage in ('risk', 'both'):
-        # 1) freeze scale branch
+        # 1) freeze scale head only; shared trunk remains trainable
         freeze_prefixes = (
-            'cnet.','featnet.','corrnet.','conv_corr.','scale_net.'
+            'conv_corr_rvt_out.','scale_net.'
         )
 
         for name, p in model.named_parameters():
@@ -395,13 +613,24 @@ def main():
                 p.requires_grad = True
 
         optimizer = build_optimizer(model, args)
+        model_init_info['optimizer_groups']['risk'] = {
+            'new_module_lr_mult': float(args.new_module_lr_mult),
+            'old_module_prefixes': list(OLD_MODULE_PREFIXES),
+            'groups': getattr(optimizer, '_fp_ttc_lr_group_summary', []),
+        }
+        if is_main_process():
+            write_json(os.path.join(out_dir, 'model_init.json'), model_init_info)
 
         if is_main_process():
-            print("Learning rate: ", optimizer.state_dict()['param_groups'][0]['lr']) 
+            print_optimizer_group_summary(optimizer)
 
         args.batch_size = args.risk_batch_size  # risk-only stage batch size
 
-        print(f"Training risk branch for {args.risk_epochs} epochs...")
+        total_risk_epochs = args.risk_epochs + args.student_tail_epochs
+        print(
+            f"Training risk branch for {total_risk_epochs} epochs "
+            f"(main={args.risk_epochs}, tail={args.student_tail_epochs})..."
+        )
         # 2) compute risk loss
         trainer = TTCTrainer(model       = model,
                              dataset     = dataset,
@@ -418,6 +647,8 @@ def main():
                              lambda_feat_distill = args.lambda_feat_distill,
                              lambda_corr_distill = args.lambda_corr_distill,
                              distill_end_pct     = args.distill_end_pct,
+                             student_tail_epochs = args.student_tail_epochs,
+                             loss_weight_alpha   = args.loss_weight_alpha,
                              )
         trainer.train()
 

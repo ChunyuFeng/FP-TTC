@@ -136,6 +136,7 @@ class nuScenes_range_image(data.Dataset):
                  max_samples=None,
                  proj_cache_root=None,
                  no_depth=False,
+                 need_teacher_proj=False,
                  ):
         self.aug_params = aug_params
         self.split = split
@@ -144,6 +145,7 @@ class nuScenes_range_image(data.Dataset):
         self.require_complete_depth = require_complete_depth
         self.no_depth = no_depth
         self.max_samples = max_samples
+        self.need_teacher_proj = need_teacher_proj
         self.dataset_root = infer_nusc_dataset_root(self.train_info_path)
         self.proj_cache_root = Path(proj_cache_root) if proj_cache_root is not None else _default_nusc_proj_cache_root(self.dataset_root)
         self.split_name = _infer_nusc_split_name(self.train_info_path, self.train_info_file)
@@ -196,7 +198,9 @@ class nuScenes_range_image(data.Dataset):
         self.affine_matrix = self.augmentor.get_affine_matrix(self.affine_params)
 
         _validate_proj_cache_meta(self.proj_cache_root, self.aug_params['crop_size'])
-        manifest_by_original_index = _load_proj_cache_manifest(self.proj_cache_root, self.split_name)
+        manifest_by_original_index = None
+        if self.need_teacher_proj:
+            manifest_by_original_index = _load_proj_cache_manifest(self.proj_cache_root, self.split_name)
         self.cache_entries = None
         if manifest_by_original_index is not None:
             self.cache_entries = []
@@ -213,7 +217,13 @@ class nuScenes_range_image(data.Dataset):
                 entry['cache_path'] = cache_path
                 self.cache_entries.append(entry)
             print(f"Loaded projection cache from {self.proj_cache_root / self.split_name}")
-        else:
+        elif self.need_teacher_proj:
+            if self.no_depth:
+                raise FileNotFoundError(
+                    "Teacher distillation in no-depth mode requires precomputed proj cache under "
+                    f"{self.proj_cache_root / self.split_name}. "
+                    "Fallback reconstruction from depth maps is disabled for this depthfree branch."
+                )
             print(
                 f"[nuScenes_range_image] projection cache not found under "
                 f"{self.proj_cache_root / self.split_name}; "
@@ -284,22 +294,28 @@ class nuScenes_range_image(data.Dataset):
         curr_surr_view_imgs, _ = self.augmentor(curr_surr_view_imgs, affine_params)
         affine_matrix = self.augmentor.get_affine_matrix(affine_params)
 
-        if self.no_depth:
+        if self.need_teacher_proj:
+            if self.cache_entries is not None:
+                with np.load(self.cache_entries[index]['cache_path']) as cache_npz:
+                    proj_pix_prev = cache_npz['proj_pix_prev']
+                    proj_pix_curr = cache_npz['proj_pix_curr']
+            else:
+                if self.no_depth:
+                    raise RuntimeError(
+                        "Teacher projection cache is required in no-depth distillation mode, "
+                        "but no cache entry was found."
+                    )
+                _, proj_pix_prev, _ = build_frame_mapping(
+                    info, 'nusc', 'prev', None, affine_matrix, idx=None,
+                    dataset_root=self.dataset_root, H_r=40, W_r=480
+                )
+                _, proj_pix_curr, _ = build_frame_mapping(
+                    info, 'nusc', 'curr', None, affine_matrix, idx=None,
+                    dataset_root=self.dataset_root, H_r=40, W_r=480
+                )
+        else:
             proj_pix_prev = np.zeros((40, 480, 3), dtype=np.int64)
             proj_pix_curr = np.zeros((40, 480, 3), dtype=np.int64)
-        elif self.cache_entries is not None:
-            with np.load(self.cache_entries[index]['cache_path']) as cache_npz:
-                proj_pix_prev = cache_npz['proj_pix_prev']
-                proj_pix_curr = cache_npz['proj_pix_curr']
-        else:
-            _, proj_pix_prev, _ = build_frame_mapping(
-                info, 'nusc', 'prev', None, affine_matrix, idx=None,
-                dataset_root=self.dataset_root, H_r=40, W_r=480
-            )
-            _, proj_pix_curr, _ = build_frame_mapping(
-                info, 'nusc', 'curr', None, affine_matrix, idx=None,
-                dataset_root=self.dataset_root, H_r=40, W_r=480
-            )
 
         for channel in camera_channels:
             prev_surr_view_imgs[channel] = torch.from_numpy(prev_surr_view_imgs[channel]).permute(2, 0, 1).float()
@@ -739,7 +755,8 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
                                         proj_cache_root=args.proj_cache_root,
                                         max_samples=args.max_train_samples,
                                         split='training',
-                                        no_depth=getattr(args, 'no_depth', False))
+                                        no_depth=getattr(args, 'no_depth', False),
+                                        need_teacher_proj=getattr(args, 'use_teacher_distill', False))
 
         train_dataset = 1*nuscenes
     

@@ -207,7 +207,12 @@ class FpTTC(nn.Module):
         teacher_corr_range = None
         teacher_ranges_prev = None
         teacher_ranges_curr = None
-        has_teacher = (not no_depth) and (proj_pix_curr is not None) and use_teacher_distill and self.training
+        has_teacher = (
+            use_teacher_distill
+            and self.training
+            and (proj_pix_prev is not None)
+            and (proj_pix_curr is not None)
+        )
 
         if has_teacher:
             with torch.no_grad():
@@ -241,10 +246,6 @@ class FpTTC(nn.Module):
         H_r = corr_encoded_list[0].shape[2]
         W_r = corr_encoded_list[0].shape[3] * V
 
-        corr_ini_query = None
-        if has_teacher:
-            corr_ini_query = teacher_corr_range.detach()
-
         corr_range = self.rvt_corr(
             feats_by_cam=corr_encoded_list,
             cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
@@ -253,8 +254,8 @@ class FpTTC(nn.Module):
             affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
             Hr=H_r, Wr=W_r,
             depth_bins=self.depth_bins,
-            ini_query=corr_ini_query,
-            use_geom_bootstrap=(no_depth or not has_teacher),
+            ini_query=None,
+            use_geom_bootstrap=True,
         )
 
         # 多尺度特征 -> range（前/当前帧）
@@ -265,9 +266,6 @@ class FpTTC(nn.Module):
             H_r = prev_feats_list[0].shape[2]
             W_r = prev_feats_list[0].shape[3] * V
 
-            prev_ini = teacher_ranges_prev[lvl].detach() if has_teacher else None
-            curr_ini = teacher_ranges_curr[lvl].detach() if has_teacher else None
-
             range_prev = self.rvt_feat[lvl](
                 feats_by_cam=prev_feats_list,
                 cam_K=[sensor_metas['prev'][cam]['K']     for cam in self.camera_channels],
@@ -276,8 +274,8 @@ class FpTTC(nn.Module):
                 affine_M=[sensor_metas['prev'][cam]['affine'] for cam in self.camera_channels],
                 Hr=H_r, Wr=W_r,
                 depth_bins=self.depth_bins,
-                ini_query=prev_ini,
-                use_geom_bootstrap=(no_depth or not has_teacher),
+                ini_query=None,
+                use_geom_bootstrap=True,
             )
             range_curr = self.rvt_feat[lvl](
                 feats_by_cam=curr_feats_list,
@@ -287,8 +285,8 @@ class FpTTC(nn.Module):
                 affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
                 Hr=H_r, Wr=W_r,
                 depth_bins=self.depth_bins,
-                ini_query=curr_ini,
-                use_geom_bootstrap=(no_depth or not has_teacher),
+                ini_query=None,
+                use_geom_bootstrap=True,
             )
             multi_level_ranges_prev.append(range_prev)
             multi_level_ranges_curr.append(range_curr)
@@ -345,6 +343,7 @@ class FpTTC(nn.Module):
             use_teacher_distill=False,
             lambda_feat_distill=1.0,
             lambda_corr_distill=1.0,
+            loss_weight_alpha=0.0,
         ):
 
         scales, risks, corr_range, ranges_prev, ranges_curr, teacher_targets = self.forward(
@@ -368,7 +367,11 @@ class FpTTC(nn.Module):
         # ===== task loss =====
         loss_s, loss_r = None, None
         if scale_only:
-            loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
+            loss_s = get_loss_scale_map(
+                scales,
+                gt_scale_map_with_mask,
+                loss_weight_alpha=loss_weight_alpha,
+            )
         else:
             loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
 
@@ -386,12 +389,23 @@ class FpTTC(nn.Module):
 
         total_distill = lambda_feat_distill * L_feat_distill + lambda_corr_distill * L_corr_distill
 
+        loss_total = (loss_s if scale_only else loss_r) + total_distill
+        loss_task = loss_s if scale_only else loss_r
+        zero = torch.tensor(0.0, device=img_prev.device)
+
+        loss_dict = {
+            'total': loss_total,
+            'task': loss_task,
+            'scale': loss_s if loss_s is not None else zero,
+            'risk': loss_r if loss_r is not None else zero,
+            'feat_distill': L_feat_distill,
+            'corr_distill': L_corr_distill,
+        }
+
         if scale_only:
-            loss = loss_s + total_distill
-            return scales, None, loss, None
+            return scales, None, loss_total, None, loss_dict
         else:
-            loss = loss_r + total_distill
-            return None, risks, None, loss
+            return None, risks, None, loss_total, loss_dict
 
     def extract_feature(self, im0, im1, branch):
         x = torch.cat([im0, im1], dim=0)

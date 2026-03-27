@@ -300,28 +300,28 @@ def get_loss_mix(scale, gt_scale_with_mask):
     # 返回 sloss 作为最终的损失
     return sloss, valid
 
-def get_loss_scale_map(scale, gt_scale_with_mask):
-    # 移除单个维度，使所有张量形状为 (320, 640)
-    scale = scale.squeeze(1)  # 将形状从 [batch_size, 1, H, W] 压缩为 [batch_size, H, W]
-    gt_scale = gt_scale_with_mask[:,0,:,:]
-    mask = gt_scale_with_mask[:,1,:,:].bool()
+def get_loss_scale_map(scale, gt_scale_with_mask, loss_weight_alpha=0.0):
+    # 移除单个维度，使所有张量形状为 (B, H, W)
+    scale = scale.squeeze(1)
+    gt_scale = gt_scale_with_mask[:, 0, :, :]
+    mask = gt_scale_with_mask[:, 1, :, :].bool()
 
     if mask.sum() == 0:
-        return scale.sum() * 0.0
         print("[WARN]:Scale branch no valid area, return 0 loss")
-    
-    # with torch.no_grad():
-    #     print("scale before clamp:", scale.min().item(), scale.max().item())
+        return scale.sum() * 0.0
 
-    # mask = mask & (scale>0)   
-    # 确保 scale 和 gt_scale 中的值都大于一个非常小的正数
-    epsilon = 1e-12  # 预防性的小值
-    log_scale = torch.log(scale + epsilon)
-    log_gt_scale = torch.log(gt_scale + epsilon)
+    epsilon = 1e-6
+    log_scale_m = torch.log(scale[mask] + epsilon)
+    log_gt_scale_m = torch.log(gt_scale[mask].clamp(min=epsilon))
 
-    # 计算 scale loss
-    loss = (log_scale - log_gt_scale).abs()
-    loss = loss[mask].mean()
+    loss = (log_scale_m - log_gt_scale_m).abs()
+
+    if loss_weight_alpha > 0:
+        with torch.no_grad():
+            weights = 1.0 + loss_weight_alpha * log_gt_scale_m.abs()
+        loss = (loss * weights).sum() / weights.sum()
+    else:
+        loss = loss.mean()
 
     return loss
 
