@@ -100,6 +100,10 @@ parser.add_argument('--concat_flow_img', action='store_true')
 parser.add_argument('--radial_sampling_num', default=8, type=int,
                     help='number of radial sampling points for spherical coordinates')
 
+# depth-free inference
+parser.add_argument('--no_depth', action='store_true',
+                    help='run inference without depth input (3ch RGB only)')
+
 # Distributed & misc
 parser.add_argument('--local_rank', default=0, type=int)
 parser.add_argument('--distributed', action='store_true')
@@ -139,7 +143,9 @@ def main():
                   num_head               = args.num_head,
                   ffn_dim_expansion      = args.ffn_dim_expansion,
                   num_transformer_layers = args.num_transformer_layers,
-                  reg_refine             = args.reg_refine).to('cuda', memory_format=torch.channels_last).eval()
+                  reg_refine             = args.reg_refine,
+                  no_depth               = getattr(args, 'no_depth', False),
+                  ).to('cuda', memory_format=torch.channels_last).eval()
 
     # Optionally resume checkpoint
     if args.resume:
@@ -307,7 +313,7 @@ def main():
             # ---- 模型前向 ----
             torch.cuda.nvtx.range_push("FpTTC.forward")
             with torch.inference_mode(), torch.cuda.amp.autocast(dtype=AMP_DTYPE):
-                scale_pred, risk_pred = model.forward(
+                scale_pred, risk_pred, *_ = model.forward(
                     img_prev         = prev_batch,
                     img_curr         = curr_batch,
                     depth_prev       = prev_depths_pred_batch,
@@ -461,7 +467,7 @@ def main():
 
             # Inference
             with torch.no_grad():
-                scale_pred, risk_pred = model.forward(
+                scale_pred, risk_pred, *_ = model.forward(
                         img_prev         = prev_batch,
                         img_curr         = curr_batch,
                         depth_prev       = prev_depths_pred_batch,

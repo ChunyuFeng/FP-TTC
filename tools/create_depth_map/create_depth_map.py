@@ -1,7 +1,8 @@
 import pickle
 import argparse
 import os
-import shutil
+from pathlib import Path
+from typing import Optional
 from tqdm import tqdm
 import cv2
 import torch
@@ -9,7 +10,6 @@ import numpy as np
 from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
 from PIL import Image
-from tools.cyberrock.sjtu_test_info import undistort_image
 from utils.nusc_paths import make_nusc_relative_path
 
 # 读取旧外参
@@ -79,6 +79,84 @@ def load_pkl_file(filepath):
         print(f"读取文件时出错: {e}")
         return None
 
+
+def save_pkl_file(filepath, data):
+    with open(filepath, 'wb') as file:
+        pickle.dump(data, file)
+
+
+def resolve_checkpoint_path(encoder: str, metric_dataset: str, checkpoint_path: Optional[str] = None) -> str:
+    if checkpoint_path not in (None, ""):
+        if os.path.exists(checkpoint_path):
+            return checkpoint_path
+        raise FileNotFoundError(f"Depth checkpoint not found: {checkpoint_path}")
+
+    ckpt_name = f'depth_anything_v2_metric_{metric_dataset}_{encoder}.pth'
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate_paths = [
+        repo_root / 'pretrained' / 'new' / ckpt_name,
+        repo_root / 'pretrained' / ckpt_name,
+        repo_root / 'depthanything' / 'checkpoints' / ckpt_name,
+        repo_root / 'depthanything' / 'metric_depth' / 'checkpoints' / ckpt_name,
+        repo_root.parent / 'FP-TTC' / 'pretrained' / 'new' / ckpt_name,
+        repo_root.parent / 'FP-TTC' / 'depthanything' / 'metric_depth' / 'checkpoints' / ckpt_name,
+    ]
+    for path in candidate_paths:
+        if path.exists():
+            return str(path)
+
+    raise FileNotFoundError(
+        "Unable to locate a DepthAnything checkpoint. Tried:\n" +
+        "\n".join(str(path) for path in candidate_paths)
+    )
+
+
+def build_depth_model(encoder: str, metric_dataset: str, max_depth: float, checkpoint_path: Optional[str] = None):
+    model_configs = {
+        'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+        'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+        'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]}
+    }
+
+    model = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': max_depth})
+    ckpt_path = resolve_checkpoint_path(
+        encoder=encoder,
+        metric_dataset=metric_dataset,
+        checkpoint_path=checkpoint_path,
+    )
+    model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
+    model.to('cuda').eval()
+    return model
+
+
+def infer_and_save_depth(
+    *,
+    model,
+    raw_image_rgb: np.ndarray,
+    image_filename: str,
+    output_dir: str,
+    depth_input_size: int,
+    skip_existing_depth: bool,
+    cache: dict,
+):
+    cached_rel_path = cache.get(image_filename)
+    if cached_rel_path is not None:
+        return cached_rel_path
+
+    depth_filename = os.path.splitext(image_filename)[0] + ".npy"
+    depth_save_path = os.path.join(output_dir, depth_filename)
+    depth_rel_path = make_nusc_relative_path(depth_save_path)
+
+    if not (skip_existing_depth and os.path.exists(depth_save_path)):
+        raw_image_bgr = cv2.cvtColor(raw_image_rgb, cv2.COLOR_RGB2BGR)
+        depth = model.infer_image(raw_image_bgr, input_size=depth_input_size)
+        save_dir = os.path.dirname(depth_save_path)
+        os.makedirs(save_dir, exist_ok=True)
+        np.save(depth_save_path, depth)
+
+    cache[image_filename] = depth_rel_path
+    return depth_rel_path
+
 def main(args):
     """
     主函数，解析命令行参数并调用加载函数.
@@ -94,28 +172,24 @@ def main(args):
 
     # 加载 pkl 数据
     data = load_pkl_file(args.pkl_file_path)
-    data_new = []
+    if data is None:
+        raise RuntimeError(f"无法读取 pkl 文件: {args.pkl_file_path}")
     print(f"pkl 文件加载成功, 包含 {len(data)} 条数据.")
 
-    model_configs = {
-    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]}
-    }
+    model = build_depth_model(
+        encoder=args.encoder,
+        metric_dataset=args.metric_dataset,
+        max_depth=args.max_depth,
+        checkpoint_path=args.checkpoint_path,
+    )
 
-    encoder = 'vitb' # or 'vits', 'vitb'
-    dataset = 'vkitti' # 'hypersim' for indoor model, 'vkitti' for outdoor model
-    max_depth = 80 # 20 for indoor model, 80 for outdoor model
-
-    model = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': max_depth})
-    model.load_state_dict(torch.load(f'pretrained/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
-    model.to('cuda').eval()
-
-    print(f"模型 {encoder} 加载成功, 最大深度: {max_depth}.")
+    print(f"模型 {args.encoder} 加载成功, 最大深度: {args.max_depth}.")
         
     channels = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_FRONT_LEFT']
+    processed_depth_paths = {}
 
     if args.sjtu:
+        from tools.cyberrock.sjtu_test_info import undistort_image
         for idx, info in enumerate(tqdm(data, desc="Processing SJTU data")):
             # Load images
             prev_images_undistorted = {}
@@ -147,22 +221,16 @@ def main(args):
             
             # 遍历每条 prev 数据
             for channel in channels:
-                raw_image = augmented_prev[channel]
-                raw_image = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR) 
-                depth = model.infer_image(raw_image)
-
                 image_filename = info['prev_camera_data'][channel]['filename']
-                depth_filename = os.path.splitext(image_filename)[0] + ".npy"
-                path_idx = depth_filename.find('scene')
-                sub_filename = depth_filename[path_idx:]
-                depth_save_path = os.path.join(args.output_dir, sub_filename)
-
-                save_dir = os.path.dirname(depth_save_path)
-                os.makedirs(save_dir, exist_ok=True)
-                np.save(depth_save_path, depth)
-
-                # 将 depth 路径信息添加到 info 中
-                info['prev_camera_data'][channel]['depth_pred'] = make_nusc_relative_path(depth_save_path)
+                info['prev_camera_data'][channel]['depth_pred'] = infer_and_save_depth(
+                    model=model,
+                    raw_image_rgb=augmented_prev[channel],
+                    image_filename=image_filename,
+                    output_dir=args.output_dir,
+                    depth_input_size=args.depth_input_size,
+                    skip_existing_depth=args.skip_existing_depth,
+                    cache=processed_depth_paths,
+                )
 
                 # # 归一化深度图到 [0,255]
                 # depth_vis = np.clip(depth, 0, max_depth) / max_depth * 255
@@ -180,29 +248,19 @@ def main(args):
 
             # 遍历每条 curr 数据
             for channel in channels:
-                raw_image = augmented_curr[channel]
-                raw_image = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR) 
-                depth = model.infer_image(raw_image)
-
                 image_filename = info['curr_camera_data'][channel]['filename']
-                depth_filename = os.path.splitext(image_filename)[0] + ".npy"
-                path_idx = depth_filename.find('scene')
-                sub_filename = depth_filename[path_idx:]
-                depth_save_path = os.path.join(args.output_dir, sub_filename)
-
-                save_dir = os.path.dirname(depth_save_path)
-                os.makedirs(save_dir, exist_ok=True)
-                np.save(depth_save_path, depth)
+                info['curr_camera_data'][channel]['depth_pred'] = infer_and_save_depth(
+                    model=model,
+                    raw_image_rgb=augmented_curr[channel],
+                    image_filename=image_filename,
+                    output_dir=args.output_dir,
+                    depth_input_size=args.depth_input_size,
+                    skip_existing_depth=args.skip_existing_depth,
+                    cache=processed_depth_paths,
+                )
                 
-                # 将 depth 路径信息添加到 info 中
-                info['curr_camera_data'][channel]['depth_pred'] = make_nusc_relative_path(depth_save_path)
-                
-            data_new.append(info)
-
-        # 保存处理后的数据到新的 pkl 文件
-        output_pkl_path = args.pkl_file_path.replace('.pkl', '_dpt.pkl')
-        with open(output_pkl_path, 'wb') as f:
-            pickle.dump(data_new, f)
+        output_pkl_path = args.pkl_file_path if args.rewrite_pkl_in_place else args.pkl_file_path.replace('.pkl', '_dpt.pkl')
+        save_pkl_file(output_pkl_path, data)
         print(f"处理完成，新的 pkl 文件已保存到: {output_pkl_path}")
 
         
@@ -224,30 +282,16 @@ def main(args):
 
             # 遍历每条 prev 数据
             for channel in channels:
-                raw_image = augmented_prev[channel]
-                raw_image = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
-
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event   = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-
-                depth = model.infer_image(raw_image, input_size=80)
-                
-                end_event.record()
-                torch.cuda.synchronize()
-                elapsed_ms = start_event.elapsed_time(end_event)
-                print(f"这段代码在 GPU 上运行耗时：{elapsed_ms:.3f} ms")
-
                 image_filename = info['prev_camera_data'][channel]['filename']
-                depth_filename = os.path.splitext(image_filename)[0] + ".npy"
-                depth_save_path = os.path.join(args.output_dir, depth_filename)
-
-                save_dir = os.path.dirname(depth_save_path)
-                os.makedirs(save_dir, exist_ok=True)
-                np.save(depth_save_path, depth)
-
-                # 将 depth 路径信息添加到 info 中
-                info['prev_camera_data'][channel]['depth_pred'] = make_nusc_relative_path(depth_save_path)
+                info['prev_camera_data'][channel]['depth_pred'] = infer_and_save_depth(
+                    model=model,
+                    raw_image_rgb=augmented_prev[channel],
+                    image_filename=image_filename,
+                    output_dir=args.output_dir,
+                    depth_input_size=args.depth_input_size,
+                    skip_existing_depth=args.skip_existing_depth,
+                    cache=processed_depth_paths,
+                )
 
                 # # 归一化深度图到 [0,255]
                 # depth_vis = np.clip(depth, 0, max_depth) / max_depth * 255
@@ -265,28 +309,21 @@ def main(args):
 
             # 遍历每条 curr 数据
             for channel in channels:
-                raw_image = augmented_curr[channel]
-                raw_image = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR) 
-                depth = model.infer_image(raw_image)
-
                 image_filename = info['curr_camera_data'][channel]['filename']
-                depth_filename = os.path.splitext(image_filename)[0] + ".npy"
-                depth_save_path = os.path.join(args.output_dir, depth_filename)
-
-                save_dir = os.path.dirname(depth_save_path)
-                os.makedirs(save_dir, exist_ok=True)
-                np.save(depth_save_path, depth)
+                info['curr_camera_data'][channel]['depth_pred'] = infer_and_save_depth(
+                    model=model,
+                    raw_image_rgb=augmented_curr[channel],
+                    image_filename=image_filename,
+                    output_dir=args.output_dir,
+                    depth_input_size=args.depth_input_size,
+                    skip_existing_depth=args.skip_existing_depth,
+                    cache=processed_depth_paths,
+                )
                 
-                # 将 depth 路径信息添加到 info 中
-                info['curr_camera_data'][channel]['depth_pred'] = make_nusc_relative_path(depth_save_path)
-                
-        #     data_new.append(info)
-        
-        # # 保存处理后的数据到新的 pkl 文件
-        # output_pkl_path = os.path.join('./Datasets/nuscenes/2_trainval_test_infos', 'nusc_trainval_infos_160_1920_fov_8_15_dpt.pkl')
-        # with open(output_pkl_path, 'wb') as f:
-        #     pickle.dump(data_new, f)
-        # print(f"处理完成，新的 pkl 文件已保存到: {output_pkl_path}")
+        output_pkl_path = args.pkl_file_path if args.rewrite_pkl_in_place else args.pkl_file_path.replace('.pkl', '_dpt.pkl')
+        save_pkl_file(output_pkl_path, data)
+        print(f"处理完成，新的 pkl 文件已保存到: {output_pkl_path}")
+        print(f"本次运行累计处理/复用的唯一图像数: {len(processed_depth_paths)}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load a pkl file and print its content.")
@@ -296,5 +333,13 @@ if __name__ == "__main__":
     parser.add_argument('--pkl_file_path', type=str, required=True, help="Path to the pkl file.")
     parser.add_argument('--nusc_root', type=str, default='./Datasets/nuscenes', help="Root directory of the nuScenes dataset.")
     parser.add_argument('--output_dir', type=str, default='./Datasets/nuscenes/4_depth_map', help="Output directory for depth map npy file.")
+    parser.add_argument('--encoder', type=str, default='vitl', choices=['vits', 'vitb', 'vitl'], help="DepthAnythingV2 encoder.")
+    parser.add_argument('--metric_dataset', type=str, default='vkitti', help="Metric depth checkpoint dataset tag.")
+    parser.add_argument('--max_depth', type=float, default=80, help="Maximum depth for metric model.")
+    parser.add_argument('--checkpoint_path', type=str, default=None, help="Optional explicit DepthAnything checkpoint path.")
+    parser.add_argument('--depth_input_size', type=int, default=320, help="DepthAnything inference input size.")
+    parser.add_argument('--rewrite_pkl_in_place', action='store_true', help="Rewrite the input pkl in place instead of saving a *_dpt.pkl copy.")
+    parser.add_argument('--skip_existing_depth', action=argparse.BooleanOptionalAction, default=True,
+                        help="Reuse existing depth npy files when present.")
     args = parser.parse_args()
     main(args=args)

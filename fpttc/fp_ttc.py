@@ -44,16 +44,20 @@ class FpTTC(nn.Module):
                  num_head               = 1,
                  ffn_dim_expansion      = 4,
                  num_transformer_layers = 6,
-                 reg_refine             = False
+                 reg_refine             = False,
+                 no_depth               = False,
                  ):
         super(FpTTC, self).__init__()
         self.num_scales = num_scales
+        self.no_depth = no_depth
 
         self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                                 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
 
+        backbone_in_ch = 3 if no_depth else 4
         self.cnet = CNNEncoder(output_dim        = feature_channels, 
-                               num_output_scales = num_scales)
+                               num_output_scales = num_scales,
+                               in_channels       = backbone_in_ch)
         
         self.featnet = FeatureNet(num_scales             = num_scales,
                                   feature_channels       = feature_channels,
@@ -131,26 +135,34 @@ class FpTTC(nn.Module):
     def forward(
         self,
         img_prev, img_curr,
-        depth_prev, depth_curr,
-        proj_pix_prev, proj_pix_curr,
-        sensor_metas,
-        attn_type,
-        attn_splits_list,
-        corr_radius_list,
-        prop_radius_list,
-        num_reg_refine,
-        scale_only
+        depth_prev=None, depth_curr=None,
+        proj_pix_prev=None, proj_pix_curr=None,
+        sensor_metas=None,
+        attn_type='swin',
+        attn_splits_list=None,
+        corr_radius_list=None,
+        prop_radius_list=None,
+        num_reg_refine=1,
+        scale_only=True,
+        no_depth=None,
+        use_teacher_distill=False,
     ):
-        
+        if no_depth is None:
+            no_depth = self.no_depth
+
         # ----- 预处理 -----
         img0, img1 = normalize_img(img_prev, img_curr)         # [B,V,3,H,W] -> normed
-        rgbd0 = torch.cat([img0, depth_prev], dim=2)           # [B,V,4,H,W]
-        rgbd1 = torch.cat([img1, depth_curr], dim=2)           # [B,V,4,H,W]
-        B, V, C, H_img, W_img = rgbd0.shape
-
-        # 合并视角到 batch 维，一次性提特征
-        x0 = rgbd0.view(B*V, C, H_img, W_img)
-        x1 = rgbd1.view(B*V, C, H_img, W_img)
+        if no_depth:
+            # depth-free: backbone 直接吃 3ch RGB
+            B, V, C, H_img, W_img = img0.shape
+            x0 = img0.view(B*V, C, H_img, W_img)
+            x1 = img1.view(B*V, C, H_img, W_img)
+        else:
+            rgbd0 = torch.cat([img0, depth_prev], dim=2)           # [B,V,4,H,W]
+            rgbd1 = torch.cat([img1, depth_curr], dim=2)           # [B,V,4,H,W]
+            B, V, C, H_img, W_img = rgbd0.shape
+            x0 = rgbd0.view(B*V, C, H_img, W_img)
+            x1 = rgbd1.view(B*V, C, H_img, W_img)
         # extract_feature 会在内部 cat([x0, x1], 0) -> cnet -> 多尺度 -> chunk 回来
         prev_lvls_flat, curr_lvls_flat = self.extract_feature(x0, x1, branch=None)  # list[T][B*V,C,Hs,Ws]
 
@@ -191,42 +203,48 @@ class FpTTC(nn.Module):
         corr_bv = corr.view(B, V, Cc, Hc, Wc)
         corr_list = [corr_bv[:, v] for v in range(V)]          # list[V] of [B,2,Hc,Wc]
 
-        # ====== 传统投影（不使用 RVT） ======
-        # 1) 风险/尺度的“相关性特征”投影（当前帧）
-        corr_range_init = self.project_views_to_range(
-            corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
-        )  # -> [B, Cc, H_r, W_r]
+        # ====== Teacher 投影（仅训练蒸馏时使用，推理时跳过） ======
+        teacher_corr_range = None
+        teacher_ranges_prev = None
+        teacher_ranges_curr = None
+        has_teacher = (not no_depth) and (proj_pix_curr is not None) and use_teacher_distill and self.training
 
-        # 2) 每个尺度的多视角特征投影
-        multi_level_ranges_prev_init, multi_level_ranges_curr_init = [], []
-        for lvl in range(self.num_scales):
-            scale = 2 ** (self.num_scales - 1 - lvl)
-            if scale > 1:
-                proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
-                proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
-            else:
-                proj_prev_lvl = proj_pix_prev
-                proj_curr_lvl = proj_pix_curr
+        if has_teacher:
+            with torch.no_grad():
+                corr_range_init_teacher = self.project_views_to_range(
+                    corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
+                )
+                teacher_corr_range = self.conv_corr_rvt_in(corr_range_init_teacher)
 
-            # 组建 list[V] of [B,C,Hs,Ws]
-            prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
-            curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
+                teacher_ranges_prev, teacher_ranges_curr = [], []
+                for lvl in range(self.num_scales):
+                    scale = 2 ** (self.num_scales - 1 - lvl)
+                    if scale > 1:
+                        proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
+                        proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
+                    else:
+                        proj_prev_lvl = proj_pix_prev
+                        proj_curr_lvl = proj_pix_curr
 
-            range_prev = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
-            range_curr = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
+                    prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
+                    curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
 
-            multi_level_ranges_prev_init.append(range_prev)  # [B,C,Hr,Wr]
-            multi_level_ranges_curr_init.append(range_curr)
-        # ====== 传统投影（不使用 RVT） ======
+                    range_prev_t = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
+                    range_curr_t = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
 
-        # ====== 基于 RVT 将多视角特征图聚合到 Range View ======
+                    teacher_ranges_prev.append(range_prev_t)
+                    teacher_ranges_curr.append(range_curr_t)
+
+        # ====== 基于 RVT (student) 将多视角特征图聚合到 Range View ======
         # corr -> range（当前帧）
         corr_encoded_list = [self.conv_corr_rvt_in(c) for c in corr_list]  # list[V] of [B, Ccorr, Hc, Wc]
         H_r = corr_encoded_list[0].shape[2]
         W_r = corr_encoded_list[0].shape[3] * V
-        # 将每个视角的 corr_encoded_list 在 W 维度横向拼接，作为初始查询
-        # ini_corr_query = torch.cat(corr_encoded_list, dim=3)  # [B, Ccorr, Hc, Wc*V]
-        corr_range_init = self.conv_corr_rvt_in(corr_range_init.detach())
+
+        corr_ini_query = None
+        if has_teacher:
+            corr_ini_query = teacher_corr_range.detach()
+
         corr_range = self.rvt_corr(
             feats_by_cam=corr_encoded_list,
             cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
@@ -235,7 +253,8 @@ class FpTTC(nn.Module):
             affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
             Hr=H_r, Wr=W_r,
             depth_bins=self.depth_bins,
-            ini_query=corr_range_init
+            ini_query=corr_ini_query,
+            use_geom_bootstrap=(no_depth or not has_teacher),
         )
 
         # 多尺度特征 -> range（前/当前帧）
@@ -246,6 +265,9 @@ class FpTTC(nn.Module):
             H_r = prev_feats_list[0].shape[2]
             W_r = prev_feats_list[0].shape[3] * V
 
+            prev_ini = teacher_ranges_prev[lvl].detach() if has_teacher else None
+            curr_ini = teacher_ranges_curr[lvl].detach() if has_teacher else None
+
             range_prev = self.rvt_feat[lvl](
                 feats_by_cam=prev_feats_list,
                 cam_K=[sensor_metas['prev'][cam]['K']     for cam in self.camera_channels],
@@ -254,7 +276,8 @@ class FpTTC(nn.Module):
                 affine_M=[sensor_metas['prev'][cam]['affine'] for cam in self.camera_channels],
                 Hr=H_r, Wr=W_r,
                 depth_bins=self.depth_bins,
-                ini_query=multi_level_ranges_prev_init[lvl].detach()  # 传统投影结果作为初始查询
+                ini_query=prev_ini,
+                use_geom_bootstrap=(no_depth or not has_teacher),
             )
             range_curr = self.rvt_feat[lvl](
                 feats_by_cam=curr_feats_list,
@@ -264,11 +287,11 @@ class FpTTC(nn.Module):
                 affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
                 Hr=H_r, Wr=W_r,
                 depth_bins=self.depth_bins,
-                ini_query=multi_level_ranges_curr_init[lvl].detach()  # 传统投影结果作为初始查询
+                ini_query=curr_ini,
+                use_geom_bootstrap=(no_depth or not has_teacher),
             )
-            multi_level_ranges_prev.append(range_prev)  # [B,C,Hr,Wr]
+            multi_level_ranges_prev.append(range_prev)
             multi_level_ranges_curr.append(range_curr)
-
 
         # ----- 预测（两分支）-----
         # scale 分支
@@ -279,40 +302,52 @@ class FpTTC(nn.Module):
         scales = self.scale_net(
             corr_encoded_s, multi_level_ranges_prev, multi_level_ranges_curr, initial_scale
         )
-        if scale_only:
-            return scales, None
 
-        # risk 分支
-        corr_encoded = self.conv_corr_risk(corr_range)
-        initial_risk = corr_encoded[:, :1]
-        corr_encoded = corr_encoded[:, 1:]
-        risk_score = self.risk_net(
-            corr_encoded, multi_level_ranges_prev, multi_level_ranges_curr, initial_risk
-        )
+        risk_score = None
+        if not scale_only:
+            corr_encoded = self.conv_corr_risk(corr_range)
+            initial_risk = corr_encoded[:, :1]
+            corr_encoded = corr_encoded[:, 1:]
+            risk_score = self.risk_net(
+                corr_encoded, multi_level_ranges_prev, multi_level_ranges_curr, initial_risk
+            )
 
-        return scales, risk_score
+        # 打包 teacher targets 用于蒸馏 loss
+        teacher_targets = None
+        if has_teacher:
+            teacher_targets = {
+                'corr_range': teacher_corr_range,
+                'ranges_prev': teacher_ranges_prev,
+                'ranges_curr': teacher_ranges_curr,
+            }
+
+        return scales, risk_score, corr_range, multi_level_ranges_prev, multi_level_ranges_curr, teacher_targets
 
 
     def forward_with_loss( 
             self,
             img_prev,                      # Tensor[B, V, 3, H, W]
             img_curr,                      # Tensor[B, V, 3, H, W]
-            depth_prev,                    # Tensor[B, V, 1, H, W]
-            depth_curr,                    # Tensor[B, V, 1, H, W]
-            proj_pix_prev,                 
-            proj_pix_curr,                 
-            gt_scale_map_with_mask,        # Tensor[B, 2, H_sph, W_sph]
-            gt_risk_score_map_with_mask,   # Tensor[B, 2, H_sph, W_sph]
-            sensor_metas,
-            attn_type,                     # str
-            attn_splits_list,              # List[int]
-            corr_radius_list,              # List[int]
-            prop_radius_list,              # List[int]
-            num_reg_refine,                # int
-            scale_only
+            depth_prev=None,               # Tensor[B, V, 1, H, W] or None
+            depth_curr=None,               # Tensor[B, V, 1, H, W] or None
+            proj_pix_prev=None,
+            proj_pix_curr=None,
+            gt_scale_map_with_mask=None,   # Tensor[B, 2, H_sph, W_sph]
+            gt_risk_score_map_with_mask=None,
+            sensor_metas=None,
+            attn_type='swin',
+            attn_splits_list=None,
+            corr_radius_list=None,
+            prop_radius_list=None,
+            num_reg_refine=1,
+            scale_only=True,
+            no_depth=None,
+            use_teacher_distill=False,
+            lambda_feat_distill=1.0,
+            lambda_corr_distill=1.0,
         ):
 
-        scales, risks = self.forward(
+        scales, risks, corr_range, ranges_prev, ranges_curr, teacher_targets = self.forward(
             img_prev         = img_prev,
             img_curr         = img_curr,
             depth_prev       = depth_prev,
@@ -326,51 +361,37 @@ class FpTTC(nn.Module):
             prop_radius_list = prop_radius_list,
             num_reg_refine   = num_reg_refine,
             scale_only       = scale_only,
+            no_depth         = no_depth,
+            use_teacher_distill = use_teacher_distill,
         )
 
-        # # ===== teacher 蒸馏（训练期才启用） =====
-        # if self.training and self.cfg.get('use_rvt_distill', True):
-        #     with torch.no_grad():
-        #         # 用现有 teacher 投影：特征与 corr -> Range
-        #         # teacher_feats_prev/teacher_feats_curr 通过 project_views_to_range(..., proj_pix_prev/curr, ...) 得到
-        #         t_range_prev_list, t_range_curr_list = [], []
-        #         for lvl in range(self.num_scales):
-        #             prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
-        #             curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
-        #             t_prev = self.project_views_to_range(prev_feats_list, proj_pix_prev, H_img=H_img, W_img=W_img)  # [B,C,Hr,Wr]
-        #             t_curr = self.project_views_to_range(curr_feats_list, proj_pix_curr, H_img=H_img, W_img=W_img)
-        #             t_range_prev_list.append(t_prev); t_range_curr_list.append(t_curr)
-
-        #         t_corr_range = self.project_views_to_range(
-        #             [self.conv_corr(c) for c in corr_list], proj_pix_curr, H_img=H_img, W_img=W_img
-        #         )
-
-        #     # L_feat：student vs teacher（多尺度 Range 特征）
-        #     L_feat = 0.0
-        #     for l in range(self.num_scales):
-        #         L_feat = L_feat + (multi_level_ranges_prev[l] - t_range_prev_list[l]).abs().mean()
-        #         L_feat = L_feat + (multi_level_ranges_curr[l] - t_range_curr_list[l]).abs().mean()
-
-        #     # L_corr：student vs teacher（Range corr）
-        #     L_corr = (corr_range - t_corr_range).abs().mean()
-
-        #     # 汇总
-        #     lam_f = self.cfg.get('lambda_feat', 1.0)
-        #     lam_c = self.cfg.get('lambda_corr', 1.0)
-        #     if scale_only:
-        #         loss = loss_s + lam_f * L_feat + lam_c * L_corr
-        #         return scales, None, loss, None
-        #     else:
-        #         loss = loss_r + lam_f * L_feat + lam_c * L_corr
-        #         return None, risks, None, loss
-        
+        # ===== task loss =====
+        loss_s, loss_r = None, None
         if scale_only:
-            # 仅计算尺度分支的损失
             loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask)
-            return scales, None, loss_s, None
         else:
             loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
-            return None, risks, None, loss_r
+
+        # ===== distillation loss (feat + corr, 分别加权) =====
+        L_feat_distill = torch.tensor(0.0, device=img_prev.device)
+        L_corr_distill = torch.tensor(0.0, device=img_prev.device)
+
+        if teacher_targets is not None:
+            t_corr = teacher_targets['corr_range']
+            L_corr_distill = (corr_range - t_corr).abs().mean()
+
+            for lvl in range(self.num_scales):
+                L_feat_distill = L_feat_distill + (ranges_prev[lvl] - teacher_targets['ranges_prev'][lvl]).abs().mean()
+                L_feat_distill = L_feat_distill + (ranges_curr[lvl] - teacher_targets['ranges_curr'][lvl]).abs().mean()
+
+        total_distill = lambda_feat_distill * L_feat_distill + lambda_corr_distill * L_corr_distill
+
+        if scale_only:
+            loss = loss_s + total_distill
+            return scales, None, loss, None
+        else:
+            loss = loss_r + total_distill
+            return None, risks, None, loss
 
     def extract_feature(self, im0, im1, branch):
         x = torch.cat([im0, im1], dim=0)
@@ -409,15 +430,20 @@ class FpTTC(nn.Module):
         u_orig  = proj_pix[..., 1].float().reshape(B, -1) # [B, N]
         v_orig  = proj_pix[..., 2].float().reshape(B, -1) # [B, N]
 
-        u_feat = (u_orig * s_u).long().clamp(0, W_feat-1) # [B, N]
-        v_feat = (v_orig * s_v).long().clamp(0, H_feat-1) # [B, N]
+        valid = cam_idx >= 0
+        cam_idx_safe = cam_idx.clamp(0, V - 1)
+        u_orig_safe = torch.where(valid, u_orig, torch.zeros_like(u_orig))
+        v_orig_safe = torch.where(valid, v_orig, torch.zeros_like(v_orig))
+
+        u_feat = (u_orig_safe * s_u).long().clamp(0, W_feat-1) # [B, N]
+        v_feat = (v_orig_safe * s_v).long().clamp(0, H_feat-1) # [B, N]
 
         # 4) 计算扁平化后的批次＋视角索引
         #    batch_idx ∈ [0..B) 重复 N 次，拼接 cam_idx → [B*N]
         batch_idx = torch.arange(B, device=cam_idx.device)\
                         .unsqueeze(1).repeat(1, H_r*W_r)\
                         .reshape(-1)
-        view_idx  = batch_idx * V + cam_idx.reshape(-1)   # [B*N]
+        view_idx  = batch_idx * V + cam_idx_safe.reshape(-1)   # [B*N]
 
         # 5) 计算在 Hf*Wf 上的线性化像素
         pix_idx   = (v_feat * W_feat + u_feat).reshape(-1)  # [B*N]
@@ -425,6 +451,10 @@ class FpTTC(nn.Module):
         # 6) 一次性 gather
         #    feats_flat[view_idx, :, pix_idx] → [B*N, C]
         selected = feats_flat[view_idx, :, pix_idx]
+        valid_flat = valid.reshape(-1)
+        if not torch.all(valid_flat):
+            selected = selected.clone()
+            selected[~valid_flat] = 0
 
         # 7) 重塑回 [B, C, H_r, W_r]
         range_feat = selected.view(B, H_r*W_r, C) \

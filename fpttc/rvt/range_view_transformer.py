@@ -239,6 +239,13 @@ class RangeViewTransformer(nn.Module):
         self.level_embeds = nn.Parameter(torch.Tensor(self.num_level, input_dim))
         nn.init.xavier_uniform_(self.level_embeds)
 
+        # -------- depth-free: query_adapter (残差路径) --------
+        self.query_adapter = nn.Sequential(
+            nn.Conv2d(d_model, d_model, 1, bias=True),
+            nn.LeakyReLU(0.1, inplace=False),
+            nn.Conv2d(d_model, d_model, 3, padding=1, bias=True),
+        )
+
         for m in self.layers:
             nn.init.constant_(m.sampling_offsets.weight, 0.0)
             nn.init.constant_(m.sampling_offsets.bias,   0.0)
@@ -315,25 +322,111 @@ class RangeViewTransformer(nn.Module):
         msk  =  msk.unsqueeze(2).repeat(1, 1, self.nhead, 1, 1)
         return samp, msk
 
+    def geom_bootstrap(self, feats_by_cam, cam_K, cam_R, cam_t, affine_M, Hr, Wr, depth_bins):
+        """
+        Sample-dependent, geometry-consistent student ini_query.
+        Uses _make_geom_sampling locations + vis_mask to soft-gather from camera features.
+
+        Returns: [B, d_model, Hr, Wr]   (already through value_fs_conv, same channel as d_model)
+        """
+        B, C_in, _, _ = feats_by_cam[0].shape
+        device = feats_by_cam[0].device
+        L = len(feats_by_cam)
+        K = depth_bins.numel()
+        Q = Hr * Wr
+
+        # 1) Pack features for grid_sample: list(L) of [B, C_in, Hf, Wf]
+        _, spatial_shapes, _, in_sizes = self._pack_levels(feats_by_cam)
+
+        # 2) Get geometric sampling locations & visibility mask (no grad needed for locations)
+        with torch.no_grad():
+            samp_loc, vis_mask = self._make_geom_sampling(
+                B, Hr, Wr, depth_bins, cam_K, cam_R, cam_t, affine_M, in_sizes
+            )  # samp_loc: [B,Q,H,L,K,2], vis_mask: [B,Q,H,L,K]
+            # Collapse head dim (take head 0, they're identical since geom is head-independent)
+            samp_loc_h0 = samp_loc[:, :, 0, :, :, :]   # [B, Q, L, K, 2] in [0,1]
+            vis_mask_h0 = vis_mask[:, :, 0, :, :]       # [B, Q, L, K]
+
+        # 3) For each camera level, grid_sample features at sampling locations
+        #    samp_loc_h0[..., l, :, :]: [B, Q, K, 2] in [0,1] → convert to [-1,1] for grid_sample
+        gathered = []  # will be [L] of [B, Q, K, C_in]
+        for l in range(L):
+            feat_l = feats_by_cam[l]  # [B, C_in, Hf, Wf]
+            # Sample points for this camera: [B, Q, K, 2]
+            grid_01 = samp_loc_h0[:, :, l, :, :]  # [B, Q, K, 2]
+            # Convert [0,1] → [-1,1] for grid_sample
+            grid = grid_01 * 2.0 - 1.0  # [B, Q, K, 2]
+            # grid_sample expects [B, C, Hout, Wout] input, [B, Hout, Wout, 2] grid
+            # Reshape grid: [B, Q, K, 2] → [B, Q*K, 1, 2] (treat as 2D: H=Q*K, W=1)
+            grid_2d = grid.view(B, Q * K, 1, 2)
+            sampled = F.grid_sample(feat_l, grid_2d, mode='bilinear',
+                                    padding_mode='zeros', align_corners=False)  # [B, C_in, Q*K, 1]
+            sampled = sampled.squeeze(-1).view(B, C_in, Q, K).permute(0, 2, 3, 1)  # [B, Q, K, C_in]
+            gathered.append(sampled)
+
+        # 4) Stack cameras and apply visibility-weighted aggregation
+        gathered = torch.stack(gathered, dim=2)  # [B, Q, L, K, C_in]
+        weights = vis_mask_h0.float()             # [B, Q, L, K]
+        # Normalize over (L, K) so each query pixel sums to 1
+        w_sum = weights.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        weights = weights / w_sum                 # [B, Q, L, K]
+        # Weighted sum: [B, Q, L, K, C_in] * [B, Q, L, K, 1] → sum → [B, Q, C_in]
+        bootstrap = (gathered * weights.unsqueeze(-1)).sum(dim=(2, 3))  # [B, Q, C_in]
+
+        # 5) Reshape to spatial and apply value_fs_conv to match d_model
+        bootstrap = bootstrap.transpose(1, 2).contiguous()  # [B, C_in, Q]
+        bootstrap = self.value_fs_conv(bootstrap)            # [B, d_model, Q]
+        bootstrap = bootstrap.view(B, self.d_model, Hr, Wr)
+        return bootstrap
+
     def forward(self,
                 feats_by_cam,         # list(L) of [B, C_in, Hf, Wf]
                 cam_K, cam_R, cam_t,  # list(L) of [B,3,3],[B,3,3],[B,3]或[B,3,1]
                 affine_M,             # list(L) of [B,3,3]
                 Hr, Wr,
                 depth_bins=None,      # Tensor[K] （若 None，则自动对数均匀采样）
-                ini_query=None):
+                ini_query=None,
+                use_geom_bootstrap=False):
         """
         输出：Range-View 聚合特征 [B, d_model, Hr, Wr]
+
+        ini_query: 外部提供的初始查询（teacher 投影或其他），送入 scale_conv 主路径。
+                   若 None 且 use_geom_bootstrap=False → zeros（旧行为）。
+                   若 None 且 use_geom_bootstrap=True  → geom_bootstrap 结果送入 scale_conv。
+        use_geom_bootstrap: True 时额外计算 geom_bootstrap，结果走 query_adapter 残差路径。
         """
         B, C_in, _, _ = feats_by_cam[0].shape
         device = feats_by_cam[0].device
 
-        # 1) 构造“query特征”，保持与 ScaleEncoder 风格一致（有 pos_enc）
+        # 0) 深度 bins（提前处理，geom_bootstrap 也需要）
+        if depth_bins is None:
+            d_min, d_max = 1.0, 40.0
+            K = self.num_points
+            depth_bins = torch.logspace(math.log10(d_min), math.log10(d_max), K, device=device)
+        else:
+            K = depth_bins.numel()
+            assert K == self.num_points, f"num_points({self.num_points}) != len(depth_bins)({K})"
+
+        # 1) 构造 query 特征 —— 主路径 + geom_bootstrap 残差路径
+        geom_ini = None
+        if use_geom_bootstrap:
+            geom_ini = self.geom_bootstrap(
+                feats_by_cam, cam_K, cam_R, cam_t, affine_M,
+                Hr, Wr, depth_bins
+            )  # [B, d_model, Hr, Wr]
+
         if ini_query is None:
-            # 这里没有天然的 Range-View 输入，给零特征也可以（scale_conv 的 bias/BN 不会引入问题）
-            ini_query = torch.zeros(B, C_in, Hr, Wr, device=device)
-        query = self.scale_conv(ini_query)            # [B,d_model,Hr,Wr]
-        query = query + self.pos_enc(query)           # 与 ScaleEncoder 一致
+            if geom_ini is not None:
+                # student-only: geom_bootstrap 结果作为主路径输入
+                ini_query = geom_ini
+            else:
+                # 旧行为: zeros
+                ini_query = torch.zeros(B, C_in, Hr, Wr, device=device)
+
+        query = self.scale_conv(ini_query)            # [B, d_model, Hr, Wr]
+        if geom_ini is not None:
+            query = query + self.query_adapter(geom_ini)  # 残差增强
+        query = query + self.pos_enc(query)           # 位置编码
         query = query.flatten(2).transpose(1, 2).contiguous()  # [B,Q,C]
 
         # 2) value 组织（与 ScaleEncoder 一致：flatten + level_embed + 1×1 conv 到 d_model）
@@ -352,16 +445,7 @@ class RangeViewTransformer(nn.Module):
         #    仍构造占位的 query_location（全零）以匹配接口
         query_location = torch.zeros(B, Hr*Wr, self.num_level, 2, device=device, dtype=value.dtype)
 
-        # 4) 深度 bins
-        if depth_bins is None:
-            d_min, d_max = 1.0, 40.0
-            K = self.num_points
-            depth_bins = torch.logspace(math.log10(d_min), math.log10(d_max), K, device=device)
-        else:
-            K = depth_bins.numel()
-            assert K == self.num_points, f"num_points({self.num_points}) != len(depth_bins)({K})"
-
-        # 5) 生成“几何采样点 + 可见性 mask”，并据此构造 ext_attention_weights
+        # 4) 生成"几何采样点 + 可见性 mask"，并据此构造 ext_attention_weights
         ext_loc, vis_mask = self._make_geom_sampling(
             B, Hr, Wr, depth_bins, cam_K, cam_R, cam_t, affine_M, in_sizes
         )  # [B,Q,H,L,K,2], [B,Q,H,L,K] bool

@@ -27,12 +27,20 @@ from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_load
 class TTCTrainer(object):
     def __init__(self, model, dataset, optimizer, args, start_epoch, device,
                 parallel=False, time_stamp=None, 
-                neptune_run=None, scale_only=False):
+                neptune_run=None, scale_only=False,
+                no_depth=False, use_teacher_distill=False,
+                lambda_feat_distill=1.0, lambda_corr_distill=0.5,
+                distill_end_pct=0.7):
         self.model = model
         self.parallel = parallel
         self.batch_size = args.batch_size
         self.train_sampler = None
         self.scale_only = scale_only
+        self.no_depth = no_depth
+        self.use_teacher_distill = use_teacher_distill
+        self.lambda_feat_distill = lambda_feat_distill
+        self.lambda_corr_distill = lambda_corr_distill
+        self.distill_end_pct = distill_end_pct
         if not self.parallel:
             self.train_loader = DataLoader(dataset, 
                                            batch_size  = args.batch_size, 
@@ -137,6 +145,24 @@ class TTCTrainer(object):
             self.train_sampler.set_epoch(epoch)
         self.model.train()
         
+        # distillation annealing: linearly decay from 1.0 → 0.0 over [0, distill_end_pct * total_epochs]
+        if self.distill_end_pct > 0 and self.epoch > 0:
+            end_epoch = int(self.distill_end_pct * self.epoch)
+            if end_epoch > 0 and epoch < end_epoch:
+                distill_scale = 1.0 - epoch / end_epoch
+            else:
+                distill_scale = 0.0
+        else:
+            distill_scale = 0.0
+
+        cur_lambda_feat = self.lambda_feat_distill * distill_scale
+        cur_lambda_corr = self.lambda_corr_distill * distill_scale
+        cur_use_distill = self.use_teacher_distill and (distill_scale > 0)
+
+        if is_main_process() and self.use_teacher_distill:
+            print(f"  [Distill] epoch={epoch}, scale={distill_scale:.3f}, "
+                  f"lambda_feat={cur_lambda_feat:.4f}, lambda_corr={cur_lambda_corr:.4f}")
+
         epoch_loss = 0
         steps = 0
 
@@ -186,7 +212,11 @@ class TTCTrainer(object):
                     corr_radius_list              = self.corr_radius_list,
                     prop_radius_list              = self.prop_radius_list,
                     num_reg_refine                = self.num_reg_refine,
-                    scale_only                    = self.scale_only
+                    scale_only                    = self.scale_only,
+                    no_depth                      = self.no_depth,
+                    use_teacher_distill           = cur_use_distill,
+                    lambda_feat_distill           = cur_lambda_feat,
+                    lambda_corr_distill           = cur_lambda_corr,
                 )
             else:
                 scale, risk_score, loss_s, loss_r = self.model.forward_with_loss(
@@ -204,7 +234,11 @@ class TTCTrainer(object):
                     corr_radius_list              = self.corr_radius_list,
                     prop_radius_list              = self.prop_radius_list,
                     num_reg_refine                = self.num_reg_refine,
-                    scale_only                    = self.scale_only
+                    scale_only                    = self.scale_only,
+                    no_depth                      = self.no_depth,
+                    use_teacher_distill           = cur_use_distill,
+                    lambda_feat_distill           = cur_lambda_feat,
+                    lambda_corr_distill           = cur_lambda_corr,
                 )
             
             loss = loss_s if self.scale_only else loss_r

@@ -10,6 +10,7 @@ NUSC_PATH_ANCHORS = (
     "2_trainval_test_infos",
     "3_visualization",
     "4_depth_map",
+    "5_proj_cache",
     "samples",
     "sweeps",
     "maps",

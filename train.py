@@ -33,6 +33,18 @@ parser.add_argument('--image_size', default=[384, 512], type=int, nargs='+',
                     help='image size for training')
 parser.add_argument('--padding_factor', default=16, type=int,
                     help='the input should be divisible by padding_factor, otherwise do padding or resizing')
+parser.add_argument('--train_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/train', type=str,
+                    help='path to the train pkl directory')
+parser.add_argument('--train_info_file', default='nusc_train_infos_key_frames_160_1920_fov_8_15.pkl', type=str,
+                    help='train pkl file name')
+parser.add_argument('--require_complete_depth', action='store_true',
+                    help='only keep samples whose 12 depth maps all exist')
+parser.add_argument('--max_train_samples', default=None, type=int,
+                    help='limit the number of train samples after filtering')
+parser.add_argument('--proj_cache_root',
+                    default='./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_v1',
+                    type=str,
+                    help='root directory of precomputed proj_pix cache')
 
 # evaluation
 parser.add_argument('--eval', action='store_true',
@@ -143,6 +155,20 @@ parser.add_argument('--scale_batch_size', type=int, default=1,
 parser.add_argument('--risk_batch_size',  type=int, default=1,
                     help='batch size for risk-only stage')
 
+# depth-free / distillation
+parser.add_argument('--no_depth', action='store_true',
+                    help='train without depth input (3ch RGB only)')
+parser.add_argument('--use_teacher_distill', action='store_true',
+                    help='use teacher (proj_pix hard projection) for distillation')
+parser.add_argument('--lambda_feat_distill', type=float, default=1.0,
+                    help='weight for feature distillation loss')
+parser.add_argument('--lambda_corr_distill', type=float, default=0.5,
+                    help='weight for correlation distillation loss')
+parser.add_argument('--distill_end_pct', type=float, default=0.7,
+                    help='fraction of training at which distillation weight reaches 0')
+parser.add_argument('--student_tail_epochs', type=int, default=0,
+                    help='extra student-only fine-tuning epochs after distillation')
+
 # 加载预训练的单分支模型：
 parser.add_argument(
     '--scale_pretrained_ckpt',
@@ -206,6 +232,7 @@ def main():
         ffn_dim_expansion      = args.ffn_dim_expansion,
         num_transformer_layers = args.num_transformer_layers,
         reg_refine             = args.reg_refine,
+        no_depth               = args.no_depth,
     ).cuda()
 
     start_epoch = 0
@@ -297,12 +324,19 @@ def main():
                     print(f"[SCALE-INIT] Missing keys: {load_info.missing_keys}")
             ##########################################################################
         # 1) freeze risk branch
-        freeze_prefixes = (
-            # 
-            'cnet.', 'featnet.', 'corrnet.',
-            # risk branch
-            'conv_corr_risk.','risk_net.'
-        )
+        if args.no_depth:
+            # depth-free: unfreeze featnet/corrnet so they adapt to 3ch input
+            freeze_prefixes = (
+                'cnet.',
+                'conv_corr_risk.', 'risk_net.',
+            )
+        else:
+            freeze_prefixes = (
+                # 
+                'cnet.', 'featnet.', 'corrnet.',
+                # risk branch
+                'conv_corr_risk.','risk_net.'
+            )
 
         for name, p in model.named_parameters():
             # remove "module." prefix if using DDP
@@ -335,6 +369,11 @@ def main():
                              time_stamp  = time_stamp,
                              neptune_run = run,
                              scale_only  = True,
+                             no_depth    = args.no_depth,
+                             use_teacher_distill = args.use_teacher_distill,
+                             lambda_feat_distill = args.lambda_feat_distill,
+                             lambda_corr_distill = args.lambda_corr_distill,
+                             distill_end_pct     = args.distill_end_pct,
                              )
         trainer.train()
 
@@ -374,6 +413,11 @@ def main():
                              time_stamp  = time_stamp,
                              neptune_run = run,
                              scale_only  = False,
+                             no_depth    = args.no_depth,
+                             use_teacher_distill = args.use_teacher_distill,
+                             lambda_feat_distill = args.lambda_feat_distill,
+                             lambda_corr_distill = args.lambda_corr_distill,
+                             distill_end_pct     = args.distill_end_pct,
                              )
         trainer.train()
 
