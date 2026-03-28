@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .modules.utils import normalize_img
-from utils.loss import get_loss_scale_map, get_loss_risk_score_map
+from utils.loss import get_loss_scale_map, get_loss_scale_gradient_map, get_loss_risk_score_map
 
 from .scale_net.backbone import CNNEncoder
 from .scale_net.feature_net.feature_net import FeatureNet
@@ -344,6 +344,7 @@ class FpTTC(nn.Module):
             lambda_feat_distill=1.0,
             lambda_corr_distill=1.0,
             loss_weight_alpha=0.0,
+            edge_loss_weight=0.0,
         ):
 
         scales, risks, corr_range, ranges_prev, ranges_curr, teacher_targets = self.forward(
@@ -375,6 +376,10 @@ class FpTTC(nn.Module):
         else:
             loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
 
+        loss_edge = torch.tensor(0.0, device=img_prev.device)
+        if scale_only and edge_loss_weight > 0:
+            loss_edge = get_loss_scale_gradient_map(scales, gt_scale_map_with_mask)
+
         # ===== distillation loss (feat + corr, 分别加权) =====
         L_feat_distill = torch.tensor(0.0, device=img_prev.device)
         L_corr_distill = torch.tensor(0.0, device=img_prev.device)
@@ -389,7 +394,7 @@ class FpTTC(nn.Module):
 
         total_distill = lambda_feat_distill * L_feat_distill + lambda_corr_distill * L_corr_distill
 
-        loss_total = (loss_s if scale_only else loss_r) + total_distill
+        loss_total = (loss_s if scale_only else loss_r) + total_distill + edge_loss_weight * loss_edge
         loss_task = loss_s if scale_only else loss_r
         zero = torch.tensor(0.0, device=img_prev.device)
 
@@ -400,6 +405,7 @@ class FpTTC(nn.Module):
             'risk': loss_r if loss_r is not None else zero,
             'feat_distill': L_feat_distill,
             'corr_distill': L_corr_distill,
+            'edge': loss_edge,
         }
 
         if scale_only:

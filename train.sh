@@ -13,16 +13,17 @@ export MASTER_PORT="${MASTER_PORT:-29501}"
 
 TRAIN_INFO_PATH="${TRAIN_INFO_PATH:-./Datasets/nuscenes/2_trainval_test_infos/train}"
 TRAIN_INFO_FILE="${TRAIN_INFO_FILE:-nusc_train_infos_key_frames_160_1920_fov_8_15.pkl}"
-PROJ_CACHE_ROOT="${PROJ_CACHE_ROOT:-./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_v1}"
-SCALE_CKPT="${SCALE_CKPT:-pretrained/rvt/1120_scale_kbins_8.pth.tar}"
+PROJ_CACHE_ROOT="${PROJ_CACHE_ROOT:-./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_hardproj_v1}"
+SCALE_CKPT="${SCALE_CKPT:-pretrained/1120_scale_kbins_8.pth.tar}"
 
 SCALE_EPOCHS="${SCALE_EPOCHS:-240}"
 STUDENT_TAIL_EPOCHS="${STUDENT_TAIL_EPOCHS:-0}"
-DISTILL_END_PCT="${DISTILL_END_PCT:-0.7}"
-LAMBDA_FEAT_DISTILL="${LAMBDA_FEAT_DISTILL:-1.0}"
+DISTILL_END_PCT="${DISTILL_END_PCT:-0.5}"
+LAMBDA_FEAT_DISTILL="${LAMBDA_FEAT_DISTILL:-0.3}"
 LAMBDA_CORR_DISTILL="${LAMBDA_CORR_DISTILL:-0.5}"
-LOSS_WEIGHT_ALPHA="${LOSS_WEIGHT_ALPHA:-0.0}"
+LOSS_WEIGHT_ALPHA="${LOSS_WEIGHT_ALPHA:-3.0}"
 NEW_MODULE_LR_MULT="${NEW_MODULE_LR_MULT:-5.0}"
+EDGE_LOSS_WEIGHT="${EDGE_LOSS_WEIGHT:-0.0}"
 
 NUM_WORKERS="${NUM_WORKERS:-2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
@@ -50,6 +51,7 @@ torchrun \
   --lr "${LR}" \
   --new_module_lr_mult "${NEW_MODULE_LR_MULT}" \
   --loss_weight_alpha "${LOSS_WEIGHT_ALPHA}" \
+  --edge_loss_weight "${EDGE_LOSS_WEIGHT}" \
   --batch_size 1 \
   --num_workers "${NUM_WORKERS}" \
   --image_size 160 320 \
@@ -60,6 +62,6 @@ torchrun \
   --lambda_feat_distill "${LAMBDA_FEAT_DISTILL}" \
   --lambda_corr_distill "${LAMBDA_CORR_DISTILL}" \
   --risk_epochs 1 \
-  --scale_batch_size 1 \
+  --scale_batch_size 4 \
   --risk_batch_size 1 \
   --scale_pretrained_ckpt "${SCALE_CKPT}"

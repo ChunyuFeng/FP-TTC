@@ -175,6 +175,8 @@ parser.add_argument('--loss_weight_alpha', type=float, default=0.0,
                     help='distance-based scale loss reweighting alpha; 0=off')
 parser.add_argument('--new_module_lr_mult', type=float, default=1.0,
                     help='learning-rate multiplier for non-pretrained modules relative to args.lr')
+parser.add_argument('--edge_loss_weight', type=float, default=0.0,
+                    help='weight for optional masked scale-gradient loss; 0=off')
 
 # 加载预训练的单分支模型：
 parser.add_argument(
@@ -592,6 +594,7 @@ def main():
                              distill_end_pct     = args.distill_end_pct,
                              student_tail_epochs = args.student_tail_epochs,
                              loss_weight_alpha   = args.loss_weight_alpha,
+                             edge_loss_weight    = args.edge_loss_weight,
                              )
         trainer.train()
 
@@ -649,6 +652,7 @@ def main():
                              distill_end_pct     = args.distill_end_pct,
                              student_tail_epochs = args.student_tail_epochs,
                              loss_weight_alpha   = args.loss_weight_alpha,
+                             edge_loss_weight    = args.edge_loss_weight,
                              )
         trainer.train()
 

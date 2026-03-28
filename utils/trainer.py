@@ -33,7 +33,7 @@ class TTCTrainer(object):
                 no_depth=False, use_teacher_distill=False,
                 lambda_feat_distill=1.0, lambda_corr_distill=0.5,
                 distill_end_pct=0.7, student_tail_epochs=0,
-                loss_weight_alpha=0.0):
+                loss_weight_alpha=0.0, edge_loss_weight=0.0):
         self.model = model
         self.parallel = parallel
         self.batch_size = args.batch_size
@@ -46,6 +46,7 @@ class TTCTrainer(object):
         self.distill_end_pct = distill_end_pct
         self.student_tail_epochs = max(0, int(student_tail_epochs))
         self.loss_weight_alpha = loss_weight_alpha
+        self.edge_loss_weight = edge_loss_weight
         self.new_module_lr_mult = getattr(args, 'new_module_lr_mult', 1.0)
         if not self.parallel:
             self.train_loader = DataLoader(dataset, 
@@ -231,6 +232,7 @@ class TTCTrainer(object):
             'scale_only': bool(self.scale_only),
             'use_teacher_distill': bool(self.use_teacher_distill),
             'student_tail_epochs': self.student_tail_epochs,
+            'edge_loss_weight': float(self.edge_loss_weight),
             'new_module_lr_mult': float(self.new_module_lr_mult),
             'optimizer_groups': getattr(self.optimizer, '_fp_ttc_lr_group_summary', []),
         }
@@ -391,6 +393,7 @@ class TTCTrainer(object):
                     lambda_feat_distill=cur_lambda_feat,
                     lambda_corr_distill=cur_lambda_corr,
                     loss_weight_alpha=self.loss_weight_alpha,
+                    edge_loss_weight=self.edge_loss_weight,
                 )
 
                 if isinstance(scale, list):
@@ -495,6 +498,7 @@ class TTCTrainer(object):
             'risk': 0.0,
             'feat_distill': 0.0,
             'corr_distill': 0.0,
+            'edge': 0.0,
         }
         steps = 0
         save_index = 1000
@@ -544,6 +548,7 @@ class TTCTrainer(object):
                     lambda_feat_distill           = cur_lambda_feat,
                     lambda_corr_distill           = cur_lambda_corr,
                     loss_weight_alpha             = self.loss_weight_alpha,
+                    edge_loss_weight              = self.edge_loss_weight,
                 )
             else:
                 scale, risk_score, loss_s, loss_r, loss_dict = self.model.forward_with_loss(
@@ -567,6 +572,7 @@ class TTCTrainer(object):
                     lambda_feat_distill           = cur_lambda_feat,
                     lambda_corr_distill           = cur_lambda_corr,
                     loss_weight_alpha             = self.loss_weight_alpha,
+                    edge_loss_weight              = self.edge_loss_weight,
                 )
             
             loss = loss_dict['total']
@@ -582,6 +588,7 @@ class TTCTrainer(object):
                 'risk': float(loss_dict['risk'].item()),
                 'feat_distill': float(loss_dict['feat_distill'].item()),
                 'corr_distill': float(loss_dict['corr_distill'].item()),
+                'edge': float(loss_dict['edge'].item()),
             }
             for key, value in batch_metrics.items():
                 epoch_totals[key] += value
@@ -623,7 +630,8 @@ class TTCTrainer(object):
                         f"Loss_now: {batch_metrics['total']:6.4f}  "
                         f"(task={batch_metrics['task']:6.4f}, "
                         f"feat={batch_metrics['feat_distill']:6.4f}, "
-                        f"corr={batch_metrics['corr_distill']:6.4f})"
+                        f"corr={batch_metrics['corr_distill']:6.4f}, "
+                        f"edge={batch_metrics['edge']:6.4f})"
                     )
 
             self.iters += 1
@@ -649,6 +657,7 @@ class TTCTrainer(object):
                         'loss_risk': batch_metrics['risk'],
                         'loss_feat_distill': batch_metrics['feat_distill'],
                         'loss_corr_distill': batch_metrics['corr_distill'],
+                        'loss_edge': batch_metrics['edge'],
                         'distill_scale': float(distill_scale),
                         'lambda_feat_distill': float(cur_lambda_feat),
                         'lambda_corr_distill': float(cur_lambda_corr),
@@ -678,6 +687,7 @@ class TTCTrainer(object):
             'train_loss_risk': avg_metrics['risk'],
             'train_loss_feat_distill': avg_metrics['feat_distill'],
             'train_loss_corr_distill': avg_metrics['corr_distill'],
+            'train_loss_edge': avg_metrics['edge'],
             'distill_scale': float(distill_scale),
             'lambda_feat_distill': float(cur_lambda_feat),
             'lambda_corr_distill': float(cur_lambda_corr),
@@ -700,6 +710,7 @@ class TTCTrainer(object):
                     'train_loss_risk',
                     'train_loss_feat_distill',
                     'train_loss_corr_distill',
+                    'train_loss_edge',
                     'distill_scale',
                     'lambda_feat_distill',
                     'lambda_corr_distill',

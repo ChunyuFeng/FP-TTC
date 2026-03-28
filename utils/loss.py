@@ -325,6 +325,35 @@ def get_loss_scale_map(scale, gt_scale_with_mask, loss_weight_alpha=0.0):
 
     return loss
 
+
+def get_loss_scale_gradient_map(scale, gt_scale_with_mask):
+    scale = scale.squeeze(1)
+    gt_scale = gt_scale_with_mask[:, 0, :, :]
+    mask = gt_scale_with_mask[:, 1, :, :].bool()
+
+    if mask.sum() == 0:
+        return scale.sum() * 0.0
+
+    valid_x = mask[:, :, 1:] & mask[:, :, :-1]
+    valid_y = mask[:, 1:, :] & mask[:, :-1, :]
+
+    losses = []
+
+    if valid_x.any():
+        grad_scale_x = scale[:, :, 1:] - scale[:, :, :-1]
+        grad_gt_x = gt_scale[:, :, 1:] - gt_scale[:, :, :-1]
+        losses.append((grad_scale_x[valid_x] - grad_gt_x[valid_x]).abs().mean())
+
+    if valid_y.any():
+        grad_scale_y = scale[:, 1:, :] - scale[:, :-1, :]
+        grad_gt_y = gt_scale[:, 1:, :] - gt_scale[:, :-1, :]
+        losses.append((grad_scale_y[valid_y] - grad_gt_y[valid_y]).abs().mean())
+
+    if not losses:
+        return scale.sum() * 0.0
+
+    return sum(losses) / len(losses)
+
 def get_loss_risk_score_map(risk_score, gt_risk_score_with_mask):
     # 移除单个维度，使所有张量形状为 (B, H, W)
     risk_score = risk_score.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
