@@ -51,6 +51,7 @@ class FpTTC(nn.Module):
                  num_transformer_layers = 6,
                  reg_refine             = False,
                  no_depth               = False,
+                 activation_checkpointing = False,
                  ):
         super(FpTTC, self).__init__()
         self.num_scales = num_scales
@@ -68,7 +69,8 @@ class FpTTC(nn.Module):
                                   feature_channels       = feature_channels,
                                   num_head               = num_head, 
                                   ffn_dim_expansion      = ffn_dim_expansion,
-                                  num_transformer_layers = num_transformer_layers)   
+                                  num_transformer_layers = num_transformer_layers,
+                                  activation_checkpointing = activation_checkpointing)   
          
         self.corrnet = FlowNet(num_scales       = num_scales,
                                feature_channels = feature_channels,
@@ -125,7 +127,8 @@ class FpTTC(nn.Module):
                 num_level=num_views,          # 相机数 = 6
                 num_points=K_bins,            # 深度 bins 数
                 fov_up=8.0,
-                fov_down=-15.0
+                fov_down=-15.0,
+                activation_checkpointing=activation_checkpointing,
             )
             for _ in range(num_scales)
         ])
@@ -139,7 +142,8 @@ class FpTTC(nn.Module):
             num_level=num_views,
             num_points=K_bins,
             fov_up=8.0,
-            fov_down=-15.0
+            fov_down=-15.0,
+            activation_checkpointing=activation_checkpointing,
         )
     
     def _predict_depth_logits(self, feat_bv):

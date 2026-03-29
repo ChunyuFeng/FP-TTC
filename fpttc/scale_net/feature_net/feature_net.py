@@ -16,6 +16,7 @@ class FeatureNet(nn.Module):
                  num_head=1,
                  ffn_dim_expansion=4,
                  num_transformer_layers=6,
+                 activation_checkpointing=False,
                  ):
         super(FeatureNet, self).__init__()
 
@@ -27,6 +28,7 @@ class FeatureNet(nn.Module):
                                               d_model=feature_channels,
                                               nhead=num_head,
                                               ffn_dim_expansion=ffn_dim_expansion,
+                                              activation_checkpointing=activation_checkpointing,
                                               )
 
     def forward(self, feature0, feature1, 
@@ -149,4 +151,3 @@ class GmaAtten(nn.Module):
     #                                                 )            
 
     #     return feature0, feature1
-

@@ -10,6 +10,7 @@ export QT_QPA_PLATFORM=offscreen
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MASTER_PORT="${MASTER_PORT:-29501}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256}"
 
 TRAIN_INFO_PATH="${TRAIN_INFO_PATH:-./Datasets/nuscenes/2_trainval_test_infos/train}"
 TRAIN_INFO_FILE="${TRAIN_INFO_FILE:-nusc_train_infos_key_frames_160_1920_fov_8_15.pkl}"
@@ -31,12 +32,18 @@ ATTN_TOPK="${ATTN_TOPK:-8}"
 BOOTSTRAP_PRIOR_SCALE="${BOOTSTRAP_PRIOR_SCALE:-2.0}"
 ATTN_PRIOR_SCALE="${ATTN_PRIOR_SCALE:-2.0}"
 DEPTH_PRIOR_EPS="${DEPTH_PRIOR_EPS:-1e-6}"
+ACTIVATION_CHECKPOINTING="${ACTIVATION_CHECKPOINTING:-1}"
 
 NUM_WORKERS="${NUM_WORKERS:-2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
 LR="${LR:-4e-5}"
-SCALE_BATCH_SIZE="${SCALE_BATCH_SIZE:-2}"
+SCALE_BATCH_SIZE="${SCALE_BATCH_SIZE:-3}"
 RISK_BATCH_SIZE="${RISK_BATCH_SIZE:-1}"
+
+EXTRA_ARGS=()
+if [[ "${ACTIVATION_CHECKPOINTING}" == "1" ]]; then
+  EXTRA_ARGS+=(--activation_checkpointing)
+fi
 
 torchrun \
   --standalone \
@@ -69,6 +76,7 @@ torchrun \
   --bootstrap_prior_scale "${BOOTSTRAP_PRIOR_SCALE}" \
   --attn_prior_scale "${ATTN_PRIOR_SCALE}" \
   --depth_prior_eps "${DEPTH_PRIOR_EPS}" \
+  "${EXTRA_ARGS[@]}" \
   --batch_size 1 \
   --num_workers "${NUM_WORKERS}" \
   --image_size 160 320 \

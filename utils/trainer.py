@@ -59,6 +59,7 @@ class TTCTrainer(object):
         self.attn_prior_scale = float(attn_prior_scale)
         self.depth_prior_eps = float(depth_prior_eps)
         self.new_module_lr_mult = getattr(args, 'new_module_lr_mult', 1.0)
+        self.activation_checkpointing = bool(getattr(args, 'activation_checkpointing', False))
         if not self.parallel:
             self.train_loader = DataLoader(dataset, 
                                            batch_size  = args.batch_size, 
@@ -179,6 +180,25 @@ class TTCTrainer(object):
             lrs.setdefault('new', 0.0)
         return lrs
 
+    def _reset_cuda_peak_stats(self):
+        if torch.cuda.is_available() and 'cuda' in str(self.device):
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+    def _cuda_peak_stats_mb(self):
+        if torch.cuda.is_available() and 'cuda' in str(self.device):
+            return {
+                'cuda_max_memory_allocated_mb': float(
+                    torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
+                ),
+                'cuda_max_memory_reserved_mb': float(
+                    torch.cuda.max_memory_reserved(self.device) / (1024 ** 2)
+                ),
+            }
+        return {
+            'cuda_max_memory_allocated_mb': 0.0,
+            'cuda_max_memory_reserved_mb': 0.0,
+        }
+
     def _log_current_lrs(self):
         group_names = getattr(self.optimizer, '_fp_ttc_lr_group_names', [])
         if group_names:
@@ -254,6 +274,7 @@ class TTCTrainer(object):
             'attn_prior_scale': float(self.attn_prior_scale),
             'depth_prior_eps': float(self.depth_prior_eps),
             'new_module_lr_mult': float(self.new_module_lr_mult),
+            'activation_checkpointing': bool(self.activation_checkpointing),
             'optimizer_groups': getattr(self.optimizer, '_fp_ttc_lr_group_summary', []),
         }
         self._write_json(manifest_path, manifest)
@@ -554,6 +575,11 @@ class TTCTrainer(object):
                     )
 
                 print("Loss in epoch", epoch, ":", epoch_metrics['train_loss_total'])
+                print(
+                    f"Peak CUDA memory in epoch {epoch}: "
+                    f"allocated={epoch_metrics['cuda_max_memory_allocated_mb']:.1f} MB, "
+                    f"reserved={epoch_metrics['cuda_max_memory_reserved_mb']:.1f} MB"
+                )
                 self._log_current_lrs()
 
     
@@ -562,6 +588,7 @@ class TTCTrainer(object):
         if self.parallel:
             self.train_sampler.set_epoch(epoch)
         self.model.train()
+        self._reset_cuda_peak_stats()
         
         if self.use_teacher_distill and self.stage_a_end > 0 and epoch < self.stage_a_end:
             distill_scale = 1.0 - (epoch / self.stage_a_end)
@@ -621,7 +648,7 @@ class TTCTrainer(object):
             gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
             sensor_metas = self._move_sensor_metas_to_device(sensor_metas)
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
             if hasattr(self.model, "module"):
                 scale, risk_score, loss_s, loss_r, loss_dict = self.model.module.forward_with_loss(
@@ -764,6 +791,7 @@ class TTCTrainer(object):
             global_step = epoch * len(self.train_loader) + i
             if is_main_process() and (i == 0 or global_step % self.batch_metrics_interval == 0):
                 current_lrs = self._current_lrs()
+                peak_stats = self._cuda_peak_stats_mb()
                 self._append_jsonl(
                     os.path.join(self.out_dir, 'batch_metrics.jsonl'),
                     {
@@ -793,6 +821,8 @@ class TTCTrainer(object):
                         'distill_scale': float(distill_scale),
                         'lambda_feat_distill': float(cur_lambda_feat),
                         'lambda_corr_distill': float(cur_lambda_corr),
+                        'cuda_max_memory_allocated_mb': peak_stats['cuda_max_memory_allocated_mb'],
+                        'cuda_max_memory_reserved_mb': peak_stats['cuda_max_memory_reserved_mb'],
                     },
                 )
             if self.neptune_run is not None and is_main_process():
@@ -806,6 +836,7 @@ class TTCTrainer(object):
         
         avg_metrics = {key: value / max(1, steps) for key, value in epoch_totals.items()}
         current_lrs = self._current_lrs()
+        peak_stats = self._cuda_peak_stats_mb()
         epoch_metrics = {
             'train_branch': self.train_branch,
             'epoch': int(epoch),
@@ -832,6 +863,8 @@ class TTCTrainer(object):
             'distill_scale': float(distill_scale),
             'lambda_feat_distill': float(cur_lambda_feat),
             'lambda_corr_distill': float(cur_lambda_corr),
+            'cuda_max_memory_allocated_mb': peak_stats['cuda_max_memory_allocated_mb'],
+            'cuda_max_memory_reserved_mb': peak_stats['cuda_max_memory_reserved_mb'],
             'num_steps': int(steps),
         }
 
@@ -864,6 +897,8 @@ class TTCTrainer(object):
                     'distill_scale',
                     'lambda_feat_distill',
                     'lambda_corr_distill',
+                    'cuda_max_memory_allocated_mb',
+                    'cuda_max_memory_reserved_mb',
                     'num_steps',
                 ],
                 epoch_metrics,

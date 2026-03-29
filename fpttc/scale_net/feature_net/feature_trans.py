@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from ...modules.attention import (single_head_full_attention, single_head_split_window_attention,
                         single_head_full_attention_1d, single_head_split_window_attention_1d)
@@ -206,11 +207,13 @@ class FeatureTransformer(nn.Module):
                  d_model=128,
                  nhead=1,
                  ffn_dim_expansion=4,
+                 activation_checkpointing=False,
                  ):
         super(FeatureTransformer, self).__init__()
 
         self.d_model = d_model
         self.nhead = nhead
+        self.activation_checkpointing = activation_checkpointing
 
         self.layers = nn.ModuleList([
             TransformerBlock(d_model=d_model,
@@ -272,15 +275,23 @@ class FeatureTransformer(nn.Module):
         concat1 = torch.cat((feature1, feature0), dim=0)  # [2B, H*W, C]
 
         for i, layer in enumerate(self.layers):
-            concat0 = layer(concat0, concat1,
-                            height=h,
-                            width=w,
-                            attn_type=attn_type,
-                            with_shift='swin' in attn_type and attn_num_splits > 1 and i % 2 == 1,
-                            attn_num_splits=attn_num_splits,
-                            shifted_window_attn_mask=shifted_window_attn_mask,
-                            shifted_window_attn_mask_1d=shifted_window_attn_mask_1d,
-                            )
+            with_shift = 'swin' in attn_type and attn_num_splits > 1 and i % 2 == 1
+
+            def _layer_forward(src, tgt):
+                return layer(src, tgt,
+                             height=h,
+                             width=w,
+                             attn_type=attn_type,
+                             with_shift=with_shift,
+                             attn_num_splits=attn_num_splits,
+                             shifted_window_attn_mask=shifted_window_attn_mask,
+                             shifted_window_attn_mask_1d=shifted_window_attn_mask_1d,
+                             )
+
+            if self.activation_checkpointing and self.training:
+                concat0 = checkpoint(_layer_forward, concat0, concat1, use_reentrant=False)
+            else:
+                concat0 = _layer_forward(concat0, concat1)
 
             # update feature1
             concat1 = torch.cat(concat0.chunk(chunks=2, dim=0)[::-1], dim=0)
@@ -374,4 +385,3 @@ class FeatureTransformerS(nn.Module):
         #print(agg_feat.shape)
         agg_feat = agg_feat.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
         return agg_feat
-

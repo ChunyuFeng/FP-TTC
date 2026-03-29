@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # 与 ScaleEncoder 使用同一版 Deformable Attention（保证接口/行为一致）
 from fpttc.scale_net.utils.multi_scale_deformable_attn_function import (
@@ -208,7 +209,8 @@ class RangeViewTransformer(nn.Module):
                  num_points=8,      # 深度 bins 数
                  fov_up=8.0,
                  fov_down=-15.0,
-                 input_hw=(160, 320)):
+                 input_hw=(160, 320),
+                 activation_checkpointing=False):
         super().__init__()
         self.d_model = d_model
         self.nhead   = nhead
@@ -217,6 +219,7 @@ class RangeViewTransformer(nn.Module):
         self.fov_up = fov_up
         self.fov_down = fov_down
         self.input_h, self.input_w = input_hw
+        self.activation_checkpointing = activation_checkpointing
 
         # 与 ScaleEncoder 对齐的“query 编码器”（这里输入通常是 0，占位）
         self.scale_conv = nn.Sequential(
@@ -279,8 +282,8 @@ class RangeViewTransformer(nn.Module):
         """
         生成几何版 sampling_locations 与 valid mask。
         返回:
-          samp_loc: [B, Q, H, L, K, 2] in [0,1]
-          attn_msk: [B, Q, H, L, K]（这里只返回可见性/边界 mask；后续会与由 query 预测的权重相乘并归一化）
+          samp_loc: [B, Q, L, K, 2] in [0,1]
+          attn_msk: [B, Q, L, K]（headless geometry；主路径需要多头时再 expand）
         """
         device = cam_K[0].device
         H = Hr; W = Wr; Kbins = depth_bins.numel(); L = len(cam_K); HWr = H*W
@@ -316,10 +319,6 @@ class RangeViewTransformer(nn.Module):
         # [B,Q,L,K,2] / [B,Q,L,K]
         samp = torch.stack(loc_lvls, dim=2)
         msk  = torch.stack(msk_lvls,  dim=2)
-
-        # 扩到多头： [B,Q,H,L,K,2] / [B,Q,H,L,K]
-        samp = samp.unsqueeze(2).repeat(1, 1, self.nhead, 1, 1, 1)
-        msk  =  msk.unsqueeze(2).repeat(1, 1, self.nhead, 1, 1)
         return samp, msk
 
     def geom_bootstrap(self, feats_by_cam, cam_K, cam_R, cam_t, affine_M, Hr, Wr, depth_bins,
@@ -327,7 +326,9 @@ class RangeViewTransformer(nn.Module):
                        depth_selection_mode='soft',
                        bootstrap_topk=4,
                        bootstrap_prior_scale=2.0,
-                       depth_prior_eps=1e-6):
+                       depth_prior_eps=1e-6,
+                       precomputed_geom=None,
+                       precomputed_depth_prior=None):
         """
         Sample-dependent, geometry-consistent student ini_query.
         Uses _make_geom_sampling locations + vis_mask to soft-gather from camera features.
@@ -340,39 +341,22 @@ class RangeViewTransformer(nn.Module):
         K = depth_bins.numel()
         Q = Hr * Wr
 
-        # 1) Pack features for grid_sample: list(L) of [B, C_in, Hf, Wf]
-        _, spatial_shapes, _, in_sizes = self._pack_levels(feats_by_cam)
+        # 1) Geometry can be precomputed by the caller and shared with the main attention path.
+        if precomputed_geom is not None:
+            samp_loc_h0, vis_mask_h0 = precomputed_geom
+        else:
+            _, _, _, in_sizes = self._pack_levels(feats_by_cam)
+            with torch.no_grad():
+                samp_loc_h0, vis_mask_h0 = self._make_geom_sampling(
+                    B, Hr, Wr, depth_bins, cam_K, cam_R, cam_t, affine_M, in_sizes
+                )  # [B,Q,L,K,2], [B,Q,L,K]
 
-        # 2) Get geometric sampling locations & visibility mask (no grad needed for locations)
-        with torch.no_grad():
-            samp_loc, vis_mask = self._make_geom_sampling(
-                B, Hr, Wr, depth_bins, cam_K, cam_R, cam_t, affine_M, in_sizes
-            )  # samp_loc: [B,Q,H,L,K,2], vis_mask: [B,Q,H,L,K]
-            # Collapse head dim (take head 0, they're identical since geom is head-independent)
-            samp_loc_h0 = samp_loc[:, :, 0, :, :, :]   # [B, Q, L, K, 2] in [0,1]
-            vis_mask_h0 = vis_mask[:, :, 0, :, :]       # [B, Q, L, K]
-
-        # 3) For each camera level, grid_sample features at sampling locations
-        #    samp_loc_h0[..., l, :, :]: [B, Q, K, 2] in [0,1] → convert to [-1,1] for grid_sample
-        gathered = []  # will be [L] of [B, Q, K, C_in]
-        for l in range(L):
-            feat_l = feats_by_cam[l]  # [B, C_in, Hf, Wf]
-            # Sample points for this camera: [B, Q, K, 2]
-            grid_01 = samp_loc_h0[:, :, l, :, :]  # [B, Q, K, 2]
-            # Convert [0,1] → [-1,1] for grid_sample
-            grid = grid_01 * 2.0 - 1.0  # [B, Q, K, 2]
-            # grid_sample expects [B, C, Hout, Wout] input, [B, Hout, Wout, 2] grid
-            # Reshape grid: [B, Q, K, 2] → [B, Q*K, 1, 2] (treat as 2D: H=Q*K, W=1)
-            grid_2d = grid.view(B, Q * K, 1, 2)
-            sampled = F.grid_sample(feat_l, grid_2d, mode='bilinear',
-                                    padding_mode='zeros', align_corners=False)  # [B, C_in, Q*K, 1]
-            sampled = sampled.squeeze(-1).view(B, C_in, Q, K).permute(0, 2, 3, 1)  # [B, Q, K, C_in]
-            gathered.append(sampled)
-
-        # 4) Stack cameras and apply visibility / depth-guided aggregation
-        gathered = torch.stack(gathered, dim=2)  # [B, Q, L, K, C_in]
-        depth_prior = self._sample_depth_prior(depth_prob_by_cam, samp_loc_h0)
-        valid_flat = vis_mask_h0.view(B, Q, L * K).bool()
+        # 2) Compute depth-aware weights once, then stream features camera-by-camera.
+        if precomputed_depth_prior is not None:
+            depth_prior = precomputed_depth_prior
+        else:
+            depth_prior = self._sample_depth_prior(depth_prob_by_cam, samp_loc_h0)
+        valid_flat = vis_mask_h0.reshape(B, Q, L * K).bool()
         if depth_prior is not None and depth_selection_mode == 'hard_topk':
             prior_logits = bootstrap_prior_scale * torch.log(depth_prior.clamp_min(depth_prior_eps)).view(B, Q, L * K)
             weights, active_candidates, selection_sparsity = self._masked_candidate_softmax(
@@ -395,8 +379,22 @@ class RangeViewTransformer(nn.Module):
         if depth_selection_mode != 'hard_topk' or depth_prior is None:
             w_sum = weights.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
             weights = weights / w_sum                 # [B, Q, L, K]
-        # Weighted sum: [B, Q, L, K, C_in] * [B, Q, L, K, 1] → sum → [B, Q, C_in]
-        bootstrap = (gathered * weights.unsqueeze(-1)).sum(dim=(2, 3))  # [B, Q, C_in]
+
+        bootstrap = torch.zeros(B, Q, C_in, device=device, dtype=feats_by_cam[0].dtype)
+        for l in range(L):
+            feat_l = feats_by_cam[l]  # [B, C_in, Hf, Wf]
+            grid_01 = samp_loc_h0[:, :, l, :, :]             # [B, Q, K, 2]
+            grid = grid_01 * 2.0 - 1.0                       # [B, Q, K, 2]
+            grid_2d = grid.reshape(B, Q * K, 1, 2)
+            sampled = F.grid_sample(
+                feat_l,
+                grid_2d,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=False,
+            )  # [B, C_in, Q*K, 1]
+            sampled = sampled.squeeze(-1).reshape(B, C_in, Q, K).permute(0, 2, 3, 1)  # [B, Q, K, C_in]
+            bootstrap = bootstrap + (sampled * weights[:, :, l, :].unsqueeze(-1)).sum(dim=2)
 
         # 5) Reshape to spatial and apply value_fs_conv to match d_model
         bootstrap = bootstrap.transpose(1, 2).contiguous()  # [B, C_in, Q]
@@ -494,9 +492,31 @@ class RangeViewTransformer(nn.Module):
             K = depth_bins.numel()
             assert K == self.num_points, f"num_points({self.num_points}) != len(depth_bins)({K})"
 
-        # 1) 构造 query 特征 —— 主路径 + geom_bootstrap 残差路径
+        # 1) 先整理每个 camera level 的 value 元数据。
+        value_lvls, spatial_shapes, lvl_start, in_sizes = self._pack_levels(feats_by_cam)  # list(L)[B,HW,C_in]
+        # 2) value 组织（与 ScaleEncoder 一致：flatten + level_embed + 1×1 conv 到 d_model）
+        value_with_le = []
+        for l, v in enumerate(value_lvls):
+            v = v + self.level_embeds[None, l:l+1, :].to(v.dtype)  # [B,HW,C_in]
+            value_with_le.append(v)
+        value_cat = torch.cat(value_with_le, dim=1)    # [B, sum(HW_l), C_in]
+        # Conv1d 按通道把 C_in -> d_model（与 ScaleEncoder 相同做法）
+        value = self.value_fs_conv(value_cat.transpose(1, 2)).transpose(1, 2)  # [B,S,d_model]
+        # 展开到 per-head 通道（保持 ScaleEncoder 的接口）
+        # mmcv 的 ms_deform_attn CUDA kernel 要求 value contiguous，这里保留 repeat。
+        value = value.unsqueeze(2).repeat(1, 1, self.nhead, 1)                  # [B,S,H,C]
+
+        # 3) 仅在真正需要时创建 geometry / depth prior，尽量缩短其生命周期。
+        samp_loc_h0 = None
+        vis_mask_h0 = None
+        depth_prior = None
         geom_ini = None
         if use_geom_bootstrap:
+            with torch.no_grad():
+                samp_loc_h0, vis_mask_h0 = self._make_geom_sampling(
+                    B, Hr, Wr, depth_bins, cam_K, cam_R, cam_t, affine_M, in_sizes
+                )  # [B,Q,L,K,2], [B,Q,L,K]
+            depth_prior = self._sample_depth_prior(depth_prob_by_cam, samp_loc_h0)
             geom_ini, geom_stats = self.geom_bootstrap(
                 feats_by_cam, cam_K, cam_R, cam_t, affine_M,
                 Hr, Wr, depth_bins,
@@ -506,6 +526,8 @@ class RangeViewTransformer(nn.Module):
                 bootstrap_topk=bootstrap_topk,
                 bootstrap_prior_scale=bootstrap_prior_scale,
                 depth_prior_eps=depth_prior_eps,
+                precomputed_geom=(samp_loc_h0, vis_mask_h0),
+                precomputed_depth_prior=depth_prior,
             )  # [B, d_model, Hr, Wr]
         else:
             geom_stats = {
@@ -527,28 +549,22 @@ class RangeViewTransformer(nn.Module):
         query = query + self.pos_enc(query)           # 位置编码
         query = query.flatten(2).transpose(1, 2).contiguous()  # [B,Q,C]
 
-        # 2) value 组织（与 ScaleEncoder 一致：flatten + level_embed + 1×1 conv 到 d_model）
-        value_lvls, spatial_shapes, lvl_start, in_sizes = self._pack_levels(feats_by_cam)  # list(L)[B,HW,C_in]
-        value_with_le = []
-        for l, v in enumerate(value_lvls):
-            v = v + self.level_embeds[None, l:l+1, :].to(v.dtype)  # [B,HW,C_in]
-            value_with_le.append(v)
-        value_cat = torch.cat(value_with_le, dim=1)    # [B, sum(HW_l), C_in]
-        # Conv1d 按通道把 C_in -> d_model（与 ScaleEncoder 相同做法）
-        value = self.value_fs_conv(value_cat.transpose(1, 2)).transpose(1, 2)  # [B,S,d_model]
-        # 展开到 per-head 通道（保持 ScaleEncoder 的接口）
-        value = value.unsqueeze(2).repeat(1, 1, self.nhead, 1)                  # [B,S,H,C]
+        if samp_loc_h0 is None or vis_mask_h0 is None:
+            with torch.no_grad():
+                samp_loc_h0, vis_mask_h0 = self._make_geom_sampling(
+                    B, Hr, Wr, depth_bins, cam_K, cam_R, cam_t, affine_M, in_sizes
+                )  # [B,Q,L,K,2], [B,Q,L,K]
+        if depth_prior is None:
+            depth_prior = self._sample_depth_prior(depth_prob_by_cam, samp_loc_h0)
 
-        # 3) 参考点：与 ScaleEncoder 一致需要 query_location（但我们走几何分支，用 ext_* 覆盖即可）
+        # 4) 参考点：与 ScaleEncoder 一致需要 query_location（但我们走几何分支，用 ext_* 覆盖即可）
         #    仍构造占位的 query_location（全零）以匹配接口
         query_location = torch.zeros(B, Hr*Wr, self.num_level, 2, device=device, dtype=value.dtype)
 
-        # 4) 生成"几何采样点 + 可见性 mask"，并据此构造 ext_attention_weights
-        ext_loc, vis_mask = self._make_geom_sampling(
-            B, Hr, Wr, depth_bins, cam_K, cam_R, cam_t, affine_M, in_sizes
-        )  # [B,Q,H,L,K,2], [B,Q,H,L,K] bool
-        valid_flat = vis_mask.view(B, Hr * Wr, self.nhead, self.num_level * self.num_points).bool()
-        depth_prior = self._sample_depth_prior(depth_prob_by_cam, ext_loc[:, :, 0, :, :, :])
+        # 5) 复用同一份 headless geometry，并在主路径里按需扩展到 head 维。
+        ext_loc = samp_loc_h0.unsqueeze(2).expand(-1, -1, self.nhead, -1, -1, -1)  # [B,Q,H,L,K,2]
+        vis_mask = vis_mask_h0.unsqueeze(2).expand(-1, -1, self.nhead, -1, -1)      # [B,Q,H,L,K]
+        valid_flat = vis_mask.reshape(B, Hr * Wr, self.nhead, self.num_level * self.num_points).bool()
         if depth_prior is not None and depth_selection_mode == 'hard_topk':
             prior_logits = attn_prior_scale * torch.log(depth_prior.clamp_min(depth_prior_eps))  # [B,Q,L,K]
             prior_logits = prior_logits.unsqueeze(2).expand(-1, -1, self.nhead, -1, -1).reshape(
@@ -556,7 +572,7 @@ class RangeViewTransformer(nn.Module):
             )
             prior_weight = None
         elif depth_prior is not None and depth_selection_mode == 'soft':
-            prior_weight = vis_mask.float() * (
+            prior_weight = vis_mask_h0.float().unsqueeze(2) * (
                 (1.0 - depth_prior_alpha) + depth_prior_alpha * depth_prior.unsqueeze(2)
             )
         else:
@@ -584,53 +600,59 @@ class RangeViewTransformer(nn.Module):
         attn_active_candidates = []
         attn_selection_sparsity = []
         for layer in self.layers:
-            # === (A) 每层重算注意力，并与可见性 mask 融合 + 在 L×K 上归一化 ===
-            attn_raw = layer.attention_weights(out)                           # [B, Q, H*L*K]
-            attn_raw = attn_raw.view(B, Hr*Wr, self.nhead, self.num_level*self.num_points)
-            if depth_selection_mode == 'hard_topk':
-                fused_logits = attn_raw if prior_logits is None else (attn_raw + prior_logits)
-                ext_attn, active_cands, sparsity = self._masked_candidate_softmax(
-                    fused_logits,
-                    valid_flat,
-                    topk=attn_topk,
+            def _layer_forward(out_tensor):
+                # === (A) 每层重算注意力，并与可见性 mask 融合 + 在 L×K 上归一化 ===
+                attn_raw = layer.attention_weights(out_tensor)                    # [B, Q, H*L*K]
+                attn_raw = attn_raw.view(B, Hr * Wr, self.nhead, self.num_level * self.num_points)
+                if depth_selection_mode == 'hard_topk':
+                    fused_logits = attn_raw if prior_logits is None else (attn_raw + prior_logits)
+                    ext_attn_local, active_cands_local, sparsity_local = self._masked_candidate_softmax(
+                        fused_logits,
+                        valid_flat,
+                        topk=attn_topk,
+                    )
+                    ext_attn_local = ext_attn_local.view(B, Hr * Wr, self.nhead, self.num_level, self.num_points)
+                else:
+                    attn_raw = F.softmax(attn_raw, dim=-1)                         # over (L*K)
+                    attn_raw = attn_raw.view(B, Hr * Wr, self.nhead, self.num_level, self.num_points)
+                    ext_attn_local = attn_raw * prior_weight                       # [B,Q,H,L,K]
+                    ext_attn_local = ext_attn_local / ext_attn_local.sum(
+                        dim=(-2, -1), keepdim=True
+                    ).clamp_min(1e-6)
+                    active_cands_local = vis_mask.float().sum(dim=(-2, -1)).mean()
+                    sparsity_local = vis_mask.float().mean()
+
+                # === (B) 几何采样位置 + 学习偏移 ===
+                delta = layer.sampling_offsets(out_tensor)                         # [B, Q, H*L*K*2]
+                delta = delta.view(B, Hr * Wr, self.nhead, self.num_level, self.num_points, 2)
+
+                offset_normalizer = torch.stack(
+                    [spatial_shapes[..., 1], spatial_shapes[..., 0]], dim=-1
+                ).to(delta.dtype).to(delta.device)
+                offset_normalizer = offset_normalizer.view(1, 1, 1, self.num_level, 1, 2)
+
+                delta01 = delta / offset_normalizer
+                sampling_locations = (ext_loc + delta01).clamp(0.0, 1.0)
+
+                # === (C) 本层 Deformable Attention ===
+                out_next = layer(
+                    out_tensor, value,
+                    height=Hr, width=Wr,
+                    query_location=query_location,
+                    spatial_shapes=spatial_shapes,
+                    level_start_index=lvl_start,
+                    ext_sampling_locations=sampling_locations,
+                    ext_attention_weights=ext_attn_local
                 )
-                ext_attn = ext_attn.view(B, Hr*Wr, self.nhead, self.num_level, self.num_points)
+                return out_next, active_cands_local.detach(), sparsity_local.detach()
+
+            if self.activation_checkpointing and self.training:
+                out, active_cands, sparsity = checkpoint(_layer_forward, out, use_reentrant=False)
             else:
-                attn_raw = F.softmax(attn_raw, dim=-1)                            # over (L*K)
-                attn_raw = attn_raw.view(B, Hr*Wr, self.nhead, self.num_level, self.num_points)
-                ext_attn = attn_raw * prior_weight                               # [B,Q,H,L,K]
-                # 在 L×K 维度上重归一化，确保每个 head 的权重和为 1
-                ext_attn = ext_attn / ext_attn.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-                active_cands = vis_mask.float().sum(dim=(-2, -1)).mean()
-                sparsity = vis_mask.float().mean()
+                out, active_cands, sparsity = _layer_forward(out)
+
             attn_active_candidates.append(active_cands)
             attn_selection_sparsity.append(sparsity)
-
-            # === (B) 几何采样位置 + 学习偏移 ===
-            # 生成未归一化的像素偏移 Δ，形状与 ext_loc 对齐
-            delta = layer.sampling_offsets(out)                                # [B, Q, H*L*K*2]
-            delta = delta.view(B, Hr*Wr, self.nhead, self.num_level, self.num_points, 2)
-
-            # 以 (W_l, H_l) 为归一化因子，把像素偏移变成 [0,1] 空间的增量
-            # spatial_shapes: [L, 2] = (H_l, W_l)，构造 [L,2] = (W_l, H_l)
-            offset_normalizer = torch.stack(
-                [spatial_shapes[..., 1], spatial_shapes[..., 0]], dim=-1      # [L,2] = (W, H)
-            ).to(delta.dtype).to(delta.device)
-            offset_normalizer = offset_normalizer.view(1, 1, 1, self.num_level, 1, 2)  # [1,1,1,L,1,2]
-
-            delta01 = delta / offset_normalizer                                # 像素 → 归一化
-            sampling_locations = (ext_loc + delta01).clamp(0.0, 1.0)           # 叠加并裁剪
-
-            # === (C) 本层 Deformable Attention（位置=几何+学习偏移，权重=融合 vis_mask 后的注意力）
-            out = layer(
-                out, value,
-                height=Hr, width=Wr,
-                query_location=query_location,          # 占位，无实际用处
-                spatial_shapes=spatial_shapes,
-                level_start_index=lvl_start,
-                ext_sampling_locations=sampling_locations,
-                ext_attention_weights=ext_attn
-            )
 
         # 7) reshape 回 Range-View 张量
         out = out.view(B, Hr, Wr, self.d_model).permute(0, 3, 1, 2).contiguous()  # [B,C,Hr,Wr]

@@ -193,6 +193,8 @@ parser.add_argument('--attn_prior_scale', type=float, default=2.0,
                     help='scale applied to log depth prior when fused into attention logits')
 parser.add_argument('--depth_prior_eps', type=float, default=1e-6,
                     help='epsilon for stable log(depth_prior)')
+parser.add_argument('--activation_checkpointing', action='store_true',
+                    help='enable activation checkpointing on the heaviest transformer stacks')
 
 # 加载预训练的单分支模型：
 parser.add_argument(
@@ -401,6 +403,7 @@ def main():
         num_transformer_layers = args.num_transformer_layers,
         reg_refine             = args.reg_refine,
         no_depth               = args.no_depth,
+        activation_checkpointing = args.activation_checkpointing,
     ).cuda()
 
     start_epoch = 0
@@ -409,6 +412,7 @@ def main():
     model_init_info = {
         'no_depth': args.no_depth,
         'use_teacher_distill': args.use_teacher_distill,
+        'activation_checkpointing': args.activation_checkpointing,
         'resume': None,
         'scale_pretrained_ckpt': None,
         'optimizer_groups': {},
@@ -474,7 +478,7 @@ def main():
     
     if parallel:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
-                        output_device=local_rank, find_unused_parameters=True)
+                        output_device=local_rank, find_unused_parameters=False)
 
         if is_main_process():
             if not os.path.isdir(out_dir):
