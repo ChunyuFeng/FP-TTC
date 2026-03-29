@@ -137,6 +137,7 @@ class nuScenes_range_image(data.Dataset):
                  proj_cache_root=None,
                  no_depth=False,
                  need_teacher_proj=False,
+                 use_internal_depth_guidance=False,
                  ):
         self.aug_params = aug_params
         self.split = split
@@ -146,6 +147,7 @@ class nuScenes_range_image(data.Dataset):
         self.no_depth = no_depth
         self.max_samples = max_samples
         self.need_teacher_proj = need_teacher_proj
+        self.use_internal_depth_guidance = use_internal_depth_guidance
         self.dataset_root = infer_nusc_dataset_root(self.train_info_path)
         self.proj_cache_root = Path(proj_cache_root) if proj_cache_root is not None else _default_nusc_proj_cache_root(self.dataset_root)
         self.split_name = _infer_nusc_split_name(self.train_info_path, self.train_info_file)
@@ -163,7 +165,7 @@ class nuScenes_range_image(data.Dataset):
         complete_depth_samples = original_samples
         filtered_samples = []
         for original_index, info in enumerate(loaded_data):
-            if self.require_complete_depth and not self.no_depth and not self._has_complete_depth(info):
+            if self.require_complete_depth and self._needs_real_depth() and not self._has_complete_depth(info):
                 continue
             filtered_samples.append((original_index, info))
 
@@ -230,6 +232,9 @@ class nuScenes_range_image(data.Dataset):
                 "falling back to on-the-fly proj mapping."
             )
 
+    def _needs_real_depth(self):
+        return (not self.no_depth) or self.use_internal_depth_guidance
+
     def _has_complete_depth(self, info):
         for frame_key in ['prev_camera_data', 'curr_camera_data']:
             for channel in self.camera_channels:
@@ -267,7 +272,7 @@ class nuScenes_range_image(data.Dataset):
             )
             curr_surr_view_imgs[channel] = Image.open(curr_surr_view_imgs_path)
 
-            if not self.no_depth:
+            if self._needs_real_depth():
                 prev_surr_view_depths_path = resolve_nusc_depth_pred_path(
                     info['prev_camera_data'][channel],
                     self.dataset_root,
@@ -320,14 +325,14 @@ class nuScenes_range_image(data.Dataset):
         for channel in camera_channels:
             prev_surr_view_imgs[channel] = torch.from_numpy(prev_surr_view_imgs[channel]).permute(2, 0, 1).float()
             curr_surr_view_imgs[channel] = torch.from_numpy(curr_surr_view_imgs[channel]).permute(2, 0, 1).float()
-            if not self.no_depth:
+            if self._needs_real_depth():
                 prev_surr_view_depths[channel] = torch.from_numpy(prev_surr_view_depths[channel]).float()
                 curr_surr_view_depths[channel] = torch.from_numpy(curr_surr_view_depths[channel]).float()
         
         prev_surr_view_imgs_tensor = torch.stack([prev_surr_view_imgs[channel] for channel in camera_channels], dim=0)
         curr_surr_view_imgs_tensor = torch.stack([curr_surr_view_imgs[channel] for channel in camera_channels], dim=0)
 
-        if self.no_depth:
+        if not self._needs_real_depth():
             img_h, img_w = prev_surr_view_imgs_tensor.shape[-2], prev_surr_view_imgs_tensor.shape[-1]
             prev_surr_view_depths_tensor = torch.zeros(len(camera_channels), 1, img_h, img_w)
             curr_surr_view_depths_tensor = torch.zeros(len(camera_channels), 1, img_h, img_w)
@@ -756,7 +761,8 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
                                         max_samples=args.max_train_samples,
                                         split='training',
                                         no_depth=getattr(args, 'no_depth', False),
-                                        need_teacher_proj=getattr(args, 'use_teacher_distill', False))
+                                        need_teacher_proj=getattr(args, 'use_teacher_distill', False),
+                                        use_internal_depth_guidance=getattr(args, 'use_internal_depth_guidance', False))
 
         train_dataset = 1*nuscenes
     

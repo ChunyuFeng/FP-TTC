@@ -354,6 +354,67 @@ def get_loss_scale_gradient_map(scale, gt_scale_with_mask):
 
     return sum(losses) / len(losses)
 
+
+def get_loss_depth_distribution(depth_logits, depth_gt, depth_bins, eps=1e-6):
+    """
+    depth_logits: [B, V, K, H, W]
+    depth_gt:     [B, V, 1, H0, W0]
+    depth_bins:   [K]
+    """
+    B, V, K, H, W = depth_logits.shape
+    device = depth_logits.device
+
+    gt = depth_gt.view(B * V, 1, depth_gt.shape[-2], depth_gt.shape[-1])
+    gt = F.interpolate(gt, size=(H, W), mode='bilinear', align_corners=True)
+    gt = gt.view(B, V, H, W)
+
+    valid = gt > 0
+    if valid.sum() == 0:
+        zero = depth_logits.sum() * 0.0
+        probs = F.softmax(depth_logits, dim=2)
+        expected = (probs * depth_bins.view(1, 1, K, 1, 1).to(device=device, dtype=depth_logits.dtype)).sum(dim=2)
+        return zero, {
+            'entropy': zero,
+            'valid_ratio': zero,
+            'top1_prob': zero,
+            'top1_margin': zero,
+            'expected': expected.detach(),
+        }
+
+    log_bins = torch.log(depth_bins.clamp_min(eps)).to(device=device, dtype=depth_logits.dtype)
+    log_gt = torch.log(gt.clamp_min(eps))
+    target = torch.argmin(
+        (log_gt.unsqueeze(-1) - log_bins.view(1, 1, 1, 1, K)).abs(),
+        dim=-1,
+    )  # [B, V, H, W]
+
+    ce = F.cross_entropy(
+        depth_logits.view(B * V, K, H, W),
+        target.view(B * V, H, W),
+        reduction='none',
+    ).view(B, V, H, W)
+    loss = ce[valid].mean()
+
+    probs = F.softmax(depth_logits, dim=2)
+    top2_probs = torch.topk(probs, k=min(2, K), dim=2).values
+    entropy = -(probs.clamp_min(eps) * probs.clamp_min(eps).log()).sum(dim=2)
+    depth_entropy = entropy[valid].mean()
+    valid_ratio = valid.float().mean()
+    depth_top1_prob = top2_probs[:, :, 0][valid].mean()
+    if K > 1:
+        depth_top1_margin = (top2_probs[:, :, 0] - top2_probs[:, :, 1])[valid].mean()
+    else:
+        depth_top1_margin = depth_top1_prob
+    expected = (probs * depth_bins.view(1, 1, K, 1, 1).to(device=device, dtype=depth_logits.dtype)).sum(dim=2)
+
+    return loss, {
+        'entropy': depth_entropy,
+        'valid_ratio': valid_ratio,
+        'top1_prob': depth_top1_prob,
+        'top1_margin': depth_top1_margin,
+        'expected': expected.detach(),
+    }
+
 def get_loss_risk_score_map(risk_score, gt_risk_score_with_mask):
     # 移除单个维度，使所有张量形状为 (B, H, W)
     risk_score = risk_score.squeeze(1)  # [B, 1, H, W] -> [B, H, W]

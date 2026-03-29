@@ -322,7 +322,12 @@ class RangeViewTransformer(nn.Module):
         msk  =  msk.unsqueeze(2).repeat(1, 1, self.nhead, 1, 1)
         return samp, msk
 
-    def geom_bootstrap(self, feats_by_cam, cam_K, cam_R, cam_t, affine_M, Hr, Wr, depth_bins):
+    def geom_bootstrap(self, feats_by_cam, cam_K, cam_R, cam_t, affine_M, Hr, Wr, depth_bins,
+                       depth_prob_by_cam=None, depth_prior_alpha=0.7,
+                       depth_selection_mode='soft',
+                       bootstrap_topk=4,
+                       bootstrap_prior_scale=2.0,
+                       depth_prior_eps=1e-6):
         """
         Sample-dependent, geometry-consistent student ini_query.
         Uses _make_geom_sampling locations + vis_mask to soft-gather from camera features.
@@ -364,12 +369,32 @@ class RangeViewTransformer(nn.Module):
             sampled = sampled.squeeze(-1).view(B, C_in, Q, K).permute(0, 2, 3, 1)  # [B, Q, K, C_in]
             gathered.append(sampled)
 
-        # 4) Stack cameras and apply visibility-weighted aggregation
+        # 4) Stack cameras and apply visibility / depth-guided aggregation
         gathered = torch.stack(gathered, dim=2)  # [B, Q, L, K, C_in]
-        weights = vis_mask_h0.float()             # [B, Q, L, K]
+        depth_prior = self._sample_depth_prior(depth_prob_by_cam, samp_loc_h0)
+        valid_flat = vis_mask_h0.view(B, Q, L * K).bool()
+        if depth_prior is not None and depth_selection_mode == 'hard_topk':
+            prior_logits = bootstrap_prior_scale * torch.log(depth_prior.clamp_min(depth_prior_eps)).view(B, Q, L * K)
+            weights, active_candidates, selection_sparsity = self._masked_candidate_softmax(
+                prior_logits,
+                valid_flat,
+                topk=bootstrap_topk,
+            )
+            weights = weights.view(B, Q, L, K)
+        elif depth_prior is not None and depth_selection_mode == 'soft':
+            weights = vis_mask_h0.float() * (
+                (1.0 - depth_prior_alpha) + depth_prior_alpha * depth_prior
+            )
+            active_candidates = vis_mask_h0.float().sum(dim=(-2, -1)).mean()
+            selection_sparsity = vis_mask_h0.float().mean()
+        else:
+            weights = vis_mask_h0.float()         # [B, Q, L, K]
+            active_candidates = vis_mask_h0.float().sum(dim=(-2, -1)).mean()
+            selection_sparsity = vis_mask_h0.float().mean()
         # Normalize over (L, K) so each query pixel sums to 1
-        w_sum = weights.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-        weights = weights / w_sum                 # [B, Q, L, K]
+        if depth_selection_mode != 'hard_topk' or depth_prior is None:
+            w_sum = weights.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+            weights = weights / w_sum                 # [B, Q, L, K]
         # Weighted sum: [B, Q, L, K, C_in] * [B, Q, L, K, 1] → sum → [B, Q, C_in]
         bootstrap = (gathered * weights.unsqueeze(-1)).sum(dim=(2, 3))  # [B, Q, C_in]
 
@@ -377,7 +402,61 @@ class RangeViewTransformer(nn.Module):
         bootstrap = bootstrap.transpose(1, 2).contiguous()  # [B, C_in, Q]
         bootstrap = self.value_fs_conv(bootstrap)            # [B, d_model, Q]
         bootstrap = bootstrap.view(B, self.d_model, Hr, Wr)
-        return bootstrap
+        return bootstrap, {
+            'bootstrap_active_candidates': active_candidates,
+            'bootstrap_selection_sparsity': selection_sparsity,
+        }
+
+    def _sample_depth_prior(self, depth_prob_by_cam, samp_loc_h0):
+        """
+        depth_prob_by_cam: list(L) of [B, K, Hf, Wf]
+        samp_loc_h0:      [B, Q, L, K, 2] in [0,1]
+        return:           [B, Q, L, K]
+        """
+        if depth_prob_by_cam is None:
+            return None
+
+        B, Q, L, K, _ = samp_loc_h0.shape
+        priors = []
+        for l in range(L):
+            prob_l = depth_prob_by_cam[l]  # [B, K, Hf, Wf]
+            grid = samp_loc_h0[:, :, l, :, :] * 2.0 - 1.0              # [B,Q,K,2]
+            grid_2d = grid.view(B, Q * K, 1, 2)
+            sampled = F.grid_sample(
+                prob_l,
+                grid_2d,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=False,
+            )  # [B, K, Q*K, 1]
+            sampled = sampled.squeeze(-1).view(B, K, Q, K).permute(0, 2, 3, 1)  # [B,Q,Kcand,Kchan]
+            diag = torch.diagonal(sampled, dim1=2, dim2=3)                       # [B,Q,K]
+            priors.append(diag)
+
+        return torch.stack(priors, dim=2).clamp_min(0.0)  # [B,Q,L,K]
+
+    def _masked_candidate_softmax(self, logits, valid_mask, topk=None):
+        """
+        logits:     [..., N]
+        valid_mask: [..., N] bool
+        """
+        invalid_fill = torch.finfo(logits.dtype).min
+        masked_logits = logits.masked_fill(~valid_mask, invalid_fill)
+        selected_mask = valid_mask
+
+        if topk is not None and topk > 0 and topk < logits.shape[-1]:
+            topk_idx = torch.topk(masked_logits, k=topk, dim=-1).indices
+            selected_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+            selected_mask.scatter_(-1, topk_idx, True)
+            selected_mask = selected_mask & valid_mask
+            masked_logits = logits.masked_fill(~selected_mask, invalid_fill)
+
+        weights = F.softmax(masked_logits, dim=-1)
+        has_any = valid_mask.any(dim=-1, keepdim=True)
+        weights = torch.where(has_any, weights, torch.zeros_like(weights))
+        active_candidates = selected_mask.float().sum(dim=-1).mean()
+        selection_sparsity = selected_mask.float().mean()
+        return weights, active_candidates, selection_sparsity
 
     def forward(self,
                 feats_by_cam,         # list(L) of [B, C_in, Hf, Wf]
@@ -386,7 +465,15 @@ class RangeViewTransformer(nn.Module):
                 Hr, Wr,
                 depth_bins=None,      # Tensor[K] （若 None，则自动对数均匀采样）
                 ini_query=None,
-                use_geom_bootstrap=False):
+                use_geom_bootstrap=False,
+                depth_prob_by_cam=None,
+                depth_prior_alpha=0.7,
+                depth_selection_mode='soft',
+                bootstrap_topk=4,
+                attn_topk=8,
+                bootstrap_prior_scale=2.0,
+                attn_prior_scale=2.0,
+                depth_prior_eps=1e-6):
         """
         输出：Range-View 聚合特征 [B, d_model, Hr, Wr]
 
@@ -410,10 +497,21 @@ class RangeViewTransformer(nn.Module):
         # 1) 构造 query 特征 —— 主路径 + geom_bootstrap 残差路径
         geom_ini = None
         if use_geom_bootstrap:
-            geom_ini = self.geom_bootstrap(
+            geom_ini, geom_stats = self.geom_bootstrap(
                 feats_by_cam, cam_K, cam_R, cam_t, affine_M,
-                Hr, Wr, depth_bins
+                Hr, Wr, depth_bins,
+                depth_prob_by_cam=depth_prob_by_cam,
+                depth_prior_alpha=depth_prior_alpha,
+                depth_selection_mode=depth_selection_mode,
+                bootstrap_topk=bootstrap_topk,
+                bootstrap_prior_scale=bootstrap_prior_scale,
+                depth_prior_eps=depth_prior_eps,
             )  # [B, d_model, Hr, Wr]
+        else:
+            geom_stats = {
+                'bootstrap_active_candidates': torch.tensor(0.0, device=device),
+                'bootstrap_selection_sparsity': torch.tensor(0.0, device=device),
+            }
 
         if ini_query is None:
             if geom_ini is not None:
@@ -449,6 +547,21 @@ class RangeViewTransformer(nn.Module):
         ext_loc, vis_mask = self._make_geom_sampling(
             B, Hr, Wr, depth_bins, cam_K, cam_R, cam_t, affine_M, in_sizes
         )  # [B,Q,H,L,K,2], [B,Q,H,L,K] bool
+        valid_flat = vis_mask.view(B, Hr * Wr, self.nhead, self.num_level * self.num_points).bool()
+        depth_prior = self._sample_depth_prior(depth_prob_by_cam, ext_loc[:, :, 0, :, :, :])
+        if depth_prior is not None and depth_selection_mode == 'hard_topk':
+            prior_logits = attn_prior_scale * torch.log(depth_prior.clamp_min(depth_prior_eps))  # [B,Q,L,K]
+            prior_logits = prior_logits.unsqueeze(2).expand(-1, -1, self.nhead, -1, -1).reshape(
+                B, Hr * Wr, self.nhead, self.num_level * self.num_points
+            )
+            prior_weight = None
+        elif depth_prior is not None and depth_selection_mode == 'soft':
+            prior_weight = vis_mask.float() * (
+                (1.0 - depth_prior_alpha) + depth_prior_alpha * depth_prior.unsqueeze(2)
+            )
+        else:
+            prior_weight = vis_mask.float()
+            prior_logits = None
 
         # # 用 query 回归的注意力（与 ScaleEncoder 一致），再乘 mask、按 K 归一化
         # # 先建立一个“哑层”来复用 attention_weights 的线性头（不想改 Block 的话也可复制参数）
@@ -468,15 +581,30 @@ class RangeViewTransformer(nn.Module):
 
         # 6) 逐层 DeformableAttn
         out = query
+        attn_active_candidates = []
+        attn_selection_sparsity = []
         for layer in self.layers:
             # === (A) 每层重算注意力，并与可见性 mask 融合 + 在 L×K 上归一化 ===
             attn_raw = layer.attention_weights(out)                           # [B, Q, H*L*K]
             attn_raw = attn_raw.view(B, Hr*Wr, self.nhead, self.num_level*self.num_points)
-            attn_raw = F.softmax(attn_raw, dim=-1)                            # over (L*K)
-            attn_raw = attn_raw.view(B, Hr*Wr, self.nhead, self.num_level, self.num_points)
-            ext_attn = attn_raw * vis_mask.float()                            # [B,Q,H,L,K]
-            # 在 L×K 维度上重归一化，确保每个 head 的权重和为 1
-            ext_attn = ext_attn / ext_attn.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+            if depth_selection_mode == 'hard_topk':
+                fused_logits = attn_raw if prior_logits is None else (attn_raw + prior_logits)
+                ext_attn, active_cands, sparsity = self._masked_candidate_softmax(
+                    fused_logits,
+                    valid_flat,
+                    topk=attn_topk,
+                )
+                ext_attn = ext_attn.view(B, Hr*Wr, self.nhead, self.num_level, self.num_points)
+            else:
+                attn_raw = F.softmax(attn_raw, dim=-1)                            # over (L*K)
+                attn_raw = attn_raw.view(B, Hr*Wr, self.nhead, self.num_level, self.num_points)
+                ext_attn = attn_raw * prior_weight                               # [B,Q,H,L,K]
+                # 在 L×K 维度上重归一化，确保每个 head 的权重和为 1
+                ext_attn = ext_attn / ext_attn.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+                active_cands = vis_mask.float().sum(dim=(-2, -1)).mean()
+                sparsity = vis_mask.float().mean()
+            attn_active_candidates.append(active_cands)
+            attn_selection_sparsity.append(sparsity)
 
             # === (B) 几何采样位置 + 学习偏移 ===
             # 生成未归一化的像素偏移 Δ，形状与 ext_loc 对齐
@@ -506,4 +634,11 @@ class RangeViewTransformer(nn.Module):
 
         # 7) reshape 回 Range-View 张量
         out = out.view(B, Hr, Wr, self.d_model).permute(0, 3, 1, 2).contiguous()  # [B,C,Hr,Wr]
-        return out
+        attn_active_mean = torch.stack(attn_active_candidates).mean() if attn_active_candidates else torch.tensor(0.0, device=device)
+        attn_sparsity_mean = torch.stack(attn_selection_sparsity).mean() if attn_selection_sparsity else torch.tensor(0.0, device=device)
+        return out, {
+            'bootstrap_active_candidates': geom_stats['bootstrap_active_candidates'],
+            'bootstrap_selection_sparsity': geom_stats['bootstrap_selection_sparsity'],
+            'attn_active_candidates': attn_active_mean,
+            'depth_selection_sparsity': attn_sparsity_mean,
+        }

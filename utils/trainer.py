@@ -33,7 +33,10 @@ class TTCTrainer(object):
                 no_depth=False, use_teacher_distill=False,
                 lambda_feat_distill=1.0, lambda_corr_distill=0.5,
                 distill_end_pct=0.7, student_tail_epochs=0,
-                loss_weight_alpha=0.0, edge_loss_weight=0.0):
+                loss_weight_alpha=0.0, edge_loss_weight=0.0,
+                use_internal_depth_guidance=False, depth_loss_weight=0.5,
+                depth_selection_mode='hard_topk', bootstrap_topk=4, attn_topk=8,
+                bootstrap_prior_scale=2.0, attn_prior_scale=2.0, depth_prior_eps=1e-6):
         self.model = model
         self.parallel = parallel
         self.batch_size = args.batch_size
@@ -47,6 +50,14 @@ class TTCTrainer(object):
         self.student_tail_epochs = max(0, int(student_tail_epochs))
         self.loss_weight_alpha = loss_weight_alpha
         self.edge_loss_weight = edge_loss_weight
+        self.use_internal_depth_guidance = use_internal_depth_guidance
+        self.depth_loss_weight = depth_loss_weight
+        self.depth_selection_mode = depth_selection_mode
+        self.bootstrap_topk = int(bootstrap_topk)
+        self.attn_topk = int(attn_topk)
+        self.bootstrap_prior_scale = float(bootstrap_prior_scale)
+        self.attn_prior_scale = float(attn_prior_scale)
+        self.depth_prior_eps = float(depth_prior_eps)
         self.new_module_lr_mult = getattr(args, 'new_module_lr_mult', 1.0)
         if not self.parallel:
             self.train_loader = DataLoader(dataset, 
@@ -120,6 +131,7 @@ class TTCTrainer(object):
         self.num_probe_samples = 4
         self.probe_seed = 326
         self.fixed_probe_samples = []
+        self.latest_feature_drift = float('nan')
 
     def _write_json(self, path, payload):
         with open(path, 'w') as f:
@@ -231,8 +243,16 @@ class TTCTrainer(object):
             'total_epochs': self.total_epochs,
             'scale_only': bool(self.scale_only),
             'use_teacher_distill': bool(self.use_teacher_distill),
+            'use_internal_depth_guidance': bool(self.use_internal_depth_guidance),
             'student_tail_epochs': self.student_tail_epochs,
             'edge_loss_weight': float(self.edge_loss_weight),
+            'depth_loss_weight': float(self.depth_loss_weight),
+            'depth_selection_mode': self.depth_selection_mode,
+            'bootstrap_topk': int(self.bootstrap_topk),
+            'attn_topk': int(self.attn_topk),
+            'bootstrap_prior_scale': float(self.bootstrap_prior_scale),
+            'attn_prior_scale': float(self.attn_prior_scale),
+            'depth_prior_eps': float(self.depth_prior_eps),
             'new_module_lr_mult': float(self.new_module_lr_mult),
             'optimizer_groups': getattr(self.optimizer, '_fp_ttc_lr_group_summary', []),
         }
@@ -246,6 +266,7 @@ class TTCTrainer(object):
         for filename, default in (
             ('checkpoints.json', []),
             ('visualizations.json', []),
+            ('probe_metrics.json', []),
         ):
             path = os.path.join(self.out_dir, filename)
             if not os.path.exists(path):
@@ -285,9 +306,25 @@ class TTCTrainer(object):
     def _log_visualization_record(self, record):
         self._append_json_array(os.path.join(self.out_dir, 'visualizations.json'), record)
 
+    def _save_depth_panorama(self, depth_expected, path):
+        if depth_expected is None:
+            return None
+        depth_map = depth_expected[0].detach().cpu().numpy()  # [V,H,W]
+        pano = np.concatenate([depth_map[v] for v in range(depth_map.shape[0])], axis=1)
+        log_min = math.log(1.0)
+        log_max = math.log(40.0)
+        pano_norm = np.clip((np.log(np.clip(pano, 1e-6, None)) - log_min) / (log_max - log_min + 1e-6), 0.0, 1.0)
+        plt.imsave(path, pano_norm, cmap='viridis', vmin=0.0, vmax=1.0)
+        return path
+
+    def _probe_feature_ref_path(self):
+        return os.path.join(self.out_dir, 'probe_feature_refs.pt')
+
     def _save_prediction_visuals(self, epoch, step, phase, scale, risk_score,
                                  gt_scale_map_with_mask, gt_risk_score_map_with_mask,
-                                 record_extra=None, prefix=None):
+                                 record_extra=None, prefix=None,
+                                 depth_expected_prev=None, depth_expected_curr=None,
+                                 feature_drift=None):
         base_prefix = prefix if prefix is not None else f"{epoch}_{step}"
         extra = record_extra or {}
 
@@ -323,6 +360,15 @@ class TTCTrainer(object):
             plt.imsave(pred_path, -normalized_pred_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
             plt.imsave(gt_path, -normalized_gt_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
 
+        depth_prev_path = None
+        depth_curr_path = None
+        if depth_expected_prev is not None:
+            depth_prev_path = os.path.join(self.out_dir, f"{base_prefix}_depth_prev.png")
+            self._save_depth_panorama(depth_expected_prev, depth_prev_path)
+        if depth_expected_curr is not None:
+            depth_curr_path = os.path.join(self.out_dir, f"{base_prefix}_depth_curr.png")
+            self._save_depth_panorama(depth_expected_curr, depth_curr_path)
+
         self._log_visualization_record({
             'kind': extra.get('kind', 'train_step'),
             'train_branch': self.train_branch,
@@ -331,6 +377,9 @@ class TTCTrainer(object):
             'phase': phase,
             'pred_path': os.path.relpath(pred_path, self.out_dir),
             'gt_path': os.path.relpath(gt_path, self.out_dir),
+            'depth_prev_path': os.path.relpath(depth_prev_path, self.out_dir) if depth_prev_path else None,
+            'depth_curr_path': os.path.relpath(depth_curr_path, self.out_dir) if depth_curr_path else None,
+            'feature_drift': None if feature_drift is None or not np.isfinite(feature_drift) else float(feature_drift),
             'sample_index': extra.get('sample_index'),
             'original_index': extra.get('original_index'),
             'scene_indice': extra.get('scene_indice'),
@@ -345,6 +394,9 @@ class TTCTrainer(object):
 
         probe_dir = os.path.join(self.out_dir, 'probes', f'epoch_{epoch:03d}')
         os.makedirs(probe_dir, exist_ok=True)
+        ref_path = self._probe_feature_ref_path()
+        feature_refs = torch.load(ref_path, map_location='cpu') if os.path.exists(ref_path) else {}
+        probe_drifts = []
 
         model_ref = self._model_ref()
         was_training = self.model.training
@@ -372,7 +424,7 @@ class TTCTrainer(object):
                 gt_risk = self._batchify_probe_value(gt_risk).to(self.device)
                 sensor_metas = self._move_sensor_metas_to_device(self._batchify_probe_value(sensor_metas))
 
-                scale, risk_score, _, _, _ = model_ref.forward_with_loss(
+                scale, risk_score, _, _, loss_dict = model_ref.forward_with_loss(
                     img_prev=prev_imgs,
                     img_curr=curr_imgs,
                     depth_prev=prev_depths,
@@ -394,10 +446,35 @@ class TTCTrainer(object):
                     lambda_corr_distill=cur_lambda_corr,
                     loss_weight_alpha=self.loss_weight_alpha,
                     edge_loss_weight=self.edge_loss_weight,
+                    use_internal_depth_guidance=self.use_internal_depth_guidance,
+                    depth_loss_weight=self.depth_loss_weight,
+                    depth_selection_mode=self.depth_selection_mode,
+                    bootstrap_topk=self.bootstrap_topk,
+                    attn_topk=self.attn_topk,
+                    bootstrap_prior_scale=self.bootstrap_prior_scale,
+                    attn_prior_scale=self.attn_prior_scale,
+                    depth_prior_eps=self.depth_prior_eps,
+                    return_aux=True,
                 )
 
                 if isinstance(scale, list):
                     scale = scale[-1]
+
+                aux = loss_dict.get('aux', {})
+                feature_monitor_prev = aux.get('feature_monitor_prev')
+                feature_monitor_curr = aux.get('feature_monitor_curr')
+                feature_drift = float('nan')
+                if feature_monitor_prev is not None and feature_monitor_curr is not None:
+                    current_feature = torch.stack(
+                        [feature_monitor_prev[0].cpu(), feature_monitor_curr[0].cpu()],
+                        dim=0,
+                    )
+                    ref_key = str(probe_idx)
+                    if ref_key not in feature_refs:
+                        feature_refs[ref_key] = current_feature
+                    ref_feature = feature_refs[ref_key]
+                    feature_drift = torch.sqrt(torch.mean((current_feature.float() - ref_feature.float()) ** 2)).item()
+                    probe_drifts.append(feature_drift)
 
                 self._save_prediction_visuals(
                     epoch=epoch,
@@ -409,10 +486,22 @@ class TTCTrainer(object):
                     gt_risk_score_map_with_mask=gt_risk,
                     record_extra={**probe_meta, 'kind': 'probe'},
                     prefix=os.path.join('probes', f'epoch_{epoch:03d}', f'probe_{probe_idx:02d}'),
+                    depth_expected_prev=aux.get('depth_expected_prev'),
+                    depth_expected_curr=aux.get('depth_expected_curr'),
+                    feature_drift=feature_drift,
                 )
         finally:
             if was_training:
                 self.model.train()
+        torch.save(feature_refs, ref_path)
+        mean_drift = float(np.mean(probe_drifts)) if probe_drifts else float('nan')
+        self.latest_feature_drift = mean_drift
+        self._append_json_array(os.path.join(self.out_dir, 'probe_metrics.json'), {
+            'train_branch': self.train_branch,
+            'epoch': int(epoch),
+            'phase': phase,
+            'feature_drift': None if not np.isfinite(mean_drift) else mean_drift,
+        })
 
 
     def train(self):
@@ -499,6 +588,14 @@ class TTCTrainer(object):
             'feat_distill': 0.0,
             'corr_distill': 0.0,
             'edge': 0.0,
+            'depth': 0.0,
+            'depth_entropy': 0.0,
+            'depth_valid_ratio': 0.0,
+            'depth_top1_prob': 0.0,
+            'depth_top1_margin': 0.0,
+            'bootstrap_active_candidates': 0.0,
+            'attn_active_candidates': 0.0,
+            'depth_selection_sparsity': 0.0,
         }
         steps = 0
         save_index = 1000
@@ -549,6 +646,14 @@ class TTCTrainer(object):
                     lambda_corr_distill           = cur_lambda_corr,
                     loss_weight_alpha             = self.loss_weight_alpha,
                     edge_loss_weight              = self.edge_loss_weight,
+                    use_internal_depth_guidance   = self.use_internal_depth_guidance,
+                    depth_loss_weight             = self.depth_loss_weight,
+                    depth_selection_mode          = self.depth_selection_mode,
+                    bootstrap_topk                = self.bootstrap_topk,
+                    attn_topk                     = self.attn_topk,
+                    bootstrap_prior_scale         = self.bootstrap_prior_scale,
+                    attn_prior_scale              = self.attn_prior_scale,
+                    depth_prior_eps               = self.depth_prior_eps,
                 )
             else:
                 scale, risk_score, loss_s, loss_r, loss_dict = self.model.forward_with_loss(
@@ -573,6 +678,14 @@ class TTCTrainer(object):
                     lambda_corr_distill           = cur_lambda_corr,
                     loss_weight_alpha             = self.loss_weight_alpha,
                     edge_loss_weight              = self.edge_loss_weight,
+                    use_internal_depth_guidance   = self.use_internal_depth_guidance,
+                    depth_loss_weight             = self.depth_loss_weight,
+                    depth_selection_mode          = self.depth_selection_mode,
+                    bootstrap_topk                = self.bootstrap_topk,
+                    attn_topk                     = self.attn_topk,
+                    bootstrap_prior_scale         = self.bootstrap_prior_scale,
+                    attn_prior_scale              = self.attn_prior_scale,
+                    depth_prior_eps               = self.depth_prior_eps,
                 )
             
             loss = loss_dict['total']
@@ -589,6 +702,14 @@ class TTCTrainer(object):
                 'feat_distill': float(loss_dict['feat_distill'].item()),
                 'corr_distill': float(loss_dict['corr_distill'].item()),
                 'edge': float(loss_dict['edge'].item()),
+                'depth': float(loss_dict['depth'].item()),
+                'depth_entropy': float(loss_dict['depth_entropy'].item()),
+                'depth_valid_ratio': float(loss_dict['depth_valid_ratio'].item()),
+                'depth_top1_prob': float(loss_dict['depth_top1_prob'].item()),
+                'depth_top1_margin': float(loss_dict['depth_top1_margin'].item()),
+                'bootstrap_active_candidates': float(loss_dict['bootstrap_active_candidates'].item()),
+                'attn_active_candidates': float(loss_dict['attn_active_candidates'].item()),
+                'depth_selection_sparsity': float(loss_dict['depth_selection_sparsity'].item()),
             }
             for key, value in batch_metrics.items():
                 epoch_totals[key] += value
@@ -631,7 +752,10 @@ class TTCTrainer(object):
                         f"(task={batch_metrics['task']:6.4f}, "
                         f"feat={batch_metrics['feat_distill']:6.4f}, "
                         f"corr={batch_metrics['corr_distill']:6.4f}, "
-                        f"edge={batch_metrics['edge']:6.4f})"
+                        f"edge={batch_metrics['edge']:6.4f}, "
+                        f"depth={batch_metrics['depth']:6.4f}, "
+                        f"top1={batch_metrics['depth_top1_prob']:6.4f}, "
+                        f"margin={batch_metrics['depth_top1_margin']:6.4f})"
                     )
 
             self.iters += 1
@@ -658,6 +782,14 @@ class TTCTrainer(object):
                         'loss_feat_distill': batch_metrics['feat_distill'],
                         'loss_corr_distill': batch_metrics['corr_distill'],
                         'loss_edge': batch_metrics['edge'],
+                        'loss_depth': batch_metrics['depth'],
+                        'depth_entropy': batch_metrics['depth_entropy'],
+                        'depth_valid_ratio': batch_metrics['depth_valid_ratio'],
+                        'depth_top1_prob': batch_metrics['depth_top1_prob'],
+                        'depth_top1_margin': batch_metrics['depth_top1_margin'],
+                        'bootstrap_active_candidates': batch_metrics['bootstrap_active_candidates'],
+                        'attn_active_candidates': batch_metrics['attn_active_candidates'],
+                        'depth_selection_sparsity': batch_metrics['depth_selection_sparsity'],
                         'distill_scale': float(distill_scale),
                         'lambda_feat_distill': float(cur_lambda_feat),
                         'lambda_corr_distill': float(cur_lambda_corr),
@@ -688,6 +820,15 @@ class TTCTrainer(object):
             'train_loss_feat_distill': avg_metrics['feat_distill'],
             'train_loss_corr_distill': avg_metrics['corr_distill'],
             'train_loss_edge': avg_metrics['edge'],
+            'train_loss_depth': avg_metrics['depth'],
+            'depth_entropy': avg_metrics['depth_entropy'],
+            'depth_valid_ratio': avg_metrics['depth_valid_ratio'],
+            'depth_top1_prob': avg_metrics['depth_top1_prob'],
+            'depth_top1_margin': avg_metrics['depth_top1_margin'],
+            'bootstrap_active_candidates': avg_metrics['bootstrap_active_candidates'],
+            'attn_active_candidates': avg_metrics['attn_active_candidates'],
+            'depth_selection_sparsity': avg_metrics['depth_selection_sparsity'],
+            'feature_drift': self.latest_feature_drift,
             'distill_scale': float(distill_scale),
             'lambda_feat_distill': float(cur_lambda_feat),
             'lambda_corr_distill': float(cur_lambda_corr),
@@ -711,6 +852,15 @@ class TTCTrainer(object):
                     'train_loss_feat_distill',
                     'train_loss_corr_distill',
                     'train_loss_edge',
+                    'train_loss_depth',
+                    'depth_entropy',
+                    'depth_valid_ratio',
+                    'depth_top1_prob',
+                    'depth_top1_margin',
+                    'bootstrap_active_candidates',
+                    'attn_active_candidates',
+                    'depth_selection_sparsity',
+                    'feature_drift',
                     'distill_scale',
                     'lambda_feat_distill',
                     'lambda_corr_distill',

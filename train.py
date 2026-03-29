@@ -177,6 +177,22 @@ parser.add_argument('--new_module_lr_mult', type=float, default=1.0,
                     help='learning-rate multiplier for non-pretrained modules relative to args.lr')
 parser.add_argument('--edge_loss_weight', type=float, default=0.0,
                     help='weight for optional masked scale-gradient loss; 0=off')
+parser.add_argument('--use_internal_depth_guidance', action='store_true',
+                    help='train with an internal depth-distribution head that guides RVT bin selection')
+parser.add_argument('--depth_loss_weight', type=float, default=0.5,
+                    help='weight for internal depth-distribution supervision')
+parser.add_argument('--depth_selection_mode', choices=['soft', 'hard_topk'], default='hard_topk',
+                    help='how depth prior influences RVT candidate selection')
+parser.add_argument('--bootstrap_topk', type=int, default=4,
+                    help='number of (camera,bin) candidates kept during geom bootstrap in hard_topk mode')
+parser.add_argument('--attn_topk', type=int, default=8,
+                    help='number of (camera,bin) candidates kept per attention head in hard_topk mode')
+parser.add_argument('--bootstrap_prior_scale', type=float, default=2.0,
+                    help='scale applied to log depth prior during geom bootstrap selection')
+parser.add_argument('--attn_prior_scale', type=float, default=2.0,
+                    help='scale applied to log depth prior when fused into attention logits')
+parser.add_argument('--depth_prior_eps', type=float, default=1e-6,
+                    help='epsilon for stable log(depth_prior)')
 
 # 加载预训练的单分支模型：
 parser.add_argument(
@@ -595,6 +611,14 @@ def main():
                              student_tail_epochs = args.student_tail_epochs,
                              loss_weight_alpha   = args.loss_weight_alpha,
                              edge_loss_weight    = args.edge_loss_weight,
+                             use_internal_depth_guidance = args.use_internal_depth_guidance,
+                             depth_loss_weight   = args.depth_loss_weight,
+                             depth_selection_mode = args.depth_selection_mode,
+                             bootstrap_topk      = args.bootstrap_topk,
+                             attn_topk           = args.attn_topk,
+                             bootstrap_prior_scale = args.bootstrap_prior_scale,
+                             attn_prior_scale    = args.attn_prior_scale,
+                             depth_prior_eps     = args.depth_prior_eps,
                              )
         trainer.train()
 
@@ -653,6 +677,14 @@ def main():
                              student_tail_epochs = args.student_tail_epochs,
                              loss_weight_alpha   = args.loss_weight_alpha,
                              edge_loss_weight    = args.edge_loss_weight,
+                             use_internal_depth_guidance = args.use_internal_depth_guidance,
+                             depth_loss_weight   = args.depth_loss_weight,
+                             depth_selection_mode = args.depth_selection_mode,
+                             bootstrap_topk      = args.bootstrap_topk,
+                             attn_topk           = args.attn_topk,
+                             bootstrap_prior_scale = args.bootstrap_prior_scale,
+                             attn_prior_scale    = args.attn_prior_scale,
+                             depth_prior_eps     = args.depth_prior_eps,
                              )
         trainer.train()
 

@@ -3,7 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .modules.utils import normalize_img
-from utils.loss import get_loss_scale_map, get_loss_scale_gradient_map, get_loss_risk_score_map
+from utils.loss import (
+    get_loss_scale_map,
+    get_loss_scale_gradient_map,
+    get_loss_risk_score_map,
+    get_loss_depth_distribution,
+)
 
 from .scale_net.backbone import CNNEncoder
 from .scale_net.feature_net.feature_net import FeatureNet
@@ -97,11 +102,17 @@ class FpTTC(nn.Module):
                                  reg_refine       = reg_refine, 
                                  head_type        = 'risk')
         
-        K_bins = 8
+        K_bins = 16
         num_views = len(self.camera_channels)
         self.register_buffer(
             "depth_bins",
             torch.logspace(math.log10(1.0), math.log10(40.0), K_bins)
+        )
+        self.depth_prior_alpha = 0.7
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(feature_channels, feature_channels // 2, 3, padding=1, bias=True),
+            nn.LeakyReLU(0.1, inplace=False),
+            nn.Conv2d(feature_channels // 2, K_bins, 1, bias=True),
         )
         
         # 特征分支：按尺度各一个
@@ -130,7 +141,19 @@ class FpTTC(nn.Module):
             fov_up=8.0,
             fov_down=-15.0
         )
-        
+    
+    def _predict_depth_logits(self, feat_bv):
+        B, V, C, H, W = feat_bv.shape
+        logits = self.depth_head(feat_bv.view(B * V, C, H, W))
+        return logits.view(B, V, -1, H, W)
+
+    def _depth_prob_by_cam(self, depth_logits, target_hw):
+        B, V, K, H, W = depth_logits.shape
+        logits = depth_logits.view(B * V, K, H, W)
+        if (H, W) != target_hw:
+            logits = _safe_bilinear(logits, size=target_hw, align_corners=True)
+        probs = F.softmax(logits, dim=1).view(B, V, K, target_hw[0], target_hw[1])
+        return [probs[:, v] for v in range(V)]
 
     def forward(
         self,
@@ -146,6 +169,13 @@ class FpTTC(nn.Module):
         scale_only=True,
         no_depth=None,
         use_teacher_distill=False,
+        use_internal_depth_guidance=False,
+        depth_selection_mode='hard_topk',
+        bootstrap_topk=4,
+        attn_topk=8,
+        bootstrap_prior_scale=2.0,
+        attn_prior_scale=2.0,
+        depth_prior_eps=1e-6,
     ):
         if no_depth is None:
             no_depth = self.no_depth
@@ -169,6 +199,11 @@ class FpTTC(nn.Module):
         # reshape 回 [B,V,C,Hs,Ws]
         prev_lvls = [f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for f in prev_lvls_flat]
         curr_lvls = [f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for f in curr_lvls_flat]
+        depth_logits_prev = None
+        depth_logits_curr = None
+        if use_internal_depth_guidance:
+            depth_logits_prev = self._predict_depth_logits(prev_lvls[-1])
+            depth_logits_curr = self._predict_depth_logits(curr_lvls[-1])
 
         # ----- 多尺度 Transformer + 相关性，仍然“只按尺度循环”，但每次处理 B*V -----
         corr = None
@@ -245,8 +280,11 @@ class FpTTC(nn.Module):
         corr_encoded_list = [self.conv_corr_rvt_in(c) for c in corr_list]  # list[V] of [B, Ccorr, Hc, Wc]
         H_r = corr_encoded_list[0].shape[2]
         W_r = corr_encoded_list[0].shape[3] * V
+        corr_depth_prob = None
+        if depth_logits_curr is not None:
+            corr_depth_prob = self._depth_prob_by_cam(depth_logits_curr, corr_encoded_list[0].shape[-2:])
 
-        corr_range = self.rvt_corr(
+        corr_range, corr_stats = self.rvt_corr(
             feats_by_cam=corr_encoded_list,
             cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
             cam_R=[sensor_metas['curr'][cam]['R_l2c'] for cam in self.camera_channels],
@@ -256,17 +294,32 @@ class FpTTC(nn.Module):
             depth_bins=self.depth_bins,
             ini_query=None,
             use_geom_bootstrap=True,
+            depth_prob_by_cam=corr_depth_prob,
+            depth_prior_alpha=self.depth_prior_alpha,
+            depth_selection_mode=depth_selection_mode,
+            bootstrap_topk=bootstrap_topk,
+            attn_topk=attn_topk,
+            bootstrap_prior_scale=bootstrap_prior_scale,
+            attn_prior_scale=attn_prior_scale,
+            depth_prior_eps=depth_prior_eps,
         )
 
         # 多尺度特征 -> range（前/当前帧）
         multi_level_ranges_prev, multi_level_ranges_curr = [], []
+        selection_stats = [corr_stats]
         for lvl in range(self.num_scales):
             prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
             curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
             H_r = prev_feats_list[0].shape[2]
             W_r = prev_feats_list[0].shape[3] * V
+            prev_depth_prob = None
+            curr_depth_prob = None
+            if depth_logits_prev is not None:
+                prev_depth_prob = self._depth_prob_by_cam(depth_logits_prev, prev_feats_list[0].shape[-2:])
+            if depth_logits_curr is not None:
+                curr_depth_prob = self._depth_prob_by_cam(depth_logits_curr, curr_feats_list[0].shape[-2:])
 
-            range_prev = self.rvt_feat[lvl](
+            range_prev, prev_stats = self.rvt_feat[lvl](
                 feats_by_cam=prev_feats_list,
                 cam_K=[sensor_metas['prev'][cam]['K']     for cam in self.camera_channels],
                 cam_R=[sensor_metas['prev'][cam]['R_l2c'] for cam in self.camera_channels],
@@ -276,8 +329,16 @@ class FpTTC(nn.Module):
                 depth_bins=self.depth_bins,
                 ini_query=None,
                 use_geom_bootstrap=True,
+                depth_prob_by_cam=prev_depth_prob,
+                depth_prior_alpha=self.depth_prior_alpha,
+                depth_selection_mode=depth_selection_mode,
+                bootstrap_topk=bootstrap_topk,
+                attn_topk=attn_topk,
+                bootstrap_prior_scale=bootstrap_prior_scale,
+                attn_prior_scale=attn_prior_scale,
+                depth_prior_eps=depth_prior_eps,
             )
-            range_curr = self.rvt_feat[lvl](
+            range_curr, curr_stats = self.rvt_feat[lvl](
                 feats_by_cam=curr_feats_list,
                 cam_K=[sensor_metas['curr'][cam]['K']     for cam in self.camera_channels],
                 cam_R=[sensor_metas['curr'][cam]['R_l2c'] for cam in self.camera_channels],
@@ -287,9 +348,30 @@ class FpTTC(nn.Module):
                 depth_bins=self.depth_bins,
                 ini_query=None,
                 use_geom_bootstrap=True,
+                depth_prob_by_cam=curr_depth_prob,
+                depth_prior_alpha=self.depth_prior_alpha,
+                depth_selection_mode=depth_selection_mode,
+                bootstrap_topk=bootstrap_topk,
+                attn_topk=attn_topk,
+                bootstrap_prior_scale=bootstrap_prior_scale,
+                attn_prior_scale=attn_prior_scale,
+                depth_prior_eps=depth_prior_eps,
             )
             multi_level_ranges_prev.append(range_prev)
             multi_level_ranges_curr.append(range_curr)
+            selection_stats.extend([prev_stats, curr_stats])
+
+        def _mean_stat(key):
+            values = [s[key] for s in selection_stats if key in s]
+            if not values:
+                return torch.tensor(0.0, device=img_prev.device)
+            return torch.stack([v if torch.is_tensor(v) else torch.tensor(v, device=img_prev.device) for v in values]).mean()
+
+        selection_summary = {
+            'bootstrap_active_candidates': _mean_stat('bootstrap_active_candidates'),
+            'attn_active_candidates': _mean_stat('attn_active_candidates'),
+            'depth_selection_sparsity': _mean_stat('depth_selection_sparsity'),
+        }
 
         # ----- 预测（两分支）-----
         # scale 分支
@@ -318,8 +400,15 @@ class FpTTC(nn.Module):
                 'ranges_prev': teacher_ranges_prev,
                 'ranges_curr': teacher_ranges_curr,
             }
+        aux_outputs = {
+            'depth_logits_prev': depth_logits_prev,
+            'depth_logits_curr': depth_logits_curr,
+            'feature_monitor_prev': prev_lvls[-1].detach() if depth_logits_prev is not None else None,
+            'feature_monitor_curr': curr_lvls[-1].detach() if depth_logits_curr is not None else None,
+            'selection_summary': selection_summary,
+        }
 
-        return scales, risk_score, corr_range, multi_level_ranges_prev, multi_level_ranges_curr, teacher_targets
+        return scales, risk_score, corr_range, multi_level_ranges_prev, multi_level_ranges_curr, teacher_targets, aux_outputs
 
 
     def forward_with_loss( 
@@ -345,9 +434,18 @@ class FpTTC(nn.Module):
             lambda_corr_distill=1.0,
             loss_weight_alpha=0.0,
             edge_loss_weight=0.0,
+            use_internal_depth_guidance=False,
+            depth_loss_weight=0.0,
+            depth_selection_mode='hard_topk',
+            bootstrap_topk=4,
+            attn_topk=8,
+            bootstrap_prior_scale=2.0,
+            attn_prior_scale=2.0,
+            depth_prior_eps=1e-6,
+            return_aux=False,
         ):
 
-        scales, risks, corr_range, ranges_prev, ranges_curr, teacher_targets = self.forward(
+        scales, risks, corr_range, ranges_prev, ranges_curr, teacher_targets, aux_outputs = self.forward(
             img_prev         = img_prev,
             img_curr         = img_curr,
             depth_prev       = depth_prev,
@@ -363,6 +461,13 @@ class FpTTC(nn.Module):
             scale_only       = scale_only,
             no_depth         = no_depth,
             use_teacher_distill = use_teacher_distill,
+            use_internal_depth_guidance = use_internal_depth_guidance,
+            depth_selection_mode = depth_selection_mode,
+            bootstrap_topk = bootstrap_topk,
+            attn_topk = attn_topk,
+            bootstrap_prior_scale = bootstrap_prior_scale,
+            attn_prior_scale = attn_prior_scale,
+            depth_prior_eps = depth_prior_eps,
         )
 
         # ===== task loss =====
@@ -383,6 +488,16 @@ class FpTTC(nn.Module):
         # ===== distillation loss (feat + corr, 分别加权) =====
         L_feat_distill = torch.tensor(0.0, device=img_prev.device)
         L_corr_distill = torch.tensor(0.0, device=img_prev.device)
+        loss_depth = torch.tensor(0.0, device=img_prev.device)
+        depth_entropy = torch.tensor(0.0, device=img_prev.device)
+        depth_valid_ratio = torch.tensor(0.0, device=img_prev.device)
+        depth_top1_prob = torch.tensor(0.0, device=img_prev.device)
+        depth_top1_margin = torch.tensor(0.0, device=img_prev.device)
+        depth_expected_prev = None
+        depth_expected_curr = None
+        bootstrap_active_candidates = aux_outputs['selection_summary']['bootstrap_active_candidates']
+        attn_active_candidates = aux_outputs['selection_summary']['attn_active_candidates']
+        depth_selection_sparsity = aux_outputs['selection_summary']['depth_selection_sparsity']
 
         if teacher_targets is not None:
             t_corr = teacher_targets['corr_range']
@@ -393,8 +508,22 @@ class FpTTC(nn.Module):
                 L_feat_distill = L_feat_distill + (ranges_curr[lvl] - teacher_targets['ranges_curr'][lvl]).abs().mean()
 
         total_distill = lambda_feat_distill * L_feat_distill + lambda_corr_distill * L_corr_distill
+        if use_internal_depth_guidance and aux_outputs['depth_logits_prev'] is not None:
+            loss_depth_prev, depth_stats_prev = get_loss_depth_distribution(
+                aux_outputs['depth_logits_prev'], depth_prev, self.depth_bins
+            )
+            loss_depth_curr, depth_stats_curr = get_loss_depth_distribution(
+                aux_outputs['depth_logits_curr'], depth_curr, self.depth_bins
+            )
+            loss_depth = 0.5 * (loss_depth_prev + loss_depth_curr)
+            depth_entropy = 0.5 * (depth_stats_prev['entropy'] + depth_stats_curr['entropy'])
+            depth_valid_ratio = 0.5 * (depth_stats_prev['valid_ratio'] + depth_stats_curr['valid_ratio'])
+            depth_top1_prob = 0.5 * (depth_stats_prev['top1_prob'] + depth_stats_curr['top1_prob'])
+            depth_top1_margin = 0.5 * (depth_stats_prev['top1_margin'] + depth_stats_curr['top1_margin'])
+            depth_expected_prev = depth_stats_prev['expected']
+            depth_expected_curr = depth_stats_curr['expected']
 
-        loss_total = (loss_s if scale_only else loss_r) + total_distill + edge_loss_weight * loss_edge
+        loss_total = (loss_s if scale_only else loss_r) + total_distill + edge_loss_weight * loss_edge + depth_loss_weight * loss_depth
         loss_task = loss_s if scale_only else loss_r
         zero = torch.tensor(0.0, device=img_prev.device)
 
@@ -406,7 +535,22 @@ class FpTTC(nn.Module):
             'feat_distill': L_feat_distill,
             'corr_distill': L_corr_distill,
             'edge': loss_edge,
+            'depth': loss_depth,
+            'depth_entropy': depth_entropy,
+            'depth_valid_ratio': depth_valid_ratio,
+            'depth_top1_prob': depth_top1_prob,
+            'depth_top1_margin': depth_top1_margin,
+            'bootstrap_active_candidates': bootstrap_active_candidates,
+            'attn_active_candidates': attn_active_candidates,
+            'depth_selection_sparsity': depth_selection_sparsity,
         }
+        if return_aux:
+            loss_dict['aux'] = {
+                'depth_expected_prev': depth_expected_prev,
+                'depth_expected_curr': depth_expected_curr,
+                'feature_monitor_prev': aux_outputs['feature_monitor_prev'],
+                'feature_monitor_curr': aux_outputs['feature_monitor_curr'],
+            }
 
         if scale_only:
             return scales, None, loss_total, None, loss_dict
