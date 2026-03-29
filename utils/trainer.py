@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 
 import matplotlib.pyplot as plt
@@ -23,6 +25,7 @@ from utils.dist import is_main_process
 from PIL import Image
 from .draw import visual_scale_map_range_image, visual_risk_score_map_range_image
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
+
 
 class TTCTrainer(object):
     def __init__(self, model, dataset, optimizer, args, start_epoch, device,
@@ -57,9 +60,8 @@ class TTCTrainer(object):
         self.start_epoch = start_epoch
         
         steps_per_epoch = int(len(self.train_loader))
-        #print(self.epoch, len(self.train_loader), self.batch_size, steps_per_epoch)
         starte = -1
-        if self.start_epoch>0:
+        if self.start_epoch > 0:
             starte = self.start_epoch - 1
         
         self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -70,7 +72,7 @@ class TTCTrainer(object):
             pct_start=0.05,
             cycle_momentum=False,
             anneal_strategy='cos',
-            last_epoch=max(steps_per_epoch*starte,-1),
+            last_epoch=max(steps_per_epoch * starte, -1),
         )
 
         self.device = device
@@ -80,70 +82,416 @@ class TTCTrainer(object):
             self.time_stamp = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
         else:
             self.time_stamp = time_stamp  
-        self.attn_type=args.attn_type
-        self.attn_splits_list=args.attn_splits_list
-        self.corr_radius_list=args.corr_radius_list
-        self.prop_radius_list=args.prop_radius_list
-        self.num_reg_refine=args.num_reg_refine
+        self.attn_type = args.attn_type
+        self.attn_splits_list = args.attn_splits_list
+        self.corr_radius_list = args.corr_radius_list
+        self.prop_radius_list = args.prop_radius_list
+        self.num_reg_refine = args.num_reg_refine
 
-        self.grad_clip = 1.0
-        self.checkpoint_interval = 20 # 保存模型的间隔
+        self.grad_clip = args.grad_clip
+        self.checkpoint_interval = 20
 
         self.loss_per_epoch = 0
         self.loss_sum_per_epoch = 0
         self.iters = 0
 
         self.neptune_run = neptune_run
+        self.dataset = dataset
+        self.out_dir = "./log/%s_surround_ttc" % (self.time_stamp)
+        self.train_branch = 'scale' if self.scale_only else 'risk'
+        self.batch_metrics_interval = 50
+        self.num_probe_samples = 4
+        self.probe_seed = 326
+        self.fixed_probe_samples = []
 
+    def _write_json(self, path, payload):
+        with open(path, 'w') as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    def _load_json(self, path, default):
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+        return default
+
+    def _append_jsonl(self, path, record):
+        with open(path, 'a') as f:
+            f.write(json.dumps(record, sort_keys=True) + '\n')
+
+    def _append_json_array(self, path, record):
+        records = self._load_json(path, [])
+        records.append(record)
+        self._write_json(path, records)
+
+    def _append_csv_row(self, path, fieldnames, row):
+        file_exists = os.path.exists(path)
+        with open(path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _model_ref(self):
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def _optimizer_group_summary(self):
+        summaries = getattr(self.optimizer, '_fp_ttc_lr_group_summary', None)
+        if summaries:
+            return summaries
+
+        group_names = getattr(self.optimizer, '_fp_ttc_lr_group_names', [])
+        fallback = []
+        for idx, pg in enumerate(self.optimizer.param_groups):
+            name = group_names[idx] if idx < len(group_names) else f'group_{idx}'
+            fallback.append({
+                'name': name,
+                'tensor_count': len(pg['params']),
+                'parameter_count': int(sum(p.numel() for p in pg['params'])),
+                'initial_lr': float(pg.get('initial_lr', pg['lr'])),
+                'max_lr': float(pg.get('max_lr', pg['lr'])),
+                'min_lr': float(pg.get('min_lr', pg['lr'])),
+            })
+        return fallback
+
+    def _current_lrs(self):
+        group_names = getattr(self.optimizer, '_fp_ttc_lr_group_names', [])
+        lrs = {}
+        for idx, pg in enumerate(self.optimizer.param_groups):
+            name = group_names[idx] if idx < len(group_names) else f'group_{idx}'
+            lrs[name] = float(pg['lr'])
+
+        if self.optimizer.param_groups:
+            fallback_lr = float(self.optimizer.param_groups[0]['lr'])
+            lrs.setdefault('old', fallback_lr)
+            lrs.setdefault('new', fallback_lr)
+        else:
+            lrs.setdefault('old', 0.0)
+            lrs.setdefault('new', 0.0)
+        return lrs
+
+    def _log_current_lrs(self):
+        group_names = getattr(self.optimizer, '_fp_ttc_lr_group_names', [])
+        if group_names:
+            for idx, name in enumerate(group_names):
+                print(f"  [{name}] lr = {self.optimizer.param_groups[idx]['lr']:.3e}")
+        else:
+            for idx, pg in enumerate(self.optimizer.param_groups):
+                print(f"  param group {idx} lr = {pg['lr']:.3e}")
+
+    def _sample_meta(self, sample_index):
+        meta = {
+            'sample_index': int(sample_index),
+            'original_index': None,
+            'scene_indice': None,
+            'gt_map_path': None,
+            'prev_sample_token': None,
+            'curr_sample_token': None,
+        }
+        if not hasattr(self.dataset, 'samples'):
+            return meta
+
+        original_index, info = self.dataset.samples[sample_index]
+        meta['original_index'] = int(original_index)
+        meta['scene_indice'] = info.get('scene_indice')
+        meta['gt_map_path'] = info.get('gt_map_path')
+        prev_front = info.get('prev_camera_data', {}).get('CAM_FRONT', {})
+        curr_front = info.get('curr_camera_data', {}).get('CAM_FRONT', {})
+        meta['prev_sample_token'] = prev_front.get('sample_token')
+        meta['curr_sample_token'] = curr_front.get('sample_token')
+        return meta
+
+    def _init_fixed_probe_samples(self):
+        if self.fixed_probe_samples:
+            return
+
+        probe_path = os.path.join(self.out_dir, 'fixed_probe_samples.json')
+        if os.path.exists(probe_path):
+            self.fixed_probe_samples = self._load_json(probe_path, [])
+            return
+
+        total = len(self.dataset)
+        probe_count = min(self.num_probe_samples, total)
+        rng = random.Random(self.probe_seed)
+        chosen_indices = list(range(total)) if probe_count == total else sorted(rng.sample(range(total), probe_count))
+        self.fixed_probe_samples = [self._sample_meta(idx) for idx in chosen_indices]
+        self._write_json(probe_path, self.fixed_probe_samples)
+
+    def _update_train_manifest(self):
+        manifest_path = os.path.join(self.out_dir, 'train_manifest.json')
+        manifest = self._load_json(manifest_path, {
+            'train_samples': len(self.dataset),
+            'checkpoint_interval': self.checkpoint_interval,
+            'batch_metrics_interval': self.batch_metrics_interval,
+            'num_probe_samples': self.num_probe_samples,
+            'probe_seed': self.probe_seed,
+            'branches': {},
+        })
+        manifest['train_samples'] = len(self.dataset)
+        manifest['checkpoint_interval'] = self.checkpoint_interval
+        manifest['batch_metrics_interval'] = self.batch_metrics_interval
+        manifest['num_probe_samples'] = self.num_probe_samples
+        manifest['probe_seed'] = self.probe_seed
+        manifest['branches'][self.train_branch] = {
+            'main_epochs': self.epoch,
+            'stage_a_end': 0,
+            'total_epochs': self.epoch,
+            'scale_only': bool(self.scale_only),
+            'use_teacher_distill': False,
+            'student_tail_epochs': 0,
+            'edge_loss_weight': 0.0,
+            'optimizer_groups': self._optimizer_group_summary(),
+        }
+        self._write_json(manifest_path, manifest)
+
+    def _initialize_run_artifacts(self):
+        os.makedirs(self.out_dir, exist_ok=True)
+        self._update_train_manifest()
+        self._init_fixed_probe_samples()
+
+        for filename, default in (
+            ('checkpoints.json', []),
+            ('visualizations.json', []),
+        ):
+            path = os.path.join(self.out_dir, filename)
+            if not os.path.exists(path):
+                self._write_json(path, default)
+
+        path = os.path.join(self.out_dir, 'batch_metrics.jsonl')
+        if not os.path.exists(path):
+            open(path, 'a').close()
+
+    def _batchify_probe_value(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.unsqueeze(0)
+        if isinstance(value, dict):
+            return {k: self._batchify_probe_value(v) for k, v in value.items()}
+        return value
+
+    def _load_probe_sample(self, sample_index):
+        np_state = np.random.get_state()
+        py_state = random.getstate()
+        np.random.seed(self.probe_seed + int(sample_index))
+        random.seed(self.probe_seed + int(sample_index))
+        try:
+            sample = self.dataset[sample_index]
+        finally:
+            np.random.set_state(np_state)
+            random.setstate(py_state)
+        return sample
+
+    def _move_sensor_metas_to_device(self, sensor_metas):
+        for frame_key in sensor_metas:
+            for channel in sensor_metas[frame_key]:
+                for key in sensor_metas[frame_key][channel]:
+                    sensor_metas[frame_key][channel][key] = sensor_metas[frame_key][channel][key].to(self.device)
+        return sensor_metas
+
+    def _forward_with_loss(self, prev_imgs, curr_imgs, prev_depths, curr_depths,
+                           proj_prev, proj_curr, gt_scale, gt_risk, sensor_metas):
+        model_ref = self._model_ref()
+        return model_ref.forward_with_loss(
+            img_prev=prev_imgs,
+            img_curr=curr_imgs,
+            depth_prev=prev_depths,
+            depth_curr=curr_depths,
+            proj_pix_prev=proj_prev,
+            proj_pix_curr=proj_curr,
+            gt_scale_map_with_mask=gt_scale,
+            gt_risk_score_map_with_mask=gt_risk,
+            sensor_metas=sensor_metas,
+            attn_type=self.attn_type,
+            attn_splits_list=self.attn_splits_list,
+            corr_radius_list=self.corr_radius_list,
+            prop_radius_list=self.prop_radius_list,
+            num_reg_refine=self.num_reg_refine,
+            scale_only=self.scale_only,
+        )
+
+    def _log_visualization_record(self, record):
+        self._append_json_array(os.path.join(self.out_dir, 'visualizations.json'), record)
+
+    def _save_prediction_visuals(self, epoch, step, phase, scale, risk_score,
+                                 gt_scale_map_with_mask, gt_risk_score_map_with_mask,
+                                 record_extra=None, prefix=None):
+        base_prefix = prefix if prefix is not None else f"{epoch}_{step}"
+        extra = record_extra or {}
+
+        if self.scale_only:
+            if isinstance(scale, list):
+                scale = scale[-1]
+
+            gt_scale = gt_scale_map_with_mask[:, 0, :, :]
+            gt_scale_valid_mask = gt_scale_map_with_mask[:, 1, :, :]
+
+            gt_scale_np = gt_scale[:1].detach().squeeze(0).cpu().numpy()
+            gt_scale_valid_mask_np = gt_scale_valid_mask[:1].squeeze(0).cpu().detach().bool()
+            normalized_gt = visual_scale_map_range_image(gt_scale_np, gt_scale_valid_mask_np)
+
+            scale_np = scale[0].detach().squeeze(0).cpu().numpy()
+            pred_scale_valid_mask = scale_np > 0
+            normalized_pred = visual_scale_map_range_image(scale_np, pred_scale_valid_mask)
+
+            pred_path = os.path.join(self.out_dir, f"{base_prefix}_pred.png")
+            gt_path = os.path.join(self.out_dir, f"{base_prefix}_gt.png")
+            plt.imsave(pred_path, -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
+            plt.imsave(gt_path, -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
+        else:
+            gt_risk_score = gt_risk_score_map_with_mask[:, 0, :, :]
+            gt_risk_score_valid_mask = gt_risk_score_map_with_mask[:, 1, :, :]
+
+            gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
+            gt_risk_score_valid_mask_np = gt_risk_score_valid_mask[:1].squeeze(0).cpu().detach().bool()
+            normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np, gt_risk_score_valid_mask_np)
+
+            risk_score_np = risk_score[0].detach().squeeze(0).cpu().numpy()
+            normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np, None)
+
+            pred_path = os.path.join(self.out_dir, f"{base_prefix}_pred_risk.png")
+            gt_path = os.path.join(self.out_dir, f"{base_prefix}_gt_risk.png")
+            plt.imsave(pred_path, -normalized_pred_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+            plt.imsave(gt_path, -normalized_gt_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
+
+        self._log_visualization_record({
+            'kind': extra.get('kind', 'train_step'),
+            'train_branch': self.train_branch,
+            'epoch': int(epoch),
+            'step': int(step),
+            'phase': phase,
+            'pred_path': os.path.relpath(pred_path, self.out_dir),
+            'gt_path': os.path.relpath(gt_path, self.out_dir),
+            'sample_index': extra.get('sample_index'),
+            'original_index': extra.get('original_index'),
+            'scene_indice': extra.get('scene_indice'),
+            'prev_sample_token': extra.get('prev_sample_token'),
+            'curr_sample_token': extra.get('curr_sample_token'),
+        })
+
+    @torch.no_grad()
+    def _save_probe_snapshots(self, epoch, phase):
+        if not self.fixed_probe_samples:
+            return
+
+        probe_dir = os.path.join(self.out_dir, 'probes', f'epoch_{epoch:03d}')
+        os.makedirs(probe_dir, exist_ok=True)
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for probe_idx, probe_meta in enumerate(self.fixed_probe_samples):
+                sample = self._load_probe_sample(probe_meta['sample_index'])
+                (prev_imgs,
+                 curr_imgs,
+                 prev_depths,
+                 curr_depths,
+                 proj_prev,
+                 proj_curr,
+                 gt_scale,
+                 gt_risk,
+                 sensor_metas) = sample
+
+                prev_imgs = self._batchify_probe_value(prev_imgs).to(self.device)
+                curr_imgs = self._batchify_probe_value(curr_imgs).to(self.device)
+                prev_depths = self._batchify_probe_value(prev_depths).to(self.device)
+                curr_depths = self._batchify_probe_value(curr_depths).to(self.device)
+                proj_prev = self._batchify_probe_value(proj_prev).to(self.device)
+                proj_curr = self._batchify_probe_value(proj_curr).to(self.device)
+                gt_scale = self._batchify_probe_value(gt_scale).to(self.device)
+                gt_risk = self._batchify_probe_value(gt_risk).to(self.device)
+                sensor_metas = self._move_sensor_metas_to_device(self._batchify_probe_value(sensor_metas))
+
+                scale, risk_score, _, _ = self._forward_with_loss(
+                    prev_imgs,
+                    curr_imgs,
+                    prev_depths,
+                    curr_depths,
+                    proj_prev,
+                    proj_curr,
+                    gt_scale,
+                    gt_risk,
+                    sensor_metas,
+                )
+
+                self._save_prediction_visuals(
+                    epoch=epoch,
+                    step=probe_idx,
+                    phase=phase,
+                    scale=scale,
+                    risk_score=risk_score,
+                    gt_scale_map_with_mask=gt_scale,
+                    gt_risk_score_map_with_mask=gt_risk,
+                    record_extra={**probe_meta, 'kind': 'probe'},
+                    prefix=os.path.join('probes', f'epoch_{epoch:03d}', f'probe_{probe_idx:02d}'),
+                )
+        finally:
+            if was_training:
+                self.model.train()
+
+    def _stage_name(self, epoch):
+        return 'main'
 
     def train(self):
-        out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
-        os.makedirs(out_dir, exist_ok=True)
-
         if is_main_process():
-            for i, pg in enumerate(self.optimizer.param_groups):
-                print(f"  param group {i} lr = {pg['lr']:.3e}")
+            self._initialize_run_artifacts()
+            self._log_current_lrs()
 
         for epoch in range(self.start_epoch, self.epoch):
+            phase = self._stage_name(epoch)
             if is_main_process():
-                print('Epoch:', epoch)
+                print(f'Epoch: {epoch} [{phase}]')
             self.loss_per_epoch = 0
             self.loss_sum_per_epoch = 0
             self.iters = 0
-            self.train_epoch(epoch)
+            epoch_metrics = self.train_epoch(epoch)
 
             if is_main_process():
-                if (epoch < self.epoch and epoch % self.checkpoint_interval == 0):
+                if epoch % self.checkpoint_interval == 0:
                     checkpoint = {
                         "net": self.model.state_dict(),
                         'optimizer': self.optimizer.state_dict(),
-                        "epoch": epoch + 1
+                        "epoch": epoch + 1,
+                        "metrics": epoch_metrics,
                     }
-                    # # 用当前的时间戳为模型保存路径命名
                     if self.scale_only:
-                        temp_pth = os.path.join(out_dir, f'{epoch}_scale.pth.tar')
+                        temp_pth = os.path.join(self.out_dir, f'{epoch}_scale.pth.tar')
                     else:
-                        temp_pth = os.path.join(out_dir, f'{epoch}.pth.tar')
+                        temp_pth = os.path.join(self.out_dir, f'{epoch}.pth.tar')
                     torch.save(checkpoint, temp_pth)
+                    self._append_json_array(os.path.join(self.out_dir, 'checkpoints.json'), {
+                        'train_branch': self.train_branch,
+                        'epoch': int(epoch),
+                        'phase': phase,
+                        'path': os.path.relpath(temp_pth, self.out_dir),
+                        'lr': epoch_metrics['lr_old'],
+                        'lr_old': epoch_metrics['lr_old'],
+                        'lr_new': epoch_metrics['lr_new'],
+                        'train_loss_total': epoch_metrics['train_loss_total'],
+                        'train_loss_task': epoch_metrics['train_loss_task'],
+                    })
+                    self._save_probe_snapshots(epoch=epoch, phase=phase)
 
-                print("Loss in epoch", epoch, ":", self.loss_per_epoch / max(1, self.iters))
-                for i, pg in enumerate(self.optimizer.param_groups):
-                    print(f"  param group {i} lr = {pg['lr']:.3e}")
+                print("Loss in epoch", epoch, ":", epoch_metrics['train_loss_total'])
+                self._log_current_lrs()
 
-    
     def train_epoch(self, epoch):
         total_samples = len(self.train_loader.dataset)
         if self.parallel:
             self.train_sampler.set_epoch(epoch)
         self.model.train()
-        
-        epoch_loss = 0
-        steps = 0
 
-        out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
+        phase = self._stage_name(epoch)
+        epoch_totals = {
+            'total': 0.0,
+            'task': 0.0,
+            'scale': 0.0,
+            'risk': 0.0,
+            'feat_distill': 0.0,
+            'corr_distill': 0.0,
+            'edge': 0.0,
+        }
+        steps = 0
         save_index = 1000
+
         for i, data in enumerate(self.train_loader):
-            
             (prev_surr_view_imgs_tensor,
              curr_surr_view_imgs_tensor,
              prev_surr_view_depths_tensor,
@@ -154,146 +502,163 @@ class TTCTrainer(object):
              gt_risk_score_map_with_mask,
              sensor_metas) = data
             
-            prev_surr_view_imgs_tensor   = prev_surr_view_imgs_tensor.to(self.device)
-            curr_surr_view_imgs_tensor   = curr_surr_view_imgs_tensor.to(self.device)
+            prev_surr_view_imgs_tensor = prev_surr_view_imgs_tensor.to(self.device)
+            curr_surr_view_imgs_tensor = curr_surr_view_imgs_tensor.to(self.device)
             prev_surr_view_depths_tensor = prev_surr_view_depths_tensor.to(self.device)
             curr_surr_view_depths_tensor = curr_surr_view_depths_tensor.to(self.device)
-            proj_pix_prev_tensor         = proj_pix_prev_tensor.to(self.device)
-            proj_pix_curr_tensor         = proj_pix_curr_tensor.to(self.device)
-            gt_scale_map_with_mask       = gt_scale_map_with_mask.to(self.device)
-            gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
-            for frame_key in sensor_metas:
-                for channel in sensor_metas[frame_key]:
-                    for key in sensor_metas[frame_key][channel]:
-                        sensor_metas[frame_key][channel][key] = sensor_metas[frame_key][channel][key].to(self.device)
-            # sensor_metas                 = sensor_metas.to(self.device)
+            proj_pix_prev_tensor = proj_pix_prev_tensor.to(self.device)
+            proj_pix_curr_tensor = proj_pix_curr_tensor.to(self.device)
+            gt_scale_map_with_mask = gt_scale_map_with_mask.to(self.device)
+            gt_risk_score_map_with_mask = gt_risk_score_map_with_mask.to(self.device)
+            sensor_metas = self._move_sensor_metas_to_device(sensor_metas)
 
             self.optimizer.zero_grad()
-            # 在多卡模式下，从 self.model.module 调用 forward_with_loss，否则直接调用
-            if hasattr(self.model, "module"):
-                scale, risk_score, loss_s, loss_r = self.model.module.forward_with_loss(
-                    img_prev                      = prev_surr_view_imgs_tensor,
-                    img_curr                      = curr_surr_view_imgs_tensor,
-                    depth_prev                    = prev_surr_view_depths_tensor,
-                    depth_curr                    = curr_surr_view_depths_tensor,
-                    proj_pix_prev                 = proj_pix_prev_tensor,
-                    proj_pix_curr                 = proj_pix_curr_tensor,
-                    gt_scale_map_with_mask        = gt_scale_map_with_mask,
-                    gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
-                    sensor_metas                  = sensor_metas,
-                    attn_type                     = self.attn_type,
-                    attn_splits_list              = self.attn_splits_list,
-                    corr_radius_list              = self.corr_radius_list,
-                    prop_radius_list              = self.prop_radius_list,
-                    num_reg_refine                = self.num_reg_refine,
-                    scale_only                    = self.scale_only
-                )
-            else:
-                scale, risk_score, loss_s, loss_r = self.model.forward_with_loss(
-                    img_prev                      = prev_surr_view_imgs_tensor,
-                    img_curr                      = curr_surr_view_imgs_tensor,
-                    depth_prev                    = prev_surr_view_depths_tensor,
-                    depth_curr                    = curr_surr_view_depths_tensor,
-                    proj_pix_prev                 = proj_pix_prev_tensor,
-                    proj_pix_curr                 = proj_pix_curr_tensor,
-                    gt_scale_map_with_mask        = gt_scale_map_with_mask,
-                    gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
-                    sensor_metas                  = sensor_metas,
-                    attn_type                     = self.attn_type,
-                    attn_splits_list              = self.attn_splits_list,
-                    corr_radius_list              = self.corr_radius_list,
-                    prop_radius_list              = self.prop_radius_list,
-                    num_reg_refine                = self.num_reg_refine,
-                    scale_only                    = self.scale_only
-                )
-            
+            scale, risk_score, loss_s, loss_r = self._forward_with_loss(
+                prev_surr_view_imgs_tensor,
+                curr_surr_view_imgs_tensor,
+                prev_surr_view_depths_tensor,
+                curr_surr_view_depths_tensor,
+                proj_pix_prev_tensor,
+                proj_pix_curr_tensor,
+                gt_scale_map_with_mask,
+                gt_risk_score_map_with_mask,
+                sensor_metas,
+            )
             loss = loss_s if self.scale_only else loss_r
+
+            batch_metrics = {
+                'total': float(loss.item()),
+                'task': float(loss.item()),
+                'scale': float(loss_s.item()) if loss_s is not None else 0.0,
+                'risk': float(loss_r.item()) if loss_r is not None else 0.0,
+                'feat_distill': 0.0,
+                'corr_distill': 0.0,
+                'edge': 0.0,
+            }
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             self.optimizer.step()
             self.lr_scheduler.step()
-            epoch_loss += loss.item()
+
+            for key in epoch_totals:
+                epoch_totals[key] += batch_metrics[key]
             steps += 1
+            self.loss_per_epoch += loss.item()
 
-            ### 可视化结果
-            
-            if type(scale) == list:
-                scale = scale[-1]
-            if i%int(save_index)==0 and is_main_process():
+            if i % int(save_index) == 0 and is_main_process():
+                self._save_prediction_visuals(
+                    epoch=epoch,
+                    step=i,
+                    phase=phase,
+                    scale=scale,
+                    risk_score=risk_score,
+                    gt_scale_map_with_mask=gt_scale_map_with_mask,
+                    gt_risk_score_map_with_mask=gt_risk_score_map_with_mask,
+                )
 
-                if self.scale_only:
-                    gt_scale = gt_scale_map_with_mask[:,0,:,:]
-                    gt_scale_valid_mask = gt_scale_map_with_mask[:,1,:,:]
-
-                    # 可视化 prediction_scale 和 gt_scale
-                    gt_scale_np = gt_scale[:1].detach().squeeze(0).cpu().numpy()
-                    gt_scale_valid_mask_np = gt_scale_valid_mask[:1].squeeze(0).cpu().detach().bool()
-                    normalized_gt = visual_scale_map_range_image(gt_scale_np, gt_scale_valid_mask_np)
-
-                    scale_np = scale[0].detach().squeeze(0).cpu().numpy()
-                    pred_scale_valid_mask = scale_np > 0
-                    normalized_pred = visual_scale_map_range_image(scale_np, pred_scale_valid_mask)
-
-                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred.png"), -normalized_pred, cmap='seismic', vmin=-1, vmax=1)
-                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt.png"), -normalized_gt, cmap='seismic', vmin=-1, vmax=1)
-
-                else: 
-                    gt_risk_score = gt_risk_score_map_with_mask[:,0,:,:]
-                    gt_risk_score_valid_mask = gt_risk_score_map_with_mask[:,1,:,:]
-                    # 可视化 risk_score 和 gt_risk_score
-                    gt_risk_score_np = gt_risk_score[:1].detach().squeeze(0).cpu().numpy()
-                    gt_risk_score_valid_mask_np = gt_risk_score_valid_mask[:1].squeeze(0).cpu().detach().bool()
-                    normalized_gt_risk_score = visual_risk_score_map_range_image(gt_risk_score_np, gt_risk_score_valid_mask_np)
-
-                    risk_score_np = risk_score[0].detach().squeeze(0).cpu().detach().numpy()
-                    normalized_pred_risk_score = visual_risk_score_map_range_image(risk_score_np, None)
-
-                    # 保存可视化结果
-                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_pred_risk.png"), -normalized_pred_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-                    plt.imsave(os.path.join(out_dir, f"{epoch}_{i}_gt_risk.png"), -normalized_gt_risk_score, cmap='seismic', vmin=-np.pi/2, vmax=np.pi/2)
-
-            loss_last = None
-            # If an auxiliary loss (loss_last) is available, use it for reporting.
-            if loss_last is not None:
-                self.loss_per_epoch += loss.item()
-                self.loss_sum_per_epoch += loss_last.item()
-                if i % 10 == 0 and is_main_process():
-                    print(
-                        f"[{i * self.train_loader.batch_size:5}/{total_samples:5} "
-                        f"({100 * i / len(self.train_loader):3.0f}%)]  "
-                        f"Loss_now (aux): {loss_last.item():6.4f}    "
-                        f"Loss: {loss.item():6.4f}    "
-                    )
-            else:
-                self.loss_per_epoch += loss.item()
-                if i % 10 == 0 and is_main_process():
-                    print(
-                        f"[{i * self.train_loader.batch_size:5}/{total_samples:5} "
-                        f"({100 * i / len(self.train_loader):3.0f}%)]  "
-                        f"Loss_now: {loss.item():6.4f}"
-                    )
+            if i % 10 == 0 and is_main_process():
+                print(
+                    f"[{i * self.train_loader.batch_size:5}/{total_samples:5} "
+                    f"({100 * i / len(self.train_loader):3.0f}%)]  "
+                    f"Loss_now: {batch_metrics['total']:6.4f}  "
+                    f"(task={batch_metrics['task']:6.4f}, "
+                    f"feat={batch_metrics['feat_distill']:6.4f}, "
+                    f"corr={batch_metrics['corr_distill']:6.4f}, "
+                    f"edge={batch_metrics['edge']:6.4f})"
+                )
 
             self.iters += 1
 
-            # 记录每个 batch 的 loss 和全局步数
             global_step = epoch * len(self.train_loader) + i
+            if is_main_process() and (i == 0 or global_step % self.batch_metrics_interval == 0):
+                current_lrs = self._current_lrs()
+                self._append_jsonl(
+                    os.path.join(self.out_dir, 'batch_metrics.jsonl'),
+                    {
+                        'train_branch': self.train_branch,
+                        'global_step': int(global_step),
+                        'epoch': int(epoch),
+                        'step_in_epoch': int(i),
+                        'phase': phase,
+                        'lr': current_lrs['old'],
+                        'lr_old': current_lrs['old'],
+                        'lr_new': current_lrs['new'],
+                        'loss_total': batch_metrics['total'],
+                        'loss_task': batch_metrics['task'],
+                        'loss_scale': batch_metrics['scale'],
+                        'loss_risk': batch_metrics['risk'],
+                        'loss_feat_distill': batch_metrics['feat_distill'],
+                        'loss_corr_distill': batch_metrics['corr_distill'],
+                        'loss_edge': batch_metrics['edge'],
+                        'distill_scale': 0.0,
+                        'lambda_feat_distill': 0.0,
+                        'lambda_corr_distill': 0.0,
+                    },
+                )
             if self.neptune_run is not None and is_main_process():
                 if self.scale_only:
-                    self.neptune_run["train/batch_loss_scale"].append(loss_s.item(), step=global_step)
+                    self.neptune_run["train/batch_loss_scale"].append(batch_metrics['scale'], step=global_step)
                 else:
-                    self.neptune_run["train/batch_loss_risk"].append(loss_r.item(), step=global_step)
+                    self.neptune_run["train/batch_loss_risk"].append(batch_metrics['risk'], step=global_step)
                 for group_idx, pg in enumerate(self.optimizer.param_groups):
                     tag = f"train/batch_learning_rate_group_{group_idx}"
                     self.neptune_run[tag].append(pg["lr"], step=global_step)
         
-        avg_loss = epoch_loss / steps
+        avg_metrics = {key: value / max(1, steps) for key, value in epoch_totals.items()}
+        current_lrs = self._current_lrs()
+        epoch_metrics = {
+            'train_branch': self.train_branch,
+            'epoch': int(epoch),
+            'phase': phase,
+            'lr': current_lrs['old'],
+            'lr_old': current_lrs['old'],
+            'lr_new': current_lrs['new'],
+            'train_loss_total': avg_metrics['total'],
+            'train_loss_task': avg_metrics['task'],
+            'train_loss_scale': avg_metrics['scale'],
+            'train_loss_risk': avg_metrics['risk'],
+            'train_loss_feat_distill': avg_metrics['feat_distill'],
+            'train_loss_corr_distill': avg_metrics['corr_distill'],
+            'train_loss_edge': avg_metrics['edge'],
+            'distill_scale': 0.0,
+            'lambda_feat_distill': 0.0,
+            'lambda_corr_distill': 0.0,
+            'num_steps': int(steps),
+        }
+
+        if is_main_process():
+            self._append_csv_row(
+                os.path.join(self.out_dir, 'epoch_metrics.csv'),
+                [
+                    'train_branch',
+                    'epoch',
+                    'phase',
+                    'lr',
+                    'lr_old',
+                    'lr_new',
+                    'train_loss_total',
+                    'train_loss_task',
+                    'train_loss_scale',
+                    'train_loss_risk',
+                    'train_loss_feat_distill',
+                    'train_loss_corr_distill',
+                    'train_loss_edge',
+                    'distill_scale',
+                    'lambda_feat_distill',
+                    'lambda_corr_distill',
+                    'num_steps',
+                ],
+                epoch_metrics,
+            )
 
         if self.neptune_run is not None and is_main_process():
-            self.neptune_run["train/epoch_loss"].append(avg_loss, step=epoch)
+            self.neptune_run["train/epoch_loss"].append(epoch_metrics['train_loss_total'], step=epoch)
             for group_idx, pg in enumerate(self.optimizer.param_groups):
                 tag = f"train/epoch_learning_rate_group_{group_idx}"
                 self.neptune_run[tag].append(pg["lr"], step=epoch)
+
+        return epoch_metrics
     
     def _weighted_loss(self, keys_s, keys_r, loss_s, loss_r, model_ref):
         """

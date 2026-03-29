@@ -1,5 +1,9 @@
 from PIL import Image
+from collections import Counter
+import json
 import os
+import socket
+import subprocess
 import time
 import numpy as np
 import torch
@@ -33,6 +37,18 @@ parser.add_argument('--image_size', default=[384, 512], type=int, nargs='+',
                     help='image size for training')
 parser.add_argument('--padding_factor', default=16, type=int,
                     help='the input should be divisible by padding_factor, otherwise do padding or resizing')
+parser.add_argument('--train_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/train', type=str,
+                    help='path to the train pkl directory')
+parser.add_argument('--train_info_file', default='nusc_train_infos_key_frames_160_1920_fov_8_15.pkl', type=str,
+                    help='train pkl file name')
+parser.add_argument('--require_complete_depth', action='store_true',
+                    help='only keep samples whose 12 depth maps all exist')
+parser.add_argument('--max_train_samples', default=None, type=int,
+                    help='limit the number of train samples after filtering')
+parser.add_argument('--proj_cache_root',
+                    default='./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_v1',
+                    type=str,
+                    help='root directory of precomputed proj_pix cache')
 
 # evaluation
 parser.add_argument('--eval', action='store_true',
@@ -147,7 +163,7 @@ parser.add_argument('--risk_batch_size',  type=int, default=1,
 parser.add_argument(
     '--scale_pretrained_ckpt',
     type=str, default=None,
-    help='path to pretrained scale‑only model (.pth or .pth.tar)'
+    help='path to pretrained model checkpoint used for full-model initialization (.pth or .pth.tar)'
 )
 
 # neptune
@@ -191,6 +207,139 @@ def build_optimizer(model, args):
         lr=max_lr, weight_decay=args.weight_decay)
     return optimizer
 
+
+def align_state_dict_module_prefix(state_dict, model_keys):
+    if not state_dict:
+        return state_dict
+
+    model_uses_module = any(k.startswith('module.') for k in model_keys)
+    state_uses_module = any(k.startswith('module.') for k in state_dict.keys())
+
+    if model_uses_module == state_uses_module:
+        return state_dict
+
+    if model_uses_module:
+        return {
+            k if k.startswith('module.') else f'module.{k}': v
+            for k, v in state_dict.items()
+        }
+
+    return {
+        k[len('module.'):] if k.startswith('module.') else k: v
+        for k, v in state_dict.items()
+    }
+
+
+def extract_checkpoint_state_dict(checkpoint):
+    if 'model' in checkpoint:
+        return checkpoint['model']
+    if 'net' in checkpoint:
+        return {k.replace('module.', ''): v for k, v in checkpoint['net'].items()}
+    if 'state_dict' in checkpoint:
+        return checkpoint['state_dict']
+    return checkpoint
+
+
+def load_matching_pretrained_weights(model, ckpt_path, device, log_tag='PRETRAIN-INIT'):
+    ckpt = torch.load(ckpt_path, map_location=device)
+    sd = extract_checkpoint_state_dict(ckpt)
+    model_dict = model.state_dict()
+    sd = align_state_dict_module_prefix(sd, model_dict.keys())
+
+    filtered = {}
+    skipped_mismatch = []
+    extra_in_ckpt = []
+
+    for k, v in sd.items():
+        if k in model_dict:
+            if model_dict[k].shape == v.shape:
+                filtered[k] = v
+            else:
+                skipped_mismatch.append((k, tuple(v.shape), tuple(model_dict[k].shape)))
+        else:
+            extra_in_ckpt.append(k)
+
+    missing_after_preload = sorted(set(model_dict.keys()) - set(filtered.keys()))
+
+    model_dict.update(filtered)
+    load_info = model.load_state_dict(model_dict, strict=False)
+
+    return {
+        'loaded_keys': sorted(filtered.keys()),
+        'loaded_count': len(filtered),
+        'skipped_mismatch': skipped_mismatch,
+        'extra_in_ckpt': sorted(extra_in_ckpt),
+        'missing_after_preload': missing_after_preload,
+        'load_info': load_info,
+        'log_tag': log_tag,
+    }
+
+
+def build_load_report(label, path, sd, load_info, extra=None):
+    loaded_keys = sorted(set(sd.keys()) - set(load_info.unexpected_keys))
+    report = {
+        'label': label,
+        'path': path,
+        'loaded_key_count': len(loaded_keys),
+        'missing_key_count': len(load_info.missing_keys),
+        'unexpected_key_count': len(load_info.unexpected_keys),
+        'loaded_keys': loaded_keys,
+        'missing_keys': list(load_info.missing_keys),
+        'unexpected_keys': list(load_info.unexpected_keys),
+    }
+    if extra:
+        report.update(extra)
+    return report
+
+
+def build_preload_report(path, preload_summary):
+    prefix_counter = Counter()
+    for key in preload_summary['loaded_keys']:
+        bare_key = key[len('module.'):] if key.startswith('module.') else key
+        prefix_counter[bare_key.split('.', 1)[0]] += 1
+
+    return {
+        'label': 'scale_pretrained_ckpt',
+        'path': path,
+        'loaded_key_count': preload_summary['loaded_count'],
+        'loaded_keys': list(preload_summary['loaded_keys']),
+        'loaded_prefix_counts': dict(prefix_counter),
+        'skipped_mismatch': [
+            {
+                'name': name,
+                'ckpt_shape': list(src_shape),
+                'model_shape': list(dst_shape),
+            }
+            for name, src_shape, dst_shape in preload_summary['skipped_mismatch']
+        ],
+        'extra_in_ckpt': list(preload_summary['extra_in_ckpt']),
+        'missing_after_preload': list(preload_summary['missing_after_preload']),
+        'load_state_dict_missing_keys': list(preload_summary['load_info'].missing_keys),
+        'load_state_dict_unexpected_keys': list(preload_summary['load_info'].unexpected_keys),
+    }
+
+
+def write_json(path, payload):
+    with open(path, 'w') as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def get_git_metadata():
+    def _git_cmd(cmd_args):
+        try:
+            return subprocess.check_output(
+                ['git'] + cmd_args,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except Exception:
+            return None
+
+    return {
+        'commit': _git_cmd(['rev-parse', 'HEAD']),
+        'branch': _git_cmd(['rev-parse', '--abbrev-ref', 'HEAD']),
+    }
+
 def main():
 
     if args.neptune and ((not args.parallel) or dist.get_rank() == 0):
@@ -209,6 +358,10 @@ def main():
     ).cuda()
 
     start_epoch = 0
+    model_init_info = {
+        'resume': None,
+        'scale_pretrained_ckpt': None,
+    }
 
     # 从预训练的模型加载参数
     if args.resume is not None:
@@ -218,17 +371,21 @@ def main():
             optimizer.load_state_dict(checkpoint['optimizer'])
             start_epoch = checkpoint.get('epoch', 0)
 
-        if 'model' in checkpoint:
-            sd = checkpoint['model']
-        elif 'net' in checkpoint:
-            sd = {k.replace('module.', ''): v for k, v in checkpoint['net'].items()}
-        elif 'state_dict' in checkpoint:
-            sd = checkpoint['state_dict']
-        else:
-            sd = checkpoint
+        sd = extract_checkpoint_state_dict(checkpoint)
+        sd = align_state_dict_module_prefix(sd, model.state_dict().keys())
 
         # 2) 载入并接收加载报告
         load_info = model.load_state_dict(sd, strict=False)
+        model_init_info['resume'] = build_load_report(
+            label='resume',
+            path=args.resume,
+            sd=sd,
+            load_info=load_info,
+            extra={
+                'resume_epoch': int(start_epoch),
+                'optimizer_loaded': bool(args.load_opt),
+            },
+        )
 
         # 3) 打印一下各类 key
         if is_main_process():
@@ -256,46 +413,74 @@ def main():
     else:
         os.makedirs(out_dir, exist_ok=True)
 
+    if args.scale_pretrained_ckpt is not None:
+        preload_summary = load_matching_pretrained_weights(
+            model,
+            args.scale_pretrained_ckpt,
+            device,
+            log_tag='PRETRAIN-INIT',
+        )
+        model_init_info['scale_pretrained_ckpt'] = build_preload_report(
+            args.scale_pretrained_ckpt,
+            preload_summary,
+        )
+        if is_main_process():
+            prefix_counter = Counter()
+            for k in preload_summary['loaded_keys']:
+                bare_k = k[len('module.'):] if k.startswith('module.') else k
+                prefix_counter[bare_k.split('.', 1)[0]] += 1
+
+            print(f"[{preload_summary['log_tag']}] Loaded {preload_summary['loaded_count']} matching keys.")
+            print(f"[{preload_summary['log_tag']}] Loaded prefix counts: {dict(prefix_counter)}")
+
+            if preload_summary['skipped_mismatch']:
+                print(f"[{preload_summary['log_tag']}] Skipped mismatched keys:")
+                for name, src_shape, dst_shape in preload_summary['skipped_mismatch']:
+                    print(f"    {name}: ckpt={src_shape} model={dst_shape}")
+
+            print(
+                f"[{preload_summary['log_tag']}] Missing model keys after preload: "
+                f"{len(preload_summary['missing_after_preload'])}"
+            )
+            if preload_summary['missing_after_preload']:
+                for name in preload_summary['missing_after_preload']:
+                    print("   ", name)
+
+            if preload_summary['extra_in_ckpt']:
+                print(
+                    f"[{preload_summary['log_tag']}] Checkpoint keys not used by model: "
+                    f"{len(preload_summary['extra_in_ckpt'])}"
+                )
+                for name in preload_summary['extra_in_ckpt']:
+                    print("   ", name)
+
+            if preload_summary['load_info'].missing_keys:
+                print(
+                    f"[{preload_summary['log_tag']}] load_state_dict missing_keys: "
+                    f"{preload_summary['load_info'].missing_keys}"
+                )
+            if preload_summary['load_info'].unexpected_keys:
+                print(
+                    f"[{preload_summary['log_tag']}] load_state_dict unexpected_keys: "
+                    f"{preload_summary['load_info'].unexpected_keys}"
+                )
+
     if is_main_process():
+        write_json(os.path.join(out_dir, 'run_config.json'), {
+            'args': vars(args),
+            'git': get_git_metadata(),
+            'time_stamp': time_stamp,
+            'out_dir': out_dir,
+            'hostname': socket.gethostname(),
+            'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+        })
+        write_json(os.path.join(out_dir, 'model_init.json'), model_init_info)
         print('Start Loading ...')
 
     dataset = datasets.fetch_dataloader(args) 
     
     # stage 1: train scale branch
     if args.train_stage in ('scale', 'both'):
-        ########################### LOAD PRETRAINED SCALE MODEL ###########################
-        if args.scale_pretrained_ckpt is not None:
-            ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
-            # 提取 state_dict
-            if 'model' in ckpt:
-                sd = ckpt['model']
-            elif 'net' in ckpt:
-                # 去掉 DDP 的 module. 前缀
-                sd = {k.replace('module.', ''): v for k, v in ckpt['net'].items()}
-            elif 'state_dict' in ckpt:
-                sd = ckpt['state_dict']
-            else:
-                sd = ckpt
-
-            # 只挑出 cnet/featnet/corrnet 的参数
-            prefixes = ('cnet.', 'featnet.', 'corrnet.')
-            filtered = {}
-            for k, v in sd.items():
-                if any(k.startswith(pref) for pref in prefixes):
-                    filtered[k] = v
-
-            # 注入到当前模型里
-            model_dict = model.state_dict()
-            model_dict.update(filtered)
-            load_info = model.load_state_dict(model_dict, strict=False)
-            if is_main_process():
-                loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
-                print(f"[SCALE-INIT] Loaded {len(loaded)} keys for scale backbone:")
-                for k in sorted(loaded):
-                    print("   ", k)
-                if load_info.missing_keys:
-                    print(f"[SCALE-INIT] Missing keys: {load_info.missing_keys}")
-            ##########################################################################
         # 1) freeze risk branch
         freeze_prefixes = (
             # 

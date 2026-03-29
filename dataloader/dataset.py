@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import torch
 import torch.utils.data as data
@@ -6,6 +7,7 @@ import os
 import pickle
 from glob import glob
 import os.path as osp
+from pathlib import Path
 from tqdm import tqdm
 
 from .utils.augmentor import NuscRangeImageAugmentor
@@ -15,97 +17,220 @@ from scipy.ndimage import distance_transform_edt
 from fpttc.scale_net.utils.spherical import build_lidar_to_camera_projection
 from utils.nusc_paths import infer_nusc_dataset_root, resolve_nusc_depth_pred_path, resolve_nusc_path
 
+CAMERA_CHANNELS = [
+    'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+    'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT'
+]
+DEFAULT_NUSC_PROJ_CACHE_NAME = 'nusc_150_keyframes_160x320_fov8_15_v1'
+
+
+def _default_nusc_proj_cache_root(dataset_root):
+    return Path(dataset_root) / '5_proj_cache' / DEFAULT_NUSC_PROJ_CACHE_NAME
+
+
+def _infer_nusc_split_name(train_info_path, train_info_file):
+    path_name = Path(train_info_path).name.lower()
+    if path_name in {'train', 'val', 'test'}:
+        return path_name
+
+    file_name = train_info_file.lower()
+    if 'nusc_train_' in file_name:
+        return 'train'
+    if 'nusc_val_' in file_name:
+        return 'val'
+    if 'nusc_test_' in file_name:
+        return 'test'
+
+    raise ValueError(
+        f'Unable to infer split from train_info_path={train_info_path} '
+        f'and train_info_file={train_info_file}'
+    )
+
+
+def _load_proj_cache_manifest(cache_root, split_name):
+    manifest_pkl = cache_root / split_name / 'manifest.pkl'
+    manifest_json = cache_root / split_name / 'manifest.json'
+
+    if manifest_pkl.exists():
+        with open(manifest_pkl, 'rb') as f:
+            manifest = pickle.load(f)
+    elif manifest_json.exists():
+        manifest = json.loads(manifest_json.read_text())
+    else:
+        return None
+
+    entries = manifest['entries'] if isinstance(manifest, dict) and 'entries' in manifest else manifest
+    if not isinstance(entries, list):
+        raise ValueError(f'Unsupported manifest format: {manifest_pkl if manifest_pkl.exists() else manifest_json}')
+
+    return {int(entry['original_index']): entry for entry in entries}
+
+
+def _validate_proj_cache_meta(cache_root, crop_size):
+    meta_path = cache_root / 'cache_meta.json'
+    if not meta_path.exists():
+        return
+
+    meta = json.loads(meta_path.read_text())
+    expected_crop = [int(crop_size[0]), int(crop_size[1])]
+    if meta.get('image_size') != expected_crop:
+        raise ValueError(
+            f'Projection cache image_size mismatch: cache={meta.get("image_size")} '
+            f'expected={expected_crop}'
+        )
+
+    if meta.get('camera_order') != CAMERA_CHANNELS:
+        raise ValueError('Projection cache camera_order mismatch.')
+
+    if meta.get('H_r') != 40 or meta.get('W_r') != 480:
+        raise ValueError('Projection cache range-view resolution mismatch.')
+
+    if meta.get('fov_up') != 8.0 or meta.get('fov_down') != -15.0:
+        raise ValueError('Projection cache FOV mismatch.')
+
+    if meta.get('augmentor', {}).get('do_flip') is not False or meta.get('augmentor', {}).get('rotate') is not False:
+        raise ValueError('Projection cache was generated with incompatible augmentation settings.')
+
+
+def _build_nusc_sensor_meta(info, frame_key, affine_matrix):
+    sensor_metas_channel = {}
+    sensor_metas = info[f'sensor_metas_{frame_key}']
+
+    for channel in CAMERA_CHANNELS:
+        _, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
+            sensor_metas,
+            sensor_metas['camera']['calibrated_sensor'][channel],
+            sensor_metas['camera']['ego_pose'][channel]
+        )
+        sensor_metas_channel[channel] = {
+            'K': np.asarray(K, dtype=np.float32),
+            'R_l2c': np.asarray(R_l2c, dtype=np.float32),
+            't_l2c': np.asarray(t_l2c, dtype=np.float32),
+            'affine': np.asarray(affine_matrix, dtype=np.float32),
+        }
+
+    return sensor_metas_channel
+
+
+def _tensorize_sensor_metas(sensor_metas):
+    tensorized = {}
+    for frame_key, frame_sensor_metas in sensor_metas.items():
+        tensorized[frame_key] = {}
+        for channel, channel_metas in frame_sensor_metas.items():
+            tensorized[frame_key][channel] = {
+                key: torch.from_numpy(np.asarray(value)).float()
+                for key, value in channel_metas.items()
+            }
+    return tensorized
+
+
 class nuScenes_range_image(data.Dataset):
     def __init__(self,
                  aug_params=None,
                  split='training',
                  train_info_path='./Datasets/nuscenes/2_trainval_test_infos/train',
-                 train_info_file='nusc_train_infos_key_frames_160_1920_fov_8_15.pkl'
+                 train_info_file='nusc_train_infos_key_frames_160_1920_fov_8_15.pkl',
+                 require_complete_depth=False,
+                 max_samples=None,
+                 proj_cache_root=None,
                  ):
         self.aug_params = aug_params
         self.split = split
-        # self.root = root
         self.train_info_path = train_info_path
         self.train_info_file = train_info_file
+        self.require_complete_depth = require_complete_depth
+        self.max_samples = max_samples
         self.dataset_root = infer_nusc_dataset_root(self.train_info_path)
-        self.data = None  # 用于存储从 pkl 文件中加载的数据
-        # self.train_location = train_location
+        self.proj_cache_root = Path(proj_cache_root) if proj_cache_root is not None else _default_nusc_proj_cache_root(self.dataset_root)
+        self.split_name = _infer_nusc_split_name(self.train_info_path, self.train_info_file)
+        self.camera_channels = CAMERA_CHANNELS
 
-        # 根据 split 加载对应的 pkl 文件
         pkl_file_path = osp.join(self.train_info_path, self.train_info_file)
-
-        # 检查文件是否存在
         if osp.exists(pkl_file_path):
             with open(pkl_file_path, 'rb') as f:
-                self.data = pickle.load(f)
+                loaded_data = pickle.load(f)
             print(f"Loaded data from {pkl_file_path}")
         else:
             raise FileNotFoundError(f"No such file: {pkl_file_path}")
 
-        # 数据增强设置
+        original_samples = len(loaded_data)
+        complete_depth_samples = original_samples
+        filtered_samples = []
+        for original_index, info in enumerate(loaded_data):
+            if self.require_complete_depth and not self._has_complete_depth(info):
+                continue
+            filtered_samples.append((original_index, info))
+
+        if self.require_complete_depth:
+            complete_depth_samples = len(filtered_samples)
+
+        if self.max_samples is not None:
+            filtered_samples = filtered_samples[:self.max_samples]
+
+        self.samples = filtered_samples
+        final_samples = len(self.samples)
+        if self.require_complete_depth or self.max_samples is not None:
+            print(
+                "[nuScenes_range_image] sample stats: "
+                f"original={original_samples}, "
+                f"complete_depth={complete_depth_samples}, "
+                f"final={final_samples}"
+            )
+
+        if final_samples == 0:
+            raise ValueError(
+                "No samples available for nuScenes_range_image after filtering. "
+                "Check the current pkl and 4_depth_map coverage."
+            )
+
         self.augmentor = None
         if self.aug_params is not None:
-            self.augmentor = NuscRangeImageAugmentor(**self.aug_params)      
-        # 获取数据增强的 affine 参数
+            self.augmentor = NuscRangeImageAugmentor(**self.aug_params)
         orig_size = (1600, 900)  # (W, H)
         self.affine_params = self.augmentor.sample_params(orig_size)
         self.affine_matrix = self.augmentor.get_affine_matrix(self.affine_params)
-        
-        self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-                                'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
 
-        # pkl 文件中包含：
-        # - surround view images pairs (nusc sample data format)
-        # - lidar data pairs (nusc sample data format)
-        # - sensor metas (including calibrated infos and ego pose infos of LiDAR and cameras)
-        # - gt range images path (including scale map, depth map and risk score map)
-        # - nuscenes scene flow pointcloud path
-        self.image_list = [] # input images
-        self.sensor_meta_list = []
-        self.scale_map_list = [] # ground truth
-        self.risk_score_map_list = []
-        # [TODO] 目前 depth map 是将碰撞点反投影回图像平面时使用的，仅在可视化时使用
-        self.depth_map_list = []
-
-        self.proj_list = [] # 记录 环视图 (cam_idx, u, v) 和 range image (u, v) 的映射关系
-
-        # 在加载数据集时离线构建 spherical voxel grid
-        # 结合 DepthAnything 预测的 Depth Pred Map，提前计算每一个像素坐标对应的 Range View 坐标
-
-        for i in tqdm(range(len(self.data)), desc='Loading nuScenes Range Image Dataset'):
-            
-            # 1. 模型 Input
-            self.image_list.append([self.data[i]['prev_camera_data'],
-                                    self.data[i]['curr_camera_data']])
-            
-            # 2. Ground Truth Range Image —— Scale Map, Risk Score Map, Depth Map
-            range_image_dir = resolve_nusc_path(self.data[i]['gt_map_path'], self.dataset_root)
-            range_image_path = os.path.join(str(range_image_dir), 'range_image_curr.npy')
-            if not osp.exists(range_image_path):
-                raise FileNotFoundError(f"Range image file {range_image_path} does not exist.")
-            range_image = np.load(range_image_path, allow_pickle=True).item()
-            self.scale_map_list.append(range_image['scale'])
-            self.risk_score_map_list.append(range_image['risk_score'])
-            self.depth_map_list.append(range_image['depth'])
-
-            # 3. 环视图像 (cam_idx, u, v) 与 range image (u, v) 之间的映射关系
-            #    通过 DepthAnything 预测的 Depth Pred Map + 内外参 计算得到
-            proj_range_prev, proj_pix_prev, sensor_metas_prev = build_frame_mapping(self.data, 'nusc', 'prev', None,
-                                                                                    self.affine_matrix, i,
-                                                                                    dataset_root=self.dataset_root,
-                                                                                    H_r=40, W_r=480)
-            proj_range_curr, proj_pix_curr, sensor_metas_curr = build_frame_mapping(self.data, 'nusc', 'curr', None,
-                                                                                    self.affine_matrix, i,
-                                                                                    dataset_root=self.dataset_root,
-                                                                                    H_r=40, W_r=480)
-            self.proj_list.append([proj_pix_prev, proj_pix_curr])
-            sensor_metas = {'prev': sensor_metas_prev, 'curr': sensor_metas_curr}
-            self.sensor_meta_list.append(sensor_metas)
+        _validate_proj_cache_meta(self.proj_cache_root, self.aug_params['crop_size'])
+        manifest_by_original_index = _load_proj_cache_manifest(self.proj_cache_root, self.split_name)
+        self.cache_entries = None
+        if manifest_by_original_index is not None:
+            self.cache_entries = []
+            for original_index, _ in self.samples:
+                if original_index not in manifest_by_original_index:
+                    raise KeyError(
+                        f'Missing cache entry for original_index={original_index} '
+                        f'in {self.proj_cache_root / self.split_name}'
+                    )
+                entry = dict(manifest_by_original_index[original_index])
+                cache_path = self.proj_cache_root / entry['cache_relpath']
+                if not cache_path.exists():
+                    raise FileNotFoundError(f'Projection cache file {cache_path} does not exist.')
+                entry['cache_path'] = cache_path
+                self.cache_entries.append(entry)
+            print(f"Loaded projection cache from {self.proj_cache_root / self.split_name}")
+        else:
+            print(
+                f"[nuScenes_range_image] projection cache not found under "
+                f"{self.proj_cache_root / self.split_name}; "
+                "falling back to on-the-fly proj mapping."
+            )
 
     def __len__(self):
-        return len(self.image_list)
+        return len(self.samples)
+
+    def _has_complete_depth(self, info):
+        for frame_key in ['prev_camera_data', 'curr_camera_data']:
+            for channel in self.camera_channels:
+                depth_path = resolve_nusc_depth_pred_path(
+                    info[frame_key][channel],
+                    self.dataset_root,
+                )
+                if depth_path is None or not depth_path.exists():
+                    return False
+        return True
 
     def __getitem__(self, index):
+        _, info = self.samples[index]
 
         prev_surr_view_imgs = {}
         curr_surr_view_imgs = {}
@@ -113,52 +238,60 @@ class nuScenes_range_image(data.Dataset):
         prev_surr_view_depths = {}
         curr_surr_view_depths = {}
 
-        camera_channels = self.camera_channels    
-        # 1. 按照相机通道读取相邻帧的图像和深度预测结果
+        camera_channels = self.camera_channels
         for channel in camera_channels:
-            # 1）读取相邻帧的图像
             prev_surr_view_imgs_path = resolve_nusc_path(
-                self.image_list[index][0][channel]['filename'],
+                info['prev_camera_data'][channel]['filename'],
                 self.dataset_root,
             )
             prev_surr_view_imgs[channel] = Image.open(prev_surr_view_imgs_path)
 
             curr_surr_view_imgs_path = resolve_nusc_path(
-                self.image_list[index][1][channel]['filename'],
+                info['curr_camera_data'][channel]['filename'],
                 self.dataset_root,
             )
             curr_surr_view_imgs[channel] = Image.open(curr_surr_view_imgs_path)
 
-            # 2) 读取相邻帧的 Depth Pred Map (DepthAnythingV2 Metric)
             prev_surr_view_depths_path = resolve_nusc_depth_pred_path(
-                self.image_list[index][0][channel],
+                info['prev_camera_data'][channel],
                 self.dataset_root,
             )
             prev_surr_view_depths[channel] = np.load(prev_surr_view_depths_path)
 
             curr_surr_view_depths_path = resolve_nusc_depth_pred_path(
-                self.image_list[index][1][channel],
+                info['curr_camera_data'][channel],
                 self.dataset_root,
             )
             curr_surr_view_depths[channel] = np.load(curr_surr_view_depths_path)
 
-        # 2. 获取 ground truth 的 scale map、risk score map 和 depth map
-        gt_scale_map      = self.scale_map_list[index]
-        gt_risk_score_map = self.risk_score_map_list[index]
-        gt_depth_map      = self.depth_map_list[index]
+        range_image_dir = resolve_nusc_path(info['gt_map_path'], self.dataset_root)
+        range_image_path = Path(range_image_dir) / 'range_image_curr.npy'
+        if not range_image_path.exists():
+            raise FileNotFoundError(f"Range image file {range_image_path} does not exist.")
+        range_image = np.load(range_image_path, allow_pickle=True).item()
+        gt_scale_map = range_image['scale']
+        gt_risk_score_map = range_image['risk_score']
 
-        # 3. 获取 (cam_idx, u, v) 到 range image (u, v) 的映射关系
-        proj_pix_prev, proj_pix_curr = self.proj_list[index]
-
-        # 4. 对 input 图像进行数据增强
         orig_size = next(iter(prev_surr_view_imgs.values())).size  # (W, H)
         affine_params = self.augmentor.sample_params(orig_size)
         prev_surr_view_imgs, _ = self.augmentor(prev_surr_view_imgs, affine_params)
         curr_surr_view_imgs, _ = self.augmentor(curr_surr_view_imgs, affine_params)
         affine_matrix = self.augmentor.get_affine_matrix(affine_params)
-        
-        # 5. 将上述收集的信息转换为 Tensor
-        # 1）将 input 图像和 depth pred map 转换为 Tensor
+
+        if self.cache_entries is not None:
+            with np.load(self.cache_entries[index]['cache_path']) as cache_npz:
+                proj_pix_prev = cache_npz['proj_pix_prev']
+                proj_pix_curr = cache_npz['proj_pix_curr']
+        else:
+            _, proj_pix_prev, _ = build_frame_mapping(
+                info, 'nusc', 'prev', None, affine_matrix,
+                idx=None, dataset_root=self.dataset_root, H_r=40, W_r=480
+            )
+            _, proj_pix_curr, _ = build_frame_mapping(
+                info, 'nusc', 'curr', None, affine_matrix,
+                idx=None, dataset_root=self.dataset_root, H_r=40, W_r=480
+            )
+
         for channel in camera_channels:
             prev_surr_view_imgs[channel] = torch.from_numpy(prev_surr_view_imgs[channel]).permute(2, 0, 1).float()
             curr_surr_view_imgs[channel] = torch.from_numpy(curr_surr_view_imgs[channel]).permute(2, 0, 1).float()
@@ -173,27 +306,20 @@ class nuScenes_range_image(data.Dataset):
         prev_surr_view_depths_tensor = prev_surr_view_depths_tensor.unsqueeze(1)
         curr_surr_view_depths_tensor = curr_surr_view_depths_tensor.unsqueeze(1)
 
-        # 2）将 ground truth 的 scale map、risk score map 和 depth map 转换为 Tensor
         gt_scale_map = torch.from_numpy(gt_scale_map).float()
         gt_risk_score_map = torch.from_numpy(gt_risk_score_map).float()
-        gt_depth_map = torch.from_numpy(gt_depth_map).float()
         mask_scale = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
         gt_scale_map_with_mask = torch.cat((gt_scale_map.unsqueeze(0), mask_scale.unsqueeze(0).float()), dim=0)
         gt_risk_map_with_mask  = torch.cat((gt_risk_score_map.unsqueeze(0), mask_scale.unsqueeze(0).float()), dim=0)
 
-        # 3）将 (cam_idx, u, v) 到 range image (u, v) 的映射关系转换为 Tensor
         proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
         proj_pix_curr_tensor = torch.from_numpy(proj_pix_curr.astype(np.int64))   # (M, 3)
 
-        # # 4) 将图像增强的仿射矩阵转换为 Tensor
-        # affine_matrix = torch.from_numpy(affine_matrix)
-
-        # 5) 将 sensor meta 转换为 Tensor
-        sensor_metas = self.sensor_meta_list[index]
-        for frame_key in ['prev', 'curr']:
-            for channel in camera_channels:
-                for k, v in sensor_metas[frame_key][channel].items():
-                    sensor_metas[frame_key][channel][k] = torch.from_numpy(np.asarray(v)).float()
+        sensor_metas = {
+            'prev': _build_nusc_sensor_meta(info, 'prev', affine_matrix),
+            'curr': _build_nusc_sensor_meta(info, 'curr', affine_matrix),
+        }
+        sensor_metas = _tensorize_sensor_metas(sensor_metas)
 
         return (prev_surr_view_imgs_tensor,
                 curr_surr_view_imgs_tensor,
@@ -206,17 +332,14 @@ class nuScenes_range_image(data.Dataset):
                 sensor_metas)
 
     def __rmul__(self, v):
-        self.image_list          = v * self.image_list
-        self.scale_map_list      = v * self.scale_map_list
-        self.risk_score_map_list = v * self.risk_score_map_list
-        self.depth_map_list      = v * self.depth_map_list
-        self.proj_list           = v * self.proj_list
-        self.sensor_meta_list    = v * self.sensor_meta_list
+        self.samples = v * self.samples
+        if self.cache_entries is not None:
+            self.cache_entries = v * self.cache_entries
         return self
 
 
 def build_frame_mapping(data, dataset_key, frame_key, depth_map,
-                        affine_matrix, idx, dataset_root='./Datasets/nuscenes',
+                        affine_matrix=None, idx=None, dataset_root='./Datasets/nuscenes',
                         H_r=40, W_r=480, visualize=False):
     """
     读取该帧的相机深度预测结果，以及内外参信息，将其反投影到 LiDAR 坐标系
@@ -224,8 +347,14 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
     以及 (cam_idx, u, v) 到 range image (u, v) 的映射关系
     该映射关系用于后续的多视角特征融合
     """
-    camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-                       'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+    sample_info = data if idx is None else data[idx]
+    if isinstance(depth_map, np.ndarray) and depth_map.shape == (3, 3) and isinstance(affine_matrix, (int, np.integer)):
+        idx = int(affine_matrix)
+        affine_matrix = depth_map
+        depth_map = None
+        sample_info = data[idx]
+
+    camera_channels = CAMERA_CHANNELS
     all_points = []
     all_pix    = []
     sensor_metas_channel = {}
@@ -236,38 +365,34 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
         #    将 LiDAR --> Ego_LiDAR_Frame --> Global --> Ego_Camera_Frame --> Camera 的外参投影矩阵合并
         #    得到 LiDAR --> Camera 的旋转、平移矩阵
         if dataset_key == 'sjtu':
-            K = data[idx][f'sensor_metas_{frame_key}'][channel]['K_undist']
-            R_l2c = data[idx][f'sensor_metas_{frame_key}'][channel]['R_l2c']
-            t_l2c = data[idx][f'sensor_metas_{frame_key}'][channel]['t_l2c']
+            K = sample_info[f'sensor_metas_{frame_key}'][channel]['K_undist']
+            R_l2c = sample_info[f'sensor_metas_{frame_key}'][channel]['R_l2c']
+            t_l2c = sample_info[f'sensor_metas_{frame_key}'][channel]['t_l2c']
             sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c, 'affine': affine_matrix}
             
             sensor_metas_channel[channel] = sensor_meta
 
-            # 3) 根据深度图和相机内外参，将像素坐标转换为 LiDAR 坐标系下的 XYZ 坐标
             depth_pred_map = depth_map[channel]
             coords = get_geometry(depth_pred_map, sensor_meta, affine_matrix)  # (H_img, W_img, 3)
             coords_n = coords.copy() 
-            # 翻转 x、y
-            coords_n[:, :, 0] *= -1            # x_n = -x_local
-            coords_n[:, :, 1] *= -1            # y_n = -y_local
+            coords_n[:, :, 0] *= -1
+            coords_n[:, :, 1] *= -1
 
         elif dataset_key == 'nusc':
-            # # 读取 idx 帧、cam_idx 相机的 depth pred map
             depth_pred_path = resolve_nusc_depth_pred_path(
-                data[idx][f'{frame_key}_camera_data'][channel],
+                sample_info[f'{frame_key}_camera_data'][channel],
                 dataset_root,
             )
             depth_map  = np.load(depth_pred_path)  # (H_img, W_img)
             proj_matrix, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
-                data[idx][f'sensor_metas_{frame_key}'],
-                data[idx][f'sensor_metas_{frame_key}']['camera']['calibrated_sensor'][channel],
-                data[idx][f'sensor_metas_{frame_key}']['camera']['ego_pose'][channel]
+                sample_info[f'sensor_metas_{frame_key}'],
+                sample_info[f'sensor_metas_{frame_key}']['camera']['calibrated_sensor'][channel],
+                sample_info[f'sensor_metas_{frame_key}']['camera']['ego_pose'][channel]
             )
             sensor_meta = {'K': K, 'R_l2c': R_l2c, 't_l2c': t_l2c, 'affine': affine_matrix}
 
             sensor_metas_channel[channel] = sensor_meta
 
-            # 3) 根据深度图和相机内外参，将像素坐标转换为 LiDAR 坐标系下的 XYZ 坐标
             coords = get_geometry(depth_map, sensor_meta, affine_matrix)  # (H_img, W_img, 3)
             coords_n = coords.copy()   
 
@@ -333,17 +458,11 @@ def build_frame_mapping(data, dataset_key, frame_key, depth_map,
         plt.imshow(proj_range_norm, cmap='jet', vmin=0, vmax=1)
         plt.axis('off')
         plt.tight_layout()
-        plt.savefig(f"./Datasets/cyberrock/scene_7/depth_vis/{frame_key}_normalized_range_{idx}.png", bbox_inches='tight', pad_inches=0)
+        sample_index = idx if idx is not None else 'sample'
+        plt.savefig(f"./Datasets/cyberrock/scene_7/depth_vis/{frame_key}_normalized_range_{sample_index}.png", bbox_inches='tight', pad_inches=0)
         plt.close()
 
     return proj_range, proj_pix, sensor_metas_channel
-
-
-
-CAMERA_CHANNELS = [
-    'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-    'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT'
-]
 
 def _precompute_pix_orig(H_img: int, W_img: int, affine_matrix: np.ndarray) -> np.ndarray:
     """
@@ -597,12 +716,15 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
 
     if args.stage == 'nuscenes_range_image':
         aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
-        train_info_file = 'nusc_train_infos_key_frames_160_1920_fov_8_15.pkl'
-        train_info_path = './Datasets/nuscenes/2_trainval_test_infos/train'
+        train_info_file = args.train_info_file
+        train_info_path = args.train_info_path
 
         nuscenes = nuScenes_range_image(aug_params,
                                         train_info_file=train_info_file,
                                         train_info_path=train_info_path,
+                                        require_complete_depth=getattr(args, 'require_complete_depth', False),
+                                        proj_cache_root=getattr(args, 'proj_cache_root', None),
+                                        max_samples=getattr(args, 'max_train_samples', None),
                                         split='training')
 
         train_dataset = 1*nuscenes
