@@ -44,6 +44,10 @@ parser.add_argument('--require_complete_depth', action='store_true',
                     help='only keep samples whose 12 depth maps all exist')
 parser.add_argument('--max_train_samples', default=None, type=int,
                     help='limit the number of train samples after filtering')
+parser.add_argument('--sample_subset_mode', choices=['head', 'random_fixed'], default='head',
+                    help='subset selection strategy when max_train_samples is set')
+parser.add_argument('--sample_subset_seed', default=326, type=int,
+                    help='seed for fixed random subset selection')
 parser.add_argument('--proj_cache_root',
                     default='./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_v1',
                     type=str,
@@ -181,6 +185,8 @@ parser.add_argument('--use_internal_depth_guidance', action='store_true',
                     help='train with an internal depth-distribution head that guides RVT bin selection')
 parser.add_argument('--depth_loss_weight', type=float, default=0.5,
                     help='weight for internal depth-distribution supervision')
+parser.add_argument('--aggregation_mode', choices=['rvt', 'hardproj_cache'], default='rvt',
+                    help='how multi-view features are aggregated into range-view features')
 parser.add_argument('--depth_selection_mode', choices=['soft', 'hard_topk'], default='hard_topk',
                     help='how depth prior influences RVT candidate selection')
 parser.add_argument('--bootstrap_topk', type=int, default=4,
@@ -195,6 +201,19 @@ parser.add_argument('--depth_prior_eps', type=float, default=1e-6,
                     help='epsilon for stable log(depth_prior)')
 parser.add_argument('--activation_checkpointing', action='store_true',
                     help='enable activation checkpointing on the heaviest transformer stacks')
+parser.add_argument('--backbone_type', choices=['cnn', 'da_vits', 'dual_backbone'], default='cnn',
+                    help='backbone type for RGB feature extraction')
+parser.add_argument('--da_pretrained_ckpt', type=str,
+                    default='pretrained/depth_anything_v2_metric_vkitti_vits.pth',
+                    help='checkpoint path for the frozen metric DepthAnything ViT-S backbone')
+parser.add_argument('--da_branch_mode', choices=['off', 'log'], default='off',
+                    help='dual_backbone only: keep the DA branch disabled or run it only for logging')
+parser.add_argument('--use_adapter_alignment_teacher', action='store_true',
+                    help='use a frozen RGBD cnet teacher to align DA adapter features before featnet')
+parser.add_argument('--adapter_warmup_epochs', type=int, default=5,
+                    help='number of warmup epochs that train only DA adapters with feature alignment')
+parser.add_argument('--adapter_align_weight', type=float, default=0.1,
+                    help='weight for adapter-to-cnet feature alignment after warmup')
 
 # 加载预训练的单分支模型：
 parser.add_argument(
@@ -209,6 +228,38 @@ parser.add_argument('--neptune', action='store_true',
 
 args = parser.parse_args()
 
+if args.backbone_type == 'dual_backbone':
+    args.aggregation_mode = 'hardproj_cache'
+    args.no_depth = True
+    args.use_teacher_distill = False
+    args.use_internal_depth_guidance = False
+    args.depth_loss_weight = 0.0
+
+if args.aggregation_mode == 'hardproj_cache':
+    args.use_teacher_distill = False
+    args.use_internal_depth_guidance = False
+    args.depth_loss_weight = 0.0
+elif args.backbone_type == 'da_vits':
+    args.depth_loss_weight = 0.0
+
+if args.use_adapter_alignment_teacher and args.backbone_type != 'da_vits':
+    raise ValueError("--use_adapter_alignment_teacher is only supported with --backbone_type da_vits.")
+
+if args.backbone_type == 'dual_backbone' and args.use_adapter_alignment_teacher:
+    raise ValueError("--use_adapter_alignment_teacher is not supported with --backbone_type dual_backbone.")
+
+if args.backbone_type != 'dual_backbone' and args.da_branch_mode != 'off':
+    raise ValueError("--da_branch_mode is only supported with --backbone_type dual_backbone.")
+
+if args.backbone_type == 'dual_backbone' and args.train_stage != 'scale':
+    raise ValueError("--backbone_type dual_backbone currently supports only --train_stage scale.")
+
+if args.use_adapter_alignment_teacher and args.resume is None and args.scale_pretrained_ckpt is None:
+    raise ValueError(
+        "Adapter alignment teacher requires a pretrained old cnet. "
+        "Please provide --scale_pretrained_ckpt or resume from a checkpoint that already contains cnet_teacher weights."
+    )
+
 if args.parallel:
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -220,7 +271,38 @@ else:
     device = torch.device("cuda", 0)
     parallel = False
 
-OLD_MODULE_PREFIXES = ('cnet.', 'featnet.', 'corrnet.')
+def get_old_module_prefixes(args):
+    backbone_type = getattr(args, 'backbone_type', 'cnn')
+    if backbone_type == 'da_vits':
+        prefixes = ['featnet.', 'corrnet.']
+        if getattr(args, 'aggregation_mode', 'rvt') == 'hardproj_cache':
+            prefixes.extend([
+                'conv_corr_rvt_in.',
+                'conv_corr_rvt_out.',
+                'scale_net.',
+            ])
+        return tuple(prefixes)
+    if backbone_type == 'dual_backbone':
+        prefixes = ['cnet.', 'featnet.', 'corrnet.']
+        if getattr(args, 'aggregation_mode', 'rvt') == 'hardproj_cache':
+            prefixes.extend([
+                'conv_corr_rvt_in.',
+                'conv_corr_rvt_out.',
+                'scale_net.',
+            ])
+        return tuple(prefixes)
+    return ('cnet.', 'featnet.', 'corrnet.')
+
+
+def is_forced_frozen_param(name, args):
+    bare_name = strip_module_prefix(name)
+    if getattr(args, 'backbone_type', 'cnn') == 'da_vits' and bare_name.startswith('cnet.backbone.'):
+        return True
+    if getattr(args, 'backbone_type', 'cnn') == 'dual_backbone' and bare_name.startswith('da_branch.'):
+        return True
+    if bare_name.startswith('cnet_teacher.'):
+        return True
+    return False
 
 
 def strip_module_prefix(name):
@@ -260,10 +342,12 @@ def build_optimizer(model, args):
     new_ini_lr = new_max_lr / 25
     new_min_lr = new_ini_lr / 1e4
 
+    old_module_prefixes = get_old_module_prefixes(args)
+
     grouped = {
         'old': {
             'params': [],
-            'prefixes': list(OLD_MODULE_PREFIXES),
+            'prefixes': list(old_module_prefixes),
             'max_lr': old_max_lr,
             'initial_lr': old_ini_lr,
             'min_lr': old_min_lr,
@@ -283,7 +367,7 @@ def build_optimizer(model, args):
         if not p.requires_grad:
             continue
         bare_name = strip_module_prefix(name)
-        group_name = 'old' if any(bare_name.startswith(prefix) for prefix in OLD_MODULE_PREFIXES) else 'new'
+        group_name = 'old' if any(bare_name.startswith(prefix) for prefix in old_module_prefixes) else 'new'
         grouped[group_name]['params'].append(p)
         tensor_counts[group_name] += 1
         param_counts[group_name] += p.numel()
@@ -365,6 +449,119 @@ def write_json(path, payload):
         json.dump(payload, f, indent=2, sort_keys=True)
 
 
+def load_scale_pretrained_components(model, args, device, out_dir, model_init_info):
+    ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
+    sd = extract_checkpoint_state_dict(ckpt)
+
+    model_dict = model.state_dict()
+    model_keys = model_dict.keys()
+    sd = align_state_dict_module_prefix(sd, model_keys)
+
+    has_module_prefix = any(k.startswith('module.') for k in model_keys)
+    if has_module_prefix:
+        if args.backbone_type == 'da_vits':
+            prefixes = ['module.featnet.', 'module.corrnet.']
+            if args.aggregation_mode == 'hardproj_cache':
+                prefixes.extend([
+                    'module.conv_corr_rvt_in.',
+                    'module.conv_corr_rvt_out.',
+                    'module.scale_net.',
+                ])
+            teacher_src_prefix = 'module.cnet.'
+            teacher_dst_prefix = 'module.cnet_teacher.'
+        elif args.backbone_type == 'dual_backbone':
+            prefixes = [
+                'module.cnet.',
+                'module.featnet.',
+                'module.corrnet.',
+                'module.conv_corr_rvt_in.',
+                'module.conv_corr_rvt_out.',
+                'module.scale_net.',
+            ]
+            teacher_src_prefix = None
+            teacher_dst_prefix = None
+        else:
+            prefixes = ('module.cnet.', 'module.featnet.', 'module.corrnet.')
+            teacher_src_prefix = None
+            teacher_dst_prefix = None
+    else:
+        if args.backbone_type == 'da_vits':
+            prefixes = ['featnet.', 'corrnet.']
+            if args.aggregation_mode == 'hardproj_cache':
+                prefixes.extend([
+                    'conv_corr_rvt_in.',
+                    'conv_corr_rvt_out.',
+                    'scale_net.',
+                ])
+            teacher_src_prefix = 'cnet.'
+            teacher_dst_prefix = 'cnet_teacher.'
+        elif args.backbone_type == 'dual_backbone':
+            prefixes = [
+                'cnet.',
+                'featnet.',
+                'corrnet.',
+                'conv_corr_rvt_in.',
+                'conv_corr_rvt_out.',
+                'scale_net.',
+            ]
+            teacher_src_prefix = None
+            teacher_dst_prefix = None
+        else:
+            prefixes = ('cnet.', 'featnet.', 'corrnet.')
+            teacher_src_prefix = None
+            teacher_dst_prefix = None
+    prefixes = tuple(prefixes)
+
+    filtered = {}
+    teacher_key_count = 0
+    for k, v in sd.items():
+        if any(k.startswith(pref) for pref in prefixes):
+            filtered[k] = v
+        elif (
+            args.use_adapter_alignment_teacher
+            and args.backbone_type == 'da_vits'
+            and teacher_src_prefix is not None
+            and k.startswith(teacher_src_prefix)
+        ):
+            mapped_key = teacher_dst_prefix + k[len(teacher_src_prefix):]
+            filtered[mapped_key] = v
+            teacher_key_count += 1
+
+    conv1_key = 'module.cnet.conv1.weight' if has_module_prefix else 'cnet.conv1.weight'
+    if args.backbone_type in ('cnn', 'dual_backbone') and args.no_depth and conv1_key in filtered:
+        ckpt_conv1 = filtered[conv1_key]
+        if ckpt_conv1.shape[1] == 4:
+            filtered[conv1_key] = ckpt_conv1[:, :3, :, :]
+            if is_main_process():
+                print(
+                    f'[SCALE-INIT] Sliced {conv1_key} from '
+                    f'{ckpt_conv1.shape} to {filtered[conv1_key].shape}'
+                )
+
+    model_dict.update(filtered)
+    load_info = model.load_state_dict(model_dict, strict=False)
+    loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
+    model_init_info['scale_pretrained_ckpt'] = build_load_report(
+        label='scale_pretrained_ckpt',
+        path=args.scale_pretrained_ckpt,
+        sd=filtered,
+        load_info=load_info,
+        extra={
+            'filtered_prefixes': list(prefixes),
+            'filtered_key_count': len(filtered),
+            'loaded_filtered_key_count': len(loaded),
+            'teacher_alignment_key_count': int(teacher_key_count),
+        },
+    )
+    if is_main_process():
+        write_json(os.path.join(out_dir, 'model_init.json'), model_init_info)
+        print(f"[SCALE-INIT] Loaded {len(loaded)} keys for scale backbone:")
+        for k in sorted(loaded):
+            print("   ", k)
+        if load_info.missing_keys:
+            print(f"[SCALE-INIT] Missing keys: {load_info.missing_keys}")
+
+
 def get_git_metadata():
     def _git_cmd(args):
         try:
@@ -404,6 +601,12 @@ def main():
         reg_refine             = args.reg_refine,
         no_depth               = args.no_depth,
         activation_checkpointing = args.activation_checkpointing,
+        backbone_type          = args.backbone_type,
+        da_pretrained_ckpt     = args.da_pretrained_ckpt,
+        da_branch_mode         = args.da_branch_mode,
+        aggregation_mode       = args.aggregation_mode,
+        image_size             = tuple(args.image_size),
+        use_adapter_alignment_teacher = args.use_adapter_alignment_teacher,
     ).cuda()
 
     start_epoch = 0
@@ -411,8 +614,15 @@ def main():
     # 从预训练的模型加载参数
     model_init_info = {
         'no_depth': args.no_depth,
+        'backbone_type': args.backbone_type,
+        'da_pretrained_ckpt': args.da_pretrained_ckpt if args.backbone_type in ('da_vits', 'dual_backbone') else None,
+        'da_branch_mode': args.da_branch_mode if args.backbone_type == 'dual_backbone' else None,
+        'aggregation_mode': args.aggregation_mode,
         'use_teacher_distill': args.use_teacher_distill,
         'activation_checkpointing': args.activation_checkpointing,
+        'use_adapter_alignment_teacher': args.use_adapter_alignment_teacher,
+        'adapter_warmup_epochs': int(args.adapter_warmup_epochs),
+        'adapter_align_weight': float(args.adapter_align_weight),
         'resume': None,
         'scale_pretrained_ckpt': None,
         'optimizer_groups': {},
@@ -440,7 +650,7 @@ def main():
 
         # 2) 处理 conv1 通道不匹配（4ch→3ch 截取 RGB）
         conv1_key = 'module.cnet.conv1.weight' if any(k.startswith('module.') for k in model_keys) else 'cnet.conv1.weight'
-        if args.no_depth and conv1_key in sd:
+        if args.backbone_type in ('cnn', 'dual_backbone') and args.no_depth and conv1_key in sd:
             ckpt_conv1 = sd[conv1_key]
             if ckpt_conv1.shape[1] == 4:
                 sd[conv1_key] = ckpt_conv1[:, :3, :, :]
@@ -501,65 +711,18 @@ def main():
     if is_main_process():
         print('Start Loading ...')
 
+    if args.scale_pretrained_ckpt is not None and (
+        args.train_stage in ('scale', 'both')
+        or (args.use_adapter_alignment_teacher and args.backbone_type == 'da_vits')
+    ):
+        load_scale_pretrained_components(model, args, device, out_dir, model_init_info)
+
     dataset = datasets.fetch_dataloader(args) 
+    if is_main_process() and hasattr(dataset, 'sample_subset_metadata'):
+        write_json(os.path.join(out_dir, 'sample_subset.json'), dataset.sample_subset_metadata)
     
     # stage 1: train scale branch
     if args.train_stage in ('scale', 'both'):
-        ########################### LOAD PRETRAINED SCALE MODEL ###########################
-        if args.scale_pretrained_ckpt is not None:
-            ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
-            # 提取 state_dict
-            sd = extract_checkpoint_state_dict(ckpt)
-
-            model_dict = model.state_dict()
-            model_keys = model_dict.keys()
-            sd = align_state_dict_module_prefix(sd, model_keys)
-
-            # 只挑出 cnet/featnet/corrnet 的参数
-            if any(k.startswith('module.') for k in model_keys):
-                prefixes = ('module.cnet.', 'module.featnet.', 'module.corrnet.')
-            else:
-                prefixes = ('cnet.', 'featnet.', 'corrnet.')
-            filtered = {}
-            for k, v in sd.items():
-                if any(k.startswith(pref) for pref in prefixes):
-                    filtered[k] = v
-
-            conv1_key = 'module.cnet.conv1.weight' if any(k.startswith('module.') for k in model_keys) else 'cnet.conv1.weight'
-            if args.no_depth and conv1_key in filtered:
-                ckpt_conv1 = filtered[conv1_key]
-                if ckpt_conv1.shape[1] == 4:
-                    filtered[conv1_key] = ckpt_conv1[:, :3, :, :]
-                    if is_main_process():
-                        print(
-                            f'[SCALE-INIT] Sliced {conv1_key} from '
-                            f'{ckpt_conv1.shape} to {filtered[conv1_key].shape}'
-                        )
-
-            # 注入到当前模型里
-            model_dict.update(filtered)
-            load_info = model.load_state_dict(model_dict, strict=False)
-            loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
-            model_init_info['scale_pretrained_ckpt'] = build_load_report(
-                label='scale_pretrained_ckpt',
-                path=args.scale_pretrained_ckpt,
-                sd=filtered,
-                load_info=load_info,
-                extra={
-                    'filtered_prefixes': list(prefixes),
-                    'filtered_key_count': len(filtered),
-                    'loaded_filtered_key_count': len(loaded),
-                },
-            )
-            if is_main_process():
-                write_json(os.path.join(out_dir, 'model_init.json'), model_init_info)
-            if is_main_process():
-                print(f"[SCALE-INIT] Loaded {len(loaded)} keys for scale backbone:")
-                for k in sorted(loaded):
-                    print("   ", k)
-                if load_info.missing_keys:
-                    print(f"[SCALE-INIT] Missing keys: {load_info.missing_keys}")
-            ##########################################################################
         # 1) freeze risk branch only; shared trunk remains trainable
         freeze_prefixes = (
             'conv_corr_risk.', 'risk_net.',
@@ -570,8 +733,10 @@ def main():
             bare_name = name
             if bare_name.startswith('module.'):
                 bare_name = bare_name[len('module.'):]
-            
-            if any(bare_name.startswith(prefix) for prefix in freeze_prefixes):
+
+            if is_forced_frozen_param(name, args):
+                p.requires_grad = False
+            elif any(bare_name.startswith(prefix) for prefix in freeze_prefixes):
                 p.requires_grad = False
             else:
                 p.requires_grad = True
@@ -579,7 +744,7 @@ def main():
         optimizer = build_optimizer(model, args)
         model_init_info['optimizer_groups']['scale'] = {
             'new_module_lr_mult': float(args.new_module_lr_mult),
-            'old_module_prefixes': list(OLD_MODULE_PREFIXES),
+            'old_module_prefixes': list(get_old_module_prefixes(args)),
             'groups': getattr(optimizer, '_fp_ttc_lr_group_summary', []),
         }
         if is_main_process():
@@ -616,7 +781,10 @@ def main():
                              loss_weight_alpha   = args.loss_weight_alpha,
                              edge_loss_weight    = args.edge_loss_weight,
                              use_internal_depth_guidance = args.use_internal_depth_guidance,
-                             depth_loss_weight   = args.depth_loss_weight,
+                             use_adapter_alignment_teacher = args.use_adapter_alignment_teacher,
+                             adapter_warmup_epochs = args.adapter_warmup_epochs,
+                             adapter_align_weight = args.adapter_align_weight,
+                             depth_loss_weight   = 0.0 if args.backbone_type in ('da_vits', 'dual_backbone') else args.depth_loss_weight,
                              depth_selection_mode = args.depth_selection_mode,
                              bootstrap_topk      = args.bootstrap_topk,
                              attn_topk           = args.attn_topk,
@@ -637,8 +805,10 @@ def main():
             bare_name = name
             if bare_name.startswith('module.'):
                 bare_name = bare_name[len('module.'):]
-            
-            if any(bare_name.startswith(prefix) for prefix in freeze_prefixes):
+
+            if is_forced_frozen_param(name, args):
+                p.requires_grad = False
+            elif any(bare_name.startswith(prefix) for prefix in freeze_prefixes):
                 p.requires_grad = False
             else:
                 p.requires_grad = True
@@ -646,7 +816,7 @@ def main():
         optimizer = build_optimizer(model, args)
         model_init_info['optimizer_groups']['risk'] = {
             'new_module_lr_mult': float(args.new_module_lr_mult),
-            'old_module_prefixes': list(OLD_MODULE_PREFIXES),
+            'old_module_prefixes': list(get_old_module_prefixes(args)),
             'groups': getattr(optimizer, '_fp_ttc_lr_group_summary', []),
         }
         if is_main_process():
@@ -682,7 +852,10 @@ def main():
                              loss_weight_alpha   = args.loss_weight_alpha,
                              edge_loss_weight    = args.edge_loss_weight,
                              use_internal_depth_guidance = args.use_internal_depth_guidance,
-                             depth_loss_weight   = args.depth_loss_weight,
+                             use_adapter_alignment_teacher = args.use_adapter_alignment_teacher,
+                             adapter_warmup_epochs = args.adapter_warmup_epochs,
+                             adapter_align_weight = args.adapter_align_weight,
+                             depth_loss_weight   = 0.0 if args.backbone_type in ('da_vits', 'dual_backbone') else args.depth_loss_weight,
                              depth_selection_mode = args.depth_selection_mode,
                              bootstrap_topk      = args.bootstrap_topk,
                              attn_topk           = args.attn_topk,

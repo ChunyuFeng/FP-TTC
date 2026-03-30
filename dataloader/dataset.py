@@ -7,6 +7,7 @@ from PIL import Image
 import os
 import pickle
 import json
+import random
 from glob import glob
 import os.path as osp
 from pathlib import Path
@@ -134,10 +135,13 @@ class nuScenes_range_image(data.Dataset):
                  train_info_file='nusc_train_infos_key_frames_160_1920_fov_8_15.pkl',
                  require_complete_depth=False,
                  max_samples=None,
+                 sample_subset_mode='head',
+                 sample_subset_seed=326,
                  proj_cache_root=None,
                  no_depth=False,
                  need_teacher_proj=False,
                  use_internal_depth_guidance=False,
+                 use_adapter_alignment_teacher=False,
                  ):
         self.aug_params = aug_params
         self.split = split
@@ -146,8 +150,11 @@ class nuScenes_range_image(data.Dataset):
         self.require_complete_depth = require_complete_depth
         self.no_depth = no_depth
         self.max_samples = max_samples
+        self.sample_subset_mode = sample_subset_mode
+        self.sample_subset_seed = int(sample_subset_seed)
         self.need_teacher_proj = need_teacher_proj
         self.use_internal_depth_guidance = use_internal_depth_guidance
+        self.use_adapter_alignment_teacher = use_adapter_alignment_teacher
         self.dataset_root = infer_nusc_dataset_root(self.train_info_path)
         self.proj_cache_root = Path(proj_cache_root) if proj_cache_root is not None else _default_nusc_proj_cache_root(self.dataset_root)
         self.split_name = _infer_nusc_split_name(self.train_info_path, self.train_info_file)
@@ -173,16 +180,29 @@ class nuScenes_range_image(data.Dataset):
             complete_depth_samples = len(filtered_samples)
 
         if self.max_samples is not None:
-            filtered_samples = filtered_samples[:self.max_samples]
+            if self.sample_subset_mode == 'random_fixed' and self.max_samples < len(filtered_samples):
+                rng = random.Random(self.sample_subset_seed)
+                chosen = rng.sample(filtered_samples, self.max_samples)
+                filtered_samples = sorted(chosen, key=lambda item: item[0])
+            else:
+                filtered_samples = filtered_samples[:self.max_samples]
 
         self.samples = filtered_samples
         final_samples = len(self.samples)
+        self.sample_subset_metadata = {
+            'mode': self.sample_subset_mode,
+            'seed': self.sample_subset_seed,
+            'max_samples': self.max_samples,
+            'final_count': final_samples,
+            'selected_original_indices': [int(original_index) for original_index, _ in self.samples],
+        }
         if self.require_complete_depth or self.max_samples is not None:
             print(
                 "[nuScenes_range_image] sample stats: "
                 f"original={original_samples}, "
                 f"complete_depth={complete_depth_samples}, "
-                f"final={final_samples}"
+                f"final={final_samples}, "
+                f"subset_mode={self.sample_subset_mode}"
             )
 
         if final_samples == 0:
@@ -222,7 +242,7 @@ class nuScenes_range_image(data.Dataset):
         elif self.need_teacher_proj:
             if self.no_depth:
                 raise FileNotFoundError(
-                    "Teacher distillation in no-depth mode requires precomputed proj cache under "
+                    "Hard projection in no-depth mode requires precomputed proj cache under "
                     f"{self.proj_cache_root / self.split_name}. "
                     "Fallback reconstruction from depth maps is disabled for this depthfree branch."
                 )
@@ -233,7 +253,7 @@ class nuScenes_range_image(data.Dataset):
             )
 
     def _needs_real_depth(self):
-        return (not self.no_depth) or self.use_internal_depth_guidance
+        return (not self.no_depth) or self.use_internal_depth_guidance or self.use_adapter_alignment_teacher
 
     def _has_complete_depth(self, info):
         for frame_key in ['prev_camera_data', 'curr_camera_data']:
@@ -759,10 +779,16 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
                                         require_complete_depth=args.require_complete_depth,
                                         proj_cache_root=args.proj_cache_root,
                                         max_samples=args.max_train_samples,
+                                        sample_subset_mode=getattr(args, 'sample_subset_mode', 'head'),
+                                        sample_subset_seed=getattr(args, 'sample_subset_seed', 326),
                                         split='training',
                                         no_depth=getattr(args, 'no_depth', False),
-                                        need_teacher_proj=getattr(args, 'use_teacher_distill', False),
-                                        use_internal_depth_guidance=getattr(args, 'use_internal_depth_guidance', False))
+                                        need_teacher_proj=(
+                                            getattr(args, 'use_teacher_distill', False)
+                                            or getattr(args, 'aggregation_mode', 'rvt') == 'hardproj_cache'
+                                        ),
+                                        use_internal_depth_guidance=getattr(args, 'use_internal_depth_guidance', False),
+                                        use_adapter_alignment_teacher=getattr(args, 'use_adapter_alignment_teacher', False))
 
         train_dataset = 1*nuscenes
     

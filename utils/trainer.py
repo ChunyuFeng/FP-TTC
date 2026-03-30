@@ -34,7 +34,11 @@ class TTCTrainer(object):
                 lambda_feat_distill=1.0, lambda_corr_distill=0.5,
                 distill_end_pct=0.7, student_tail_epochs=0,
                 loss_weight_alpha=0.0, edge_loss_weight=0.0,
-                use_internal_depth_guidance=False, depth_loss_weight=0.5,
+                use_internal_depth_guidance=False,
+                use_adapter_alignment_teacher=False,
+                adapter_warmup_epochs=5,
+                adapter_align_weight=0.1,
+                depth_loss_weight=0.5,
                 depth_selection_mode='hard_topk', bootstrap_topk=4, attn_topk=8,
                 bootstrap_prior_scale=2.0, attn_prior_scale=2.0, depth_prior_eps=1e-6):
         self.model = model
@@ -51,6 +55,9 @@ class TTCTrainer(object):
         self.loss_weight_alpha = loss_weight_alpha
         self.edge_loss_weight = edge_loss_weight
         self.use_internal_depth_guidance = use_internal_depth_guidance
+        self.use_adapter_alignment_teacher = bool(use_adapter_alignment_teacher)
+        self.adapter_warmup_epochs = max(0, int(adapter_warmup_epochs))
+        self.adapter_align_weight = float(adapter_align_weight)
         self.depth_loss_weight = depth_loss_weight
         self.depth_selection_mode = depth_selection_mode
         self.bootstrap_topk = int(bootstrap_topk)
@@ -164,6 +171,46 @@ class TTCTrainer(object):
     def _model_ref(self):
         return self.model.module if hasattr(self.model, "module") else self.model
 
+    @staticmethod
+    def _strip_module_prefix(name):
+        return name[len('module.'):] if name.startswith('module.') else name
+
+    def _warmup_active(self, epoch):
+        return self.use_adapter_alignment_teacher and epoch < self.adapter_warmup_epochs
+
+    def _apply_epoch_freeze_policy(self, epoch):
+        model_ref = self._model_ref()
+        warmup_active = self._warmup_active(epoch)
+
+        permanently_frozen = {
+            'cnet.backbone.',
+            'cnet_teacher.',
+            'da_branch.',
+        }
+        if self.scale_only:
+            permanently_frozen.update({'conv_corr_risk.', 'risk_net.'})
+        else:
+            permanently_frozen.update({'conv_corr_rvt_out.', 'scale_net.'})
+
+        trainable_adapter_prefixes = ('cnet.adapter_hi.', 'cnet.adapter_lo.')
+
+        for name, p in model_ref.named_parameters():
+            bare_name = self._strip_module_prefix(name)
+
+            if any(bare_name.startswith(prefix) for prefix in permanently_frozen):
+                p.requires_grad = False
+                continue
+
+            if warmup_active:
+                p.requires_grad = any(bare_name.startswith(prefix) for prefix in trainable_adapter_prefixes)
+            else:
+                p.requires_grad = True
+
+        if getattr(model_ref, 'cnet_teacher', None) is not None:
+            model_ref.cnet_teacher.eval()
+        if getattr(model_ref, 'da_branch', None) is not None:
+            model_ref.da_branch.eval()
+
     def _current_lrs(self):
         group_names = getattr(self.optimizer, '_fp_ttc_lr_group_names', [])
         lrs = {}
@@ -267,6 +314,9 @@ class TTCTrainer(object):
             'student_tail_epochs': self.student_tail_epochs,
             'edge_loss_weight': float(self.edge_loss_weight),
             'depth_loss_weight': float(self.depth_loss_weight),
+            'use_adapter_alignment_teacher': bool(self.use_adapter_alignment_teacher),
+            'adapter_warmup_epochs': int(self.adapter_warmup_epochs),
+            'adapter_align_weight': float(self.adapter_align_weight),
             'depth_selection_mode': self.depth_selection_mode,
             'bootstrap_topk': int(self.bootstrap_topk),
             'attn_topk': int(self.attn_topk),
@@ -468,6 +518,9 @@ class TTCTrainer(object):
                     loss_weight_alpha=self.loss_weight_alpha,
                     edge_loss_weight=self.edge_loss_weight,
                     use_internal_depth_guidance=self.use_internal_depth_guidance,
+                    use_adapter_alignment_teacher=self.use_adapter_alignment_teacher,
+                    adapter_align_weight=self.adapter_align_weight,
+                    adapter_warmup_active=self._warmup_active(epoch),
                     depth_loss_weight=self.depth_loss_weight,
                     depth_selection_mode=self.depth_selection_mode,
                     bootstrap_topk=self.bootstrap_topk,
@@ -588,6 +641,7 @@ class TTCTrainer(object):
         if self.parallel:
             self.train_sampler.set_epoch(epoch)
         self.model.train()
+        self._apply_epoch_freeze_policy(epoch)
         self._reset_cuda_peak_stats()
         
         if self.use_teacher_distill and self.stage_a_end > 0 and epoch < self.stage_a_end:
@@ -600,6 +654,11 @@ class TTCTrainer(object):
         cur_use_distill = self.use_teacher_distill and (distill_scale > 0)
 
         if is_main_process():
+            if self._warmup_active(epoch):
+                print(
+                    f"  [Adapter-Warmup] epoch={epoch}, align_only=True, "
+                    f"warmup_epochs={self.adapter_warmup_epochs}, align_weight={self.adapter_align_weight:.3f}"
+                )
             if cur_use_distill:
                 print(f"  [Distill] epoch={epoch}, scale={distill_scale:.3f}, "
                       f"lambda_feat={cur_lambda_feat:.4f}, lambda_corr={cur_lambda_corr:.4f}")
@@ -616,6 +675,7 @@ class TTCTrainer(object):
             'corr_distill': 0.0,
             'edge': 0.0,
             'depth': 0.0,
+            'align': 0.0,
             'depth_entropy': 0.0,
             'depth_valid_ratio': 0.0,
             'depth_top1_prob': 0.0,
@@ -674,6 +734,9 @@ class TTCTrainer(object):
                     loss_weight_alpha             = self.loss_weight_alpha,
                     edge_loss_weight              = self.edge_loss_weight,
                     use_internal_depth_guidance   = self.use_internal_depth_guidance,
+                    use_adapter_alignment_teacher = self.use_adapter_alignment_teacher,
+                    adapter_align_weight          = self.adapter_align_weight,
+                    adapter_warmup_active         = self._warmup_active(epoch),
                     depth_loss_weight             = self.depth_loss_weight,
                     depth_selection_mode          = self.depth_selection_mode,
                     bootstrap_topk                = self.bootstrap_topk,
@@ -706,6 +769,9 @@ class TTCTrainer(object):
                     loss_weight_alpha             = self.loss_weight_alpha,
                     edge_loss_weight              = self.edge_loss_weight,
                     use_internal_depth_guidance   = self.use_internal_depth_guidance,
+                    use_adapter_alignment_teacher = self.use_adapter_alignment_teacher,
+                    adapter_align_weight          = self.adapter_align_weight,
+                    adapter_warmup_active         = self._warmup_active(epoch),
                     depth_loss_weight             = self.depth_loss_weight,
                     depth_selection_mode          = self.depth_selection_mode,
                     bootstrap_topk                = self.bootstrap_topk,
@@ -730,6 +796,7 @@ class TTCTrainer(object):
                 'corr_distill': float(loss_dict['corr_distill'].item()),
                 'edge': float(loss_dict['edge'].item()),
                 'depth': float(loss_dict['depth'].item()),
+                'align': float(loss_dict['align'].item()),
                 'depth_entropy': float(loss_dict['depth_entropy'].item()),
                 'depth_valid_ratio': float(loss_dict['depth_valid_ratio'].item()),
                 'depth_top1_prob': float(loss_dict['depth_top1_prob'].item()),
@@ -777,6 +844,7 @@ class TTCTrainer(object):
                         f"({100 * i / len(self.train_loader):3.0f}%)]  "
                         f"Loss_now: {batch_metrics['total']:6.4f}  "
                         f"(task={batch_metrics['task']:6.4f}, "
+                        f"align={batch_metrics['align']:6.4f}, "
                         f"feat={batch_metrics['feat_distill']:6.4f}, "
                         f"corr={batch_metrics['corr_distill']:6.4f}, "
                         f"edge={batch_metrics['edge']:6.4f}, "
@@ -811,6 +879,7 @@ class TTCTrainer(object):
                         'loss_corr_distill': batch_metrics['corr_distill'],
                         'loss_edge': batch_metrics['edge'],
                         'loss_depth': batch_metrics['depth'],
+                        'loss_align': batch_metrics['align'],
                         'depth_entropy': batch_metrics['depth_entropy'],
                         'depth_valid_ratio': batch_metrics['depth_valid_ratio'],
                         'depth_top1_prob': batch_metrics['depth_top1_prob'],
@@ -852,6 +921,7 @@ class TTCTrainer(object):
             'train_loss_corr_distill': avg_metrics['corr_distill'],
             'train_loss_edge': avg_metrics['edge'],
             'train_loss_depth': avg_metrics['depth'],
+            'train_loss_align': avg_metrics['align'],
             'depth_entropy': avg_metrics['depth_entropy'],
             'depth_valid_ratio': avg_metrics['depth_valid_ratio'],
             'depth_top1_prob': avg_metrics['depth_top1_prob'],
@@ -886,6 +956,7 @@ class TTCTrainer(object):
                     'train_loss_corr_distill',
                     'train_loss_edge',
                     'train_loss_depth',
+                    'train_loss_align',
                     'depth_entropy',
                     'depth_valid_ratio',
                     'depth_top1_prob',
