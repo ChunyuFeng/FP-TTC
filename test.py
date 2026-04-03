@@ -29,7 +29,12 @@ from typing import Dict, List, Tuple
 from fpttc.fp_ttc import FpTTC
 from utils.draw import scale2rgb, orientation2rgb
 from dataloader.utils.augmentor import NuscRangeImageAugmentor
-from dataloader.dataset import build_frame_mapping, build_frame_mapping_fast
+from dataloader.dataset import (
+    build_frame_mapping,
+    build_frame_mapping_fast,
+    build_frame_sensor_metas,
+    tensorize_sensor_metas,
+)
 from depthanything.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
 
 parser = argparse.ArgumentParser()
@@ -129,6 +134,58 @@ resize_height, resize_width = args.image_size  # height, width from CLI
 augmentor = NuscRangeImageAugmentor(crop_size=(resize_height, resize_width),
                                    do_flip=False,
                                    rotate=False)
+
+
+def _batchify_sensor_metas(sensor_metas):
+    return {
+        frame_key: {
+            channel: {
+                key: value.unsqueeze(0)
+                for key, value in channel_metas.items()
+            }
+            for channel, channel_metas in frame_sensor_metas.items()
+        }
+        for frame_key, frame_sensor_metas in sensor_metas.items()
+    }
+
+
+def _move_sensor_metas_to_device(sensor_metas, device):
+    for frame_key in sensor_metas:
+        for channel in sensor_metas[frame_key]:
+            for key in sensor_metas[frame_key][channel]:
+                sensor_metas[frame_key][channel][key] = sensor_metas[frame_key][channel][key].to(device)
+    return sensor_metas
+
+
+def _load_checkpoint_flexibly(model, checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if 'net' in checkpoint:
+        raw_state_dict = checkpoint['net']
+    elif 'state_dict' in checkpoint:
+        raw_state_dict = checkpoint['state_dict']
+    elif 'model' in checkpoint:
+        raw_state_dict = checkpoint['model']
+    else:
+        raw_state_dict = checkpoint
+
+    processed_state_dict = {}
+    for key, value in raw_state_dict.items():
+        processed_state_dict[key[len('module.'):] if key.startswith('module.') else key] = value
+
+    model_state_dict = model.state_dict()
+    loadable = {}
+    for key, value in processed_state_dict.items():
+        if key in model_state_dict and value.shape == model_state_dict[key].shape:
+            loadable[key] = value
+
+    load_info = model.load_state_dict(loadable, strict=False)
+    print(f"[TEST] loaded {len(loadable)} keys from {checkpoint_path}")
+    if load_info.missing_keys:
+        print(f"[TEST] missing {len(load_info.missing_keys)} keys")
+    if load_info.unexpected_keys:
+        print(f"[TEST] unexpected {len(load_info.unexpected_keys)} keys")
+
+
 def main():
     # Load model
     model = FpTTC(num_scales             = args.num_scales,
@@ -141,25 +198,7 @@ def main():
 
     # Optionally resume checkpoint
     if args.resume:
-        map_loc = f'cuda:{args.local_rank}' if torch.cuda.is_available() else 'cpu'
-        checkpoint = torch.load(args.resume, map_location=map_loc)
-        # Extract raw state dict
-        if 'net' in checkpoint:
-            raw_state_dict = checkpoint['net']
-        elif 'state_dict' in checkpoint:
-            raw_state_dict = checkpoint['state_dict']
-        else:
-            raw_state_dict = checkpoint
-
-        processed_state_dict = {}
-        for key, value in raw_state_dict.items():
-            new_key = key[len('module.'):] if key.startswith('module.') else key
-            processed_state_dict[new_key] = value
-        # Load into model
-        model.load_state_dict(processed_state_dict)
-        # missing, unexpected = model.load_state_dict(processed_state_dict, strict=False)
-        # print("missing:", missing)        # 会看到 init_scale / init_risk / corr_enc_shared 相关
-        # print("unexpected:", unexpected)  # 会看到旧的 conv_corr / conv_corr_risk 相关
+        _load_checkpoint_flexibly(model, args.resume, device)
 
     model.eval()
 
@@ -300,6 +339,13 @@ def main():
             proj_pix_prev_batch = torch.from_numpy(proj_pix_prev.astype(np.int64)).unsqueeze(0).pin_memory().to(device, non_blocking=True)
             proj_pix_curr_batch = torch.from_numpy(proj_pix_curr.astype(np.int64)).unsqueeze(0).pin_memory().to(device, non_blocking=True)
 
+            sensor_metas = {
+                'prev': build_frame_sensor_metas(test_entries, 'sjtu', 'prev', affine_matrix, idx=idx),
+                'curr': build_frame_sensor_metas(test_entries, 'sjtu', 'curr', affine_matrix, idx=idx),
+            }
+            sensor_metas = tensorize_sensor_metas(sensor_metas)
+            sensor_metas = _move_sensor_metas_to_device(_batchify_sensor_metas(sensor_metas), device)
+
             end3 = time.perf_counter()
             print(f"Building range-image mapping took {(end3 - end2)*1000:.2f} ms")
             # ---- 模型前向 ----
@@ -312,6 +358,7 @@ def main():
                     depth_curr       = curr_depths_pred_batch,
                     proj_pix_prev    = proj_pix_prev_batch,
                     proj_pix_curr    = proj_pix_curr_batch,
+                    sensor_metas     = sensor_metas,
                     attn_type        = args.attn_type,
                     attn_splits_list = args.attn_splits_list,
                     corr_radius_list = args.corr_radius_list,
@@ -396,8 +443,8 @@ def main():
                 depth_pred_prev = depth_model.infer_image(augmented_prev[channel], input_size=320)
                 depth_pred_curr = depth_model.infer_image(augmented_curr[channel], input_size=320)
 
-                prev_depth_pred_map[channel] = torch.from_numpy(depth_pred_prev)
-                curr_depth_pred_map[channel] = torch.from_numpy(depth_pred_curr)
+                prev_depth_pred_map[channel] = depth_pred_prev
+                curr_depth_pred_map[channel] = depth_pred_curr
             # for channel in camera_channels:
             #     depth_pred_prev_path = test_entries[idx]['prev_camera_data'][channel]['depth_pred']
             #     depth_pred_curr_path = test_entries[idx]['curr_camera_data'][channel]['depth_pred']
@@ -408,8 +455,14 @@ def main():
             #     prev_depth_pred_map[channel] = torch.from_numpy(prev_depth_pred_map[channel])
             #     curr_depth_pred_map[channel] = torch.from_numpy(curr_depth_pred_map[channel])
 
-            prev_depths_pred_tensor = torch.stack([prev_depth_pred_map[channel] for channel in camera_channels], dim=0).unsqueeze(1)
-            curr_depths_pred_tensor = torch.stack([curr_depth_pred_map[channel] for channel in camera_channels], dim=0).unsqueeze(1)
+            prev_depths_pred_tensor = torch.stack(
+                [torch.from_numpy(prev_depth_pred_map[channel]) for channel in camera_channels],
+                dim=0,
+            ).unsqueeze(1)
+            curr_depths_pred_tensor = torch.stack(
+                [torch.from_numpy(curr_depth_pred_map[channel]) for channel in camera_channels],
+                dim=0,
+            ).unsqueeze(1)
 
             prev_depths_pred_batch = prev_depths_pred_tensor.unsqueeze(0).to(device)
             curr_depths_pred_batch = curr_depths_pred_tensor.unsqueeze(0).to(device)
@@ -436,9 +489,9 @@ def main():
                 gt_risk_tensor = torch.zeros((1, 2, prev_batch.shape[2], prev_batch.shape[3])).to(device)
 
             # 4) load 环视图像 uv 坐标与 range view uv 坐标之间的对应关系 (DepthAnythingV2)
-            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'nusc', 'prev', depth_pred_prev, 
+            proj_range_prev, proj_pix_prev = build_frame_mapping(test_entries, 'nusc', 'prev', prev_depth_pred_map,
                                                                  affine_matrix, idx, H_r=40, W_r=480)
-            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'nusc', 'curr', depth_pred_curr,
+            proj_range_curr, proj_pix_curr = build_frame_mapping(test_entries, 'nusc', 'curr', curr_depth_pred_map,
                                                                  affine_matrix, idx, H_r=40, W_r=480)
             # 转换为 tensor
             proj_pix_prev_tensor = torch.from_numpy(proj_pix_prev.astype(np.int64))   # (M, 3)
@@ -446,6 +499,13 @@ def main():
             # 打包 batch
             proj_pix_prev_batch = proj_pix_prev_tensor.unsqueeze(0).to(device)
             proj_pix_curr_batch = proj_pix_curr_tensor.unsqueeze(0).to(device)
+
+            sensor_metas = {
+                'prev': build_frame_sensor_metas(test_entries, 'nusc', 'prev', affine_matrix, idx=idx),
+                'curr': build_frame_sensor_metas(test_entries, 'nusc', 'curr', affine_matrix, idx=idx),
+            }
+            sensor_metas = tensorize_sensor_metas(sensor_metas)
+            sensor_metas = _move_sensor_metas_to_device(_batchify_sensor_metas(sensor_metas), device)
 
             # Inference
             with torch.no_grad():
@@ -456,6 +516,7 @@ def main():
                         depth_curr       = curr_depths_pred_batch,
                         proj_pix_prev    = proj_pix_prev_batch,
                         proj_pix_curr    = proj_pix_curr_batch,
+                        sensor_metas     = sensor_metas,
                         attn_type        = args.attn_type,
                         attn_splits_list = args.attn_splits_list,
                         corr_radius_list = args.corr_radius_list,

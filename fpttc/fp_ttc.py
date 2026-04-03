@@ -1,32 +1,35 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .modules.utils import normalize_img
-from utils.loss import get_loss_scale_map, get_loss_risk_score_map
 
+from .modules.utils import normalize_img
 from .scale_net.backbone import CNNEncoder
 from .scale_net.feature_net.feature_net import FeatureNet
 from .scale_net.flow_net import FlowNet
 from .scale_net.scale_net import ScaleNet
-from .scale_net.multi_view_deformable_fusion import MultiViewDeformableFusion
+from .rvt.range_view_transformer import RangeViewTransformer
+from utils.loss import get_loss_risk_score_map, get_loss_scale_map
 
-import torch.distributed as dist
-import numpy as np
-from utils.dist import is_main_process
-
-import matplotlib.pyplot as plt
-import time
 
 def _safe_bilinear(x, *, size=None, scale_factor=None, align_corners=True):
     orig_dtype = x.dtype
     if orig_dtype == torch.bfloat16:
-        x = x.float()  # or x.half()
-    y = F.interpolate(x, size=size, scale_factor=scale_factor,
-                      mode='bilinear', align_corners=align_corners)
+        x = x.float()
+    y = F.interpolate(
+        x,
+        size=size,
+        scale_factor=scale_factor,
+        mode='bilinear',
+        align_corners=align_corners,
+    )
     return y.to(orig_dtype)
+
+
 class CorrEncoder(nn.Module):
     def __init__(self, dim_in, dim_out):
-        super(CorrEncoder, self).__init__()
+        super().__init__()
         self.convc1 = nn.Conv2d(dim_in, 256, 1)
         self.convc2 = nn.Conv2d(256, dim_out, 3, padding=1)
 
@@ -35,134 +38,207 @@ class CorrEncoder(nn.Module):
         x = F.relu(self.convc2(x))
         return x
 
+
+class CorrResidualDecoder(nn.Module):
+    """Decode RVT corr features into a residual 2-channel corr map."""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.encoder = CorrEncoder(hidden_dim, hidden_dim)
+        self.proj = nn.Conv2d(hidden_dim, 2, kernel_size=1)
+
+    def forward(self, x):
+        return self.proj(self.encoder(x))
+
+
 class FpTTC(nn.Module):
-    def __init__(self,
-                 num_scales             = 2,
-                 feature_channels       = 128,
-                 upsample_factor        = 4,
-                 num_head               = 1,
-                 ffn_dim_expansion      = 4,
-                 num_transformer_layers = 6,
-                 reg_refine             = False
-                 ):
-        super(FpTTC, self).__init__()
-        self.num_scales = num_scales
-
-        self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
-                                'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
-
-        self.cnet = CNNEncoder(output_dim        = feature_channels, 
-                               num_output_scales = num_scales)
-        
-        self.featnet = FeatureNet(num_scales             = num_scales,
-                                  feature_channels       = feature_channels,
-                                  num_head               = num_head, 
-                                  ffn_dim_expansion      = ffn_dim_expansion,
-                                  num_transformer_layers = num_transformer_layers)   
-         
-        self.corrnet = FlowNet(num_scales       = num_scales,
-                               feature_channels = feature_channels,
-                               upsample_factor  = upsample_factor,
-                               reg_refine       = reg_refine) 
-        
-        self.conv_corr = CorrEncoder(dim_in  = 2,
-                                     dim_out = feature_channels+1)
-        self.scale_net = ScaleNet(num_scales      = num_scales,
-                                 feature_channels = feature_channels,
-                                 upsample_factor  = upsample_factor,
-                                 num_head         = 4,
-                                 scale_level      = num_scales, 
-                                 reg_refine       = reg_refine, 
-                                 head_type        = 'scale')
-
-        # Risk 分支
-        self.conv_corr_risk = CorrEncoder(dim_in  = 2,
-                                          dim_out = feature_channels+1)
-        self.risk_net = ScaleNet(num_scales       = num_scales,
-                                 feature_channels = feature_channels,
-                                 upsample_factor  = upsample_factor,
-                                 num_head         = 4,
-                                 scale_level      = num_scales, 
-                                 reg_refine       = reg_refine, 
-                                 head_type        = 'risk')
-        
-
-    def forward(
+    def __init__(
         self,
-        img_prev, img_curr,
-        depth_prev, depth_curr,
-        proj_pix_prev, proj_pix_curr,
+        num_scales=2,
+        feature_channels=128,
+        upsample_factor=4,
+        num_head=1,
+        ffn_dim_expansion=4,
+        num_transformer_layers=6,
+        reg_refine=False,
+    ):
+        super().__init__()
+        self.num_scales = num_scales
+        self.feature_channels = feature_channels
+
+        self.camera_channels = [
+            'CAM_FRONT_LEFT',
+            'CAM_FRONT',
+            'CAM_FRONT_RIGHT',
+            'CAM_BACK_RIGHT',
+            'CAM_BACK',
+            'CAM_BACK_LEFT',
+        ]
+
+        self.cnet = CNNEncoder(
+            output_dim=feature_channels,
+            num_output_scales=num_scales,
+        )
+        self.featnet = FeatureNet(
+            num_scales=num_scales,
+            feature_channels=feature_channels,
+            num_head=num_head,
+            ffn_dim_expansion=ffn_dim_expansion,
+            num_transformer_layers=num_transformer_layers,
+        )
+        self.corrnet = FlowNet(
+            num_scales=num_scales,
+            feature_channels=feature_channels,
+            upsample_factor=upsample_factor,
+            reg_refine=reg_refine,
+        )
+
+        # Existing heads keep their names so current hardproj checkpoints still load cleanly.
+        self.conv_corr = CorrEncoder(dim_in=2, dim_out=feature_channels + 1)
+        self.conv_corr_risk = CorrEncoder(dim_in=2, dim_out=feature_channels + 1)
+        self.scale_net = ScaleNet(
+            num_scales=num_scales,
+            feature_channels=feature_channels,
+            upsample_factor=upsample_factor,
+            num_head=4,
+            scale_level=num_scales,
+            reg_refine=reg_refine,
+            head_type='scale',
+        )
+        self.risk_net = ScaleNet(
+            num_scales=num_scales,
+            feature_channels=feature_channels,
+            upsample_factor=upsample_factor,
+            num_head=4,
+            scale_level=num_scales,
+            reg_refine=reg_refine,
+            head_type='risk',
+        )
+
+        num_views = len(self.camera_channels)
+        num_depth_bins = 8
+        self.register_buffer(
+            'depth_bins',
+            torch.linspace(0.0, 48.0, num_depth_bins),
+        )
+
+        self.rvt_feat = nn.ModuleList(
+            [
+                RangeViewTransformer(
+                    num_layers=2,
+                    input_dim=feature_channels,
+                    d_model=feature_channels,
+                    nhead=4,
+                    num_level=num_views,
+                    num_points=num_depth_bins,
+                    fov_up=8.0,
+                    fov_down=-15.0,
+                )
+                for _ in range(num_scales)
+            ]
+        )
+        self.rvt_corr = RangeViewTransformer(
+            num_layers=2,
+            input_dim=2,
+            d_model=feature_channels,
+            nhead=4,
+            num_level=num_views,
+            num_points=num_depth_bins,
+            fov_up=8.0,
+            fov_down=-15.0,
+        )
+        self.corr_residual_decoder = CorrResidualDecoder(feature_channels)
+
+    def _camera_meta_list(self, sensor_metas, frame_key, meta_key):
+        return [sensor_metas[frame_key][camera][meta_key] for camera in self.camera_channels]
+
+    def _extract_multi_view_features(
+        self,
+        img_prev,
+        img_curr,
         attn_type,
         attn_splits_list,
         corr_radius_list,
         prop_radius_list,
         num_reg_refine,
-        scale_only,
-        return_debug=False,
     ):
-        t0 = time.perf_counter()
-
-        # ----- 预处理 -----
-        img0, img1 = normalize_img(img_prev, img_curr)         # [B,V,3,H,W] -> normed
+        img0, img1 = normalize_img(img_prev, img_curr)
         B, V, C, H_img, W_img = img0.shape
 
-        # 合并视角到 batch 维，一次性提特征
-        x0 = img0.view(B*V, C, H_img, W_img)
-        x1 = img1.view(B*V, C, H_img, W_img)
-        # extract_feature 会在内部 cat([x0, x1], 0) -> cnet -> 多尺度 -> chunk 回来
-        prev_lvls_flat, curr_lvls_flat = self.extract_feature(x0, x1, branch=None)  # list[T][B*V,C,Hs,Ws]
+        x0 = img0.view(B * V, C, H_img, W_img)
+        x1 = img1.view(B * V, C, H_img, W_img)
+        prev_lvls_flat, curr_lvls_flat = self.extract_feature(x0, x1, branch=None)
 
-        # reshape 回 [B,V,C,Hs,Ws]
-        prev_lvls = [f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for f in prev_lvls_flat]
-        curr_lvls = [f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for f in curr_lvls_flat]
+        prev_lvls = [feat.view(B, V, feat.shape[1], feat.shape[2], feat.shape[3]) for feat in prev_lvls_flat]
+        curr_lvls = [feat.view(B, V, feat.shape[1], feat.shape[2], feat.shape[3]) for feat in curr_lvls_flat]
 
-        t1 = time.perf_counter()
-        # print(f"feature extraction time: {t1 - t0:.4f} s")
-
-        # ----- 多尺度 Transformer + 相关性，仍然“只按尺度循环”，但每次处理 B*V -----
         corr = None
         multi_level_feats_prev = []
         multi_level_feats_curr = []
 
         for lvl in range(self.num_scales):
-            # 取出该尺度的 [B,V,C,Hs,Ws]，合并为 [B*V,C,Hs,Ws] 一次性送入
-            p = prev_lvls[lvl].reshape(B*V, -1, prev_lvls[lvl].shape[3], prev_lvls[lvl].shape[4])
-            c = curr_lvls[lvl].reshape(B*V, -1, curr_lvls[lvl].shape[3], curr_lvls[lvl].shape[4])
+            prev_level = prev_lvls[lvl].reshape(B * V, -1, prev_lvls[lvl].shape[3], prev_lvls[lvl].shape[4])
+            curr_level = curr_lvls[lvl].reshape(B * V, -1, curr_lvls[lvl].shape[3], curr_lvls[lvl].shape[4])
 
             fused_prev, fused_curr = self.featnet(
-                p, c, lvl, attn_type, attn_splits_list, corr
+                prev_level,
+                curr_level,
+                lvl,
+                attn_type,
+                attn_splits_list,
+                corr,
             )
 
-            # 保存为 [B,V,C,Hs,Ws] 以便后续投影
-            fp = fused_prev.view(B, V, fused_prev.shape[1], fused_prev.shape[2], fused_prev.shape[3])
-            fc = fused_curr.view(B, V, fused_curr.shape[1], fused_curr.shape[2], fused_curr.shape[3])
-            multi_level_feats_prev.append(fp)
-            multi_level_feats_curr.append(fc)
+            multi_level_feats_prev.append(
+                fused_prev.view(B, V, fused_prev.shape[1], fused_prev.shape[2], fused_prev.shape[3])
+            )
+            multi_level_feats_curr.append(
+                fused_curr.view(B, V, fused_curr.shape[1], fused_curr.shape[2], fused_curr.shape[3])
+            )
 
             corr, _ = self.corrnet(
-                fused_prev, fused_curr,
-                lvl, corr_radius_list, prop_radius_list,
-                num_reg_refine, False, corr
+                fused_prev,
+                fused_curr,
+                lvl,
+                corr_radius_list,
+                prop_radius_list,
+                num_reg_refine,
+                False,
+                corr,
             )
             if lvl < self.num_scales - 1:
                 corr = _safe_bilinear(corr, scale_factor=2, align_corners=True) * 2
 
+        corr = corr.view(B, V, corr.shape[1], corr.shape[2], corr.shape[3])
+        corr_list = [corr[:, view_idx] for view_idx in range(V)]
 
-        t2 = time.perf_counter()
-        # print(f"correlation computation time: {t2 - t1:.4f} s")
+        return {
+            'H_img': H_img,
+            'W_img': W_img,
+            'multi_level_feats_prev': multi_level_feats_prev,
+            'multi_level_feats_curr': multi_level_feats_curr,
+            'corr_list': corr_list,
+        }
 
-        # corr 此时是 [B*V, 2, Hc, Wc]，变回 [B,V,2,Hc,Wc] 后，为每个视角投影到 range
-        Cc, Hc, Wc = corr.shape[1], corr.shape[2], corr.shape[3]
-        corr_bv = corr.view(B, V, Cc, Hc, Wc)
-        corr_list = [corr_bv[:, v] for v in range(V)]          # list[V] of [B,2,Hc,Wc]
+    def _build_hardproj_initial_ranges(
+        self,
+        multi_level_feats_prev,
+        multi_level_feats_curr,
+        corr_list,
+        proj_pix_prev,
+        proj_pix_curr,
+        H_img,
+        W_img,
+    ):
+        hardproj_corr_range_init = self.project_views_to_range(
+            corr_list,
+            proj_pix_curr,
+            H_img=H_img,
+            W_img=W_img,
+        )
 
-        # 1) 风险/尺度的“相关性特征”投影（当前帧）
-        corr_range = self.project_views_to_range(
-            corr_list, proj_pix_curr, H_img=H_img, W_img=W_img
-        )  # -> [B, Cc, H_r, W_r]
-
-        # 2) 每个尺度的多视角特征投影
-        multi_level_ranges_prev, multi_level_ranges_curr = [], []
+        hardproj_ranges_prev_init = []
+        hardproj_ranges_curr_init = []
         for lvl in range(self.num_scales):
             scale = 2 ** (self.num_scales - 1 - lvl)
             if scale > 1:
@@ -172,165 +248,273 @@ class FpTTC(nn.Module):
                 proj_prev_lvl = proj_pix_prev
                 proj_curr_lvl = proj_pix_curr
 
-            # 组建 list[V] of [B,C,Hs,Ws]
-            prev_feats_list = [multi_level_feats_prev[lvl][:, v] for v in range(V)]
-            curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
+            prev_feats_list = [multi_level_feats_prev[lvl][:, view_idx] for view_idx in range(len(self.camera_channels))]
+            curr_feats_list = [multi_level_feats_curr[lvl][:, view_idx] for view_idx in range(len(self.camera_channels))]
 
-            range_prev = self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
-            range_curr = self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
+            hardproj_ranges_prev_init.append(
+                self.project_views_to_range(prev_feats_list, proj_prev_lvl, H_img=H_img, W_img=W_img)
+            )
+            hardproj_ranges_curr_init.append(
+                self.project_views_to_range(curr_feats_list, proj_curr_lvl, H_img=H_img, W_img=W_img)
+            )
 
-            multi_level_ranges_prev.append(range_prev)  # [B,C,Hr,Wr]
-            multi_level_ranges_curr.append(range_curr)
+        return hardproj_corr_range_init, hardproj_ranges_prev_init, hardproj_ranges_curr_init
 
-        t3 = time.perf_counter()
-        # print(f"projection to range-view time: {t3 - t2:.4f} s")
+    def _refine_corr_range(self, corr_list, hardproj_corr_range_init, sensor_metas, input_hw):
+        Hr, Wr = hardproj_corr_range_init.shape[-2:]
+        corr_delta = self.rvt_corr(
+            feats_by_cam=corr_list,
+            cam_K=self._camera_meta_list(sensor_metas, 'curr', 'K'),
+            cam_R=self._camera_meta_list(sensor_metas, 'curr', 'R_l2c'),
+            cam_t=self._camera_meta_list(sensor_metas, 'curr', 't_l2c'),
+            affine_M=self._camera_meta_list(sensor_metas, 'curr', 'affine'),
+            Hr=Hr,
+            Wr=Wr,
+            depth_bins=self.depth_bins,
+            ini_query=hardproj_corr_range_init.detach(),
+            input_hw=input_hw,
+        )
+        corr_delta = self.corr_residual_decoder(corr_delta)
+        return hardproj_corr_range_init + corr_delta
+
+    def _refine_feature_ranges(
+        self,
+        multi_level_feats_prev,
+        multi_level_feats_curr,
+        hardproj_ranges_prev_init,
+        hardproj_ranges_curr_init,
+        sensor_metas,
+        input_hw,
+    ):
+        rvt_ranges_prev = []
+        rvt_ranges_curr = []
+
+        for lvl in range(self.num_scales):
+            prev_feats_list = [multi_level_feats_prev[lvl][:, view_idx] for view_idx in range(len(self.camera_channels))]
+            curr_feats_list = [multi_level_feats_curr[lvl][:, view_idx] for view_idx in range(len(self.camera_channels))]
+
+            Hr, Wr = hardproj_ranges_prev_init[lvl].shape[-2:]
+            prev_delta = self.rvt_feat[lvl](
+                feats_by_cam=prev_feats_list,
+                cam_K=self._camera_meta_list(sensor_metas, 'prev', 'K'),
+                cam_R=self._camera_meta_list(sensor_metas, 'prev', 'R_l2c'),
+                cam_t=self._camera_meta_list(sensor_metas, 'prev', 't_l2c'),
+                affine_M=self._camera_meta_list(sensor_metas, 'prev', 'affine'),
+                Hr=Hr,
+                Wr=Wr,
+                depth_bins=self.depth_bins,
+                ini_query=hardproj_ranges_prev_init[lvl].detach(),
+                input_hw=input_hw,
+            )
+            curr_delta = self.rvt_feat[lvl](
+                feats_by_cam=curr_feats_list,
+                cam_K=self._camera_meta_list(sensor_metas, 'curr', 'K'),
+                cam_R=self._camera_meta_list(sensor_metas, 'curr', 'R_l2c'),
+                cam_t=self._camera_meta_list(sensor_metas, 'curr', 't_l2c'),
+                affine_M=self._camera_meta_list(sensor_metas, 'curr', 'affine'),
+                Hr=Hr,
+                Wr=Wr,
+                depth_bins=self.depth_bins,
+                ini_query=hardproj_ranges_curr_init[lvl].detach(),
+                input_hw=input_hw,
+            )
+
+            rvt_ranges_prev.append(hardproj_ranges_prev_init[lvl] + prev_delta)
+            rvt_ranges_curr.append(hardproj_ranges_curr_init[lvl] + curr_delta)
+
+        return rvt_ranges_prev, rvt_ranges_curr
+
+    def forward(
+        self,
+        img_prev,
+        img_curr,
+        depth_prev,
+        depth_curr,
+        proj_pix_prev,
+        proj_pix_curr,
+        sensor_metas,
+        attn_type,
+        attn_splits_list,
+        corr_radius_list,
+        prop_radius_list,
+        num_reg_refine,
+        scale_only,
+        return_debug=False,
+    ):
+        del depth_prev, depth_curr
+        if sensor_metas is None:
+            raise ValueError('sensor_metas must be provided when RVT refinement is enabled.')
+
+        feature_outputs = self._extract_multi_view_features(
+            img_prev=img_prev,
+            img_curr=img_curr,
+            attn_type=attn_type,
+            attn_splits_list=attn_splits_list,
+            corr_radius_list=corr_radius_list,
+            prop_radius_list=prop_radius_list,
+            num_reg_refine=num_reg_refine,
+        )
+
+        hardproj_corr_range_init, hardproj_ranges_prev_init, hardproj_ranges_curr_init = (
+            self._build_hardproj_initial_ranges(
+                multi_level_feats_prev=feature_outputs['multi_level_feats_prev'],
+                multi_level_feats_curr=feature_outputs['multi_level_feats_curr'],
+                corr_list=feature_outputs['corr_list'],
+                proj_pix_prev=proj_pix_prev,
+                proj_pix_curr=proj_pix_curr,
+                H_img=feature_outputs['H_img'],
+                W_img=feature_outputs['W_img'],
+            )
+        )
+
+        input_hw = (feature_outputs['H_img'], feature_outputs['W_img'])
+        corr_range = self._refine_corr_range(
+            corr_list=feature_outputs['corr_list'],
+            hardproj_corr_range_init=hardproj_corr_range_init,
+            sensor_metas=sensor_metas,
+            input_hw=input_hw,
+        )
+        multi_level_ranges_prev, multi_level_ranges_curr = self._refine_feature_ranges(
+            multi_level_feats_prev=feature_outputs['multi_level_feats_prev'],
+            multi_level_feats_curr=feature_outputs['multi_level_feats_curr'],
+            hardproj_ranges_prev_init=hardproj_ranges_prev_init,
+            hardproj_ranges_curr_init=hardproj_ranges_curr_init,
+            sensor_metas=sensor_metas,
+            input_hw=input_hw,
+        )
 
         debug_dict = None
         if return_debug:
             debug_dict = {
-                'multi_level_feats_prev': multi_level_feats_prev,
-                'multi_level_feats_curr': multi_level_feats_curr,
+                'multi_level_feats_prev': feature_outputs['multi_level_feats_prev'],
+                'multi_level_feats_curr': feature_outputs['multi_level_feats_curr'],
+                'multi_level_ranges_prev_init': hardproj_ranges_prev_init,
+                'multi_level_ranges_curr_init': hardproj_ranges_curr_init,
                 'multi_level_ranges_prev': multi_level_ranges_prev,
                 'multi_level_ranges_curr': multi_level_ranges_curr,
+                'corr_range_init': hardproj_corr_range_init,
+                'corr_range': corr_range,
             }
 
-        # ----- 预测（两分支）-----
-        # scale 分支
-        corr_encoded_s = self.conv_corr(corr_range)
-        initial_scale = F.softplus(corr_encoded_s[:, :1]) + 1e-3
-        corr_encoded_s = corr_encoded_s[:, 1:]
-
+        corr_encoded_scale = self.conv_corr(corr_range)
+        initial_scale = F.softplus(corr_encoded_scale[:, :1]) + 1e-3
+        corr_encoded_scale = corr_encoded_scale[:, 1:]
         scales = self.scale_net(
-            corr_encoded_s, multi_level_ranges_prev, multi_level_ranges_curr, initial_scale
+            corr_encoded_scale,
+            multi_level_ranges_prev,
+            multi_level_ranges_curr,
+            initial_scale,
         )
         if scale_only:
             if return_debug:
                 return scales, None, debug_dict
             return scales, None
 
-        # risk 分支
-        corr_encoded = self.conv_corr_risk(corr_range)
-        initial_risk = corr_encoded[:, :1]
-        corr_encoded = corr_encoded[:, 1:]
+        corr_encoded_risk = self.conv_corr_risk(corr_range)
+        initial_risk = corr_encoded_risk[:, :1]
+        corr_encoded_risk = corr_encoded_risk[:, 1:]
         risk_score = self.risk_net(
-            corr_encoded, multi_level_ranges_prev, multi_level_ranges_curr, initial_risk
+            corr_encoded_risk,
+            multi_level_ranges_prev,
+            multi_level_ranges_curr,
+            initial_risk,
         )
-
-        t4 = time.perf_counter()
-        # print(f"scale & risk prediction time: {t4 - t3:.4f} s")
 
         if return_debug:
             return scales, risk_score, debug_dict
         return scales, risk_score
 
-
-    def forward_with_loss( 
-            self,
-            img_prev,                      # Tensor[B, V, 3, H, W]
-            img_curr,                      # Tensor[B, V, 3, H, W]
-            depth_prev,                    # Tensor[B, V, 1, H, W]
-            depth_curr,                    # Tensor[B, V, 1, H, W]
-            proj_pix_prev,                 
-            proj_pix_curr,                 
-            gt_scale_map_with_mask,        # Tensor[B, 2, H_sph, W_sph]
-            gt_risk_score_map_with_mask,   # Tensor[B, 2, H_sph, W_sph]
-            attn_type,                     # str
-            attn_splits_list,              # List[int]
-            corr_radius_list,              # List[int]
-            prop_radius_list,              # List[int]
-            num_reg_refine,                # int
-            scale_only,
-            loss_weight_alpha=0.0,
-            return_debug=False,
-        ):
-
+    def forward_with_loss(
+        self,
+        img_prev,
+        img_curr,
+        depth_prev,
+        depth_curr,
+        proj_pix_prev,
+        proj_pix_curr,
+        gt_scale_map_with_mask,
+        gt_risk_score_map_with_mask,
+        sensor_metas,
+        attn_type,
+        attn_splits_list,
+        corr_radius_list,
+        prop_radius_list,
+        num_reg_refine,
+        scale_only,
+        loss_weight_alpha=0.0,
+        return_debug=False,
+    ):
         outputs = self.forward(
-            img_prev         = img_prev,
-            img_curr         = img_curr,
-            depth_prev       = depth_prev,
-            depth_curr       = depth_curr,
-            proj_pix_prev    = proj_pix_prev,
-            proj_pix_curr    = proj_pix_curr,
-            attn_type        = attn_type,
-            attn_splits_list = attn_splits_list,
-            corr_radius_list = corr_radius_list,
-            prop_radius_list = prop_radius_list,
-            num_reg_refine   = num_reg_refine,
-            scale_only       = scale_only,
-            return_debug     = return_debug,
+            img_prev=img_prev,
+            img_curr=img_curr,
+            depth_prev=depth_prev,
+            depth_curr=depth_curr,
+            proj_pix_prev=proj_pix_prev,
+            proj_pix_curr=proj_pix_curr,
+            sensor_metas=sensor_metas,
+            attn_type=attn_type,
+            attn_splits_list=attn_splits_list,
+            corr_radius_list=corr_radius_list,
+            prop_radius_list=prop_radius_list,
+            num_reg_refine=num_reg_refine,
+            scale_only=scale_only,
+            return_debug=return_debug,
         )
         if return_debug:
             scales, risks, debug_dict = outputs
         else:
             scales, risks = outputs
+
         if scale_only:
-            # 仅计算尺度分支的损失
-            loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask, loss_weight_alpha=loss_weight_alpha)
+            loss_scale = get_loss_scale_map(
+                scales,
+                gt_scale_map_with_mask,
+                loss_weight_alpha=loss_weight_alpha,
+            )
             if return_debug:
-                return scales, None, loss_s, None, debug_dict
-            return scales, None, loss_s, None
-        else:
-            loss_r = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
-            if return_debug:
-                return None, risks, None, loss_r, debug_dict
-            return None, risks, None, loss_r
+                return scales, None, loss_scale, None, debug_dict
+            return scales, None, loss_scale, None
+
+        loss_risk = get_loss_risk_score_map(risks, gt_risk_score_map_with_mask)
+        if return_debug:
+            return scales, risks, None, loss_risk, debug_dict
+        return scales, risks, None, loss_risk
 
     def extract_feature(self, im0, im1, branch):
         x = torch.cat([im0, im1], dim=0)
         feats = self.cnet(x, branch=branch)[::-1]
         p0, p1 = [], []
-        for f in feats:
-            a, b = torch.chunk(f, 2, dim=0)
-            p0.append(a); p1.append(b)
+        for feat in feats:
+            a, b = torch.chunk(feat, 2, dim=0)
+            p0.append(a)
+            p1.append(b)
         return p0, p1
-    
-    def project_views_to_range(
-        self,
-        features_list,   # list of V tensors, each [B, C, H_feat, W_feat]
-        proj_pix,        # LongTensor [B, H_r, W_r, 3] = (cam_idx, u_orig, v_orig)
-        H_img=160, W_img=320
-    ):
-        """
-        把 V 路视角、同一尺度的特征图，按 proj_pix 映射到 range-view [B, C, H_r, W_r]。
-        """
+
+    def project_views_to_range(self, features_list, proj_pix, H_img=160, W_img=320):
+        """Project multi-view image features to range-view using cached hard projection indices."""
         B, H_r, W_r, _ = proj_pix.shape
         V = len(features_list)
         C = features_list[0].shape[1]
         H_feat, W_feat = features_list[0].shape[2], features_list[0].shape[3]
 
-        # 1) 下采样比例
-        s_u = W_feat / W_img
-        s_v = H_feat / H_img
+        scale_u = W_feat / W_img
+        scale_v = H_feat / H_img
 
-        # 2) 合并成 [B, V, C, Hf, Wf] → [B*V, C, Hf, Wf]
-        feats = torch.stack(features_list, dim=1)         # [B,V,C,Hf,Wf]
-        feats = feats.view(B*V, C, H_feat, W_feat)
-        feats_flat = feats.view(B*V, C, -1)               # [B*V, C, Hf*Wf]
+        feats = torch.stack(features_list, dim=1)
+        feats = feats.view(B * V, C, H_feat, W_feat)
+        feats_flat = feats.view(B * V, C, -1)
 
-        # 3) 拆出并缩放像素索引
-        cam_idx = proj_pix[..., 0].reshape(B, -1)         # [B, N]
-        u_orig  = proj_pix[..., 1].float().reshape(B, -1) # [B, N]
-        v_orig  = proj_pix[..., 2].float().reshape(B, -1) # [B, N]
+        cam_idx = proj_pix[..., 0].reshape(B, -1)
+        u_orig = proj_pix[..., 1].float().reshape(B, -1)
+        v_orig = proj_pix[..., 2].float().reshape(B, -1)
 
-        u_feat = (u_orig * s_u).long().clamp(0, W_feat-1) # [B, N]
-        v_feat = (v_orig * s_v).long().clamp(0, H_feat-1) # [B, N]
+        u_feat = (u_orig * scale_u).long().clamp(0, W_feat - 1)
+        v_feat = (v_orig * scale_v).long().clamp(0, H_feat - 1)
 
-        # 4) 计算扁平化后的批次＋视角索引
-        #    batch_idx ∈ [0..B) 重复 N 次，拼接 cam_idx → [B*N]
-        batch_idx = torch.arange(B, device=cam_idx.device)\
-                        .unsqueeze(1).repeat(1, H_r*W_r)\
-                        .reshape(-1)
-        view_idx  = batch_idx * V + cam_idx.reshape(-1)   # [B*N]
+        batch_idx = torch.arange(B, device=cam_idx.device).unsqueeze(1).repeat(1, H_r * W_r).reshape(-1)
+        view_idx = batch_idx * V + cam_idx.reshape(-1)
+        pix_idx = (v_feat * W_feat + u_feat).reshape(-1)
 
-        # 5) 计算在 Hf*Wf 上的线性化像素
-        pix_idx   = (v_feat * W_feat + u_feat).reshape(-1)  # [B*N]
-
-        # 6) 一次性 gather
-        #    feats_flat[view_idx, :, pix_idx] → [B*N, C]
         selected = feats_flat[view_idx, :, pix_idx]
-
-        # 7) 重塑回 [B, C, H_r, W_r]
-        range_feat = selected.view(B, H_r*W_r, C) \
-                            .permute(0,2,1) \
-                            .reshape(B, C, H_r, W_r)
+        range_feat = selected.view(B, H_r * W_r, C).permute(0, 2, 1).reshape(B, C, H_r, W_r)
         return range_feat

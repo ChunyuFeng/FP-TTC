@@ -1,3 +1,4 @@
+import math
 from PIL import Image
 import os
 import time
@@ -179,6 +180,12 @@ parser.add_argument(
     type=str, default=None,
     help='path to pretrained scale‑only model (.pth or .pth.tar)'
 )
+parser.add_argument(
+    '--hardproj_pretrained_ckpt',
+    type=str,
+    default=None,
+    help='path to a mature hardproj checkpoint used to initialize the RVT model'
+)
 
 # 学习率调度
 parser.add_argument('--pct_start', type=float, default=0.05,
@@ -190,6 +197,16 @@ parser.add_argument('--grad_accum_steps', type=int, default=1,
 parser.add_argument('--loss_weight_alpha', type=float, default=0.0,
                     help='distance-based loss reweighting alpha; 0=off, recommended 2~5 '
                          '(higher = more weight on pixels far from scale=1.0)')
+parser.add_argument('--metric_delta_t', type=float, default=0.1,
+                    help='frame interval used to convert scale to TTC for paper metrics')
+parser.add_argument('--metric_tau_theta', type=float, default=math.pi / 12.0,
+                    help='orientation tolerance used by SCOPE orientation metrics')
+parser.add_argument('--metric_tau_t', type=float, default=2.0,
+                    help='TTC threshold used by SCOPE high-risk orientation metrics')
+parser.add_argument('--metric_fbeta_beta', type=float, default=2.0,
+                    help='beta used in HR-Fbeta; default follows the paper F2 setting')
+parser.add_argument('--metric_mid_scale', type=float, default=1e4,
+                    help='multiplier used in MiD Err to match the paper metric scale')
 
 # neptune
 parser.add_argument('--neptune', action='store_true',
@@ -211,14 +228,17 @@ else:
 def build_optimizer(model, args):
     """
     构造分层学习率的 AdamW 优化器。
-    预训练模块 (cnet/featnet/corrnet/scale_net/risk_net) 使用基础 LR，
-    随机初始化模块 (conv_corr/conv_corr_risk) 使用 LR * new_module_lr_mult。
+    预训练模块（成熟 hardproj 主干与 head）使用基础 LR，
+    随机初始化的 RVT 相关模块使用 LR * new_module_lr_mult。
     """
     base_lr = args.lr
     mult = getattr(args, 'new_module_lr_mult', 5.0)
 
-    # 随机初始化模块的前缀（从 hardproj_rgbdinput 加载时这些模块因 4ch→3ch 或其他原因未能加载）
-    new_module_prefixes = ('conv_corr.', 'conv_corr_risk.')
+    new_module_prefixes = (
+        'rvt_feat.',
+        'rvt_corr.',
+        'corr_residual_decoder.',
+    )
 
     pretrained_params = []
     new_params = []
@@ -262,6 +282,72 @@ def build_optimizer(model, args):
         param_groups,
         lr=base_lr, weight_decay=args.weight_decay)
     return optimizer
+
+
+def _extract_state_dict(checkpoint):
+    if 'model' in checkpoint:
+        return checkpoint['model']
+    if 'net' in checkpoint:
+        return checkpoint['net']
+    if 'state_dict' in checkpoint:
+        return checkpoint['state_dict']
+    return checkpoint
+
+
+def _align_state_dict_prefix(state_dict, model_state_dict):
+    model_has_module = any(key.startswith('module.') for key in model_state_dict.keys())
+    ckpt_has_module = any(key.startswith('module.') for key in state_dict.keys())
+
+    if model_has_module and not ckpt_has_module:
+        return {'module.' + key: value for key, value in state_dict.items()}
+    if not model_has_module and ckpt_has_module:
+        return {key.replace('module.', '', 1): value for key, value in state_dict.items()}
+    return state_dict
+
+
+def load_flexible_checkpoint(model, checkpoint_path, device, tag='CHECKPOINT'):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    raw_state_dict = _extract_state_dict(checkpoint)
+    model_state_dict = model.state_dict()
+    raw_state_dict = _align_state_dict_prefix(raw_state_dict, model_state_dict)
+
+    loadable_state_dict = {}
+    skipped_shape = []
+    ignored_unexpected = []
+
+    for key, value in raw_state_dict.items():
+        if key not in model_state_dict:
+            ignored_unexpected.append(key)
+            continue
+        if value.shape != model_state_dict[key].shape:
+            skipped_shape.append((key, list(value.shape), list(model_state_dict[key].shape)))
+            continue
+        loadable_state_dict[key] = value
+
+    load_info = model.load_state_dict(loadable_state_dict, strict=False)
+
+    if is_main_process():
+        print(f"[{tag}] Loaded {len(loadable_state_dict)} keys from {checkpoint_path}")
+        if load_info.missing_keys:
+            print(f"[{tag}] Missing {len(load_info.missing_keys)} keys:")
+            for key in load_info.missing_keys:
+                print(f"    {key}")
+        if skipped_shape:
+            print(f"[{tag}] Skipped {len(skipped_shape)} shape-mismatched keys:")
+            for key, ckpt_shape, model_shape in skipped_shape:
+                print(f"    {key}: ckpt={ckpt_shape} model={model_shape}")
+        if ignored_unexpected:
+            print(f"[{tag}] Ignored {len(ignored_unexpected)} unexpected keys:")
+            for key in ignored_unexpected:
+                print(f"    {key}")
+
+    return checkpoint
+
+
+def set_trainable_prefixes(model, trainable_prefixes):
+    for name, param in model.named_parameters():
+        bare_name = name[len('module.'):] if name.startswith('module.') else name
+        param.requires_grad = any(bare_name.startswith(prefix) for prefix in trainable_prefixes)
 
 def main():
 
@@ -326,6 +412,15 @@ def main():
             print(f"[WARN] Unexpected ({len(load_info.unexpected_keys)}) keys (not used by model):")
             for k in load_info.unexpected_keys:
                 print(f"    {k}")
+
+    pretrained_ckpt_path = args.hardproj_pretrained_ckpt or args.scale_pretrained_ckpt
+    if pretrained_ckpt_path is not None and args.resume is None:
+        load_flexible_checkpoint(
+            model=model,
+            checkpoint_path=pretrained_ckpt_path,
+            device=device,
+            tag='HARDPROJ_PRETRAINED',
+        )
     
     if parallel:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], \
@@ -349,80 +444,14 @@ def main():
     
     # stage 1: train scale branch
     if args.train_stage in ('scale', 'both'):
-        ########################### LOAD PRETRAINED MODEL ###########################
-        if args.scale_pretrained_ckpt is not None:
-            ckpt = torch.load(args.scale_pretrained_ckpt, map_location=device)
-            # 提取 state_dict
-            if 'model' in ckpt:
-                sd = ckpt['model']
-            elif 'net' in ckpt:
-                sd = ckpt['net']
-            elif 'state_dict' in ckpt:
-                sd = ckpt['state_dict']
-            else:
-                sd = ckpt
-
-            # 让 checkpoint key 与 model key 对齐（自适应处理 module. 前缀）
-            model_dict = model.state_dict()
-            model_has_module = any(k.startswith('module.') for k in model_dict)
-            ckpt_has_module = any(k.startswith('module.') for k in sd)
-            if model_has_module and not ckpt_has_module:
-                sd = {'module.' + k: v for k, v in sd.items()}
-            elif not model_has_module and ckpt_has_module:
-                sd = {k.replace('module.', '', 1): v for k, v in sd.items()}
-
-            # 处理 cnet.conv1.weight 的 RGBD(4ch) → RGB(3ch) 裁剪
-            conv1_key = 'module.cnet.conv1.weight' if model_has_module else 'cnet.conv1.weight'
-            if conv1_key in sd and conv1_key in model_dict:
-                ckpt_shape = sd[conv1_key].shape   # e.g. [64, 4, 7, 7]
-                model_shape = model_dict[conv1_key].shape  # e.g. [64, 3, 7, 7]
-                if ckpt_shape[1] != model_shape[1] and ckpt_shape[1] > model_shape[1]:
-                    if is_main_process():
-                        print(f"[PRETRAINED] Trimming {conv1_key}: {list(ckpt_shape)} → {list(model_shape)} (keeping first {model_shape[1]} input channels)")
-                    sd[conv1_key] = sd[conv1_key][:, :model_shape[1], :, :]
-
-            # 过滤掉 shape 不匹配的 key（安全兜底）
-            filtered = {}
-            skipped = []
-            for k, v in sd.items():
-                if k in model_dict:
-                    if v.shape == model_dict[k].shape:
-                        filtered[k] = v
-                    else:
-                        skipped.append((k, list(v.shape), list(model_dict[k].shape)))
-                # 跳过 checkpoint 中有但 model 中没有的 key（unexpected）
-
-            # 注入到当前模型里
-            model_dict.update(filtered)
-            load_info = model.load_state_dict(model_dict, strict=False)
-            if is_main_process():
-                loaded = set(filtered.keys()) - set(load_info.unexpected_keys)
-                print(f"[PRETRAINED] Loaded {len(loaded)}/{len(model_dict)} keys from {args.scale_pretrained_ckpt}")
-                if skipped:
-                    print(f"[PRETRAINED] Skipped {len(skipped)} shape-mismatched keys:")
-                    for k, s1, s2 in skipped:
-                        print(f"    {k}: ckpt={s1} vs model={s2}")
-                missing_in_ckpt = [k for k in model_dict if k not in sd]
-                if missing_in_ckpt:
-                    print(f"[PRETRAINED] {len(missing_in_ckpt)} keys not in checkpoint (random init):")
-                    for k in sorted(missing_in_ckpt):
-                        print(f"    {k}")
-            ##########################################################################
-        # 1) freeze risk branch
-        freeze_prefixes = (
-            'conv_corr_risk.','risk_net.'
+        scale_stage_trainable = (
+            'rvt_feat.',
+            'rvt_corr.',
+            'corr_residual_decoder.',
+            'conv_corr.',
+            'scale_net.',
         )
-
-        for name, p in model.named_parameters():
-            # remove "module." prefix if using DDP
-            bare_name = name
-            if bare_name.startswith('module.'):
-                bare_name = bare_name[len('module.'):]
-            
-            if any(bare_name.startswith(prefix) for prefix in freeze_prefixes):
-                p.requires_grad = False
-            else:
-                p.requires_grad = True
+        set_trainable_prefixes(model, scale_stage_trainable)
 
         optimizer = build_optimizer(model, args)
 
@@ -450,20 +479,11 @@ def main():
 
     # stage 2: train risk branch
     if args.train_stage in ('risk', 'both'):
-        # 1) freeze scale branch
-        freeze_prefixes = (
-            'cnet.','featnet.','corrnet.','conv_corr.','scale_net.'
+        risk_stage_trainable = (
+            'conv_corr_risk.',
+            'risk_net.',
         )
-
-        for name, p in model.named_parameters():
-            bare_name = name
-            if bare_name.startswith('module.'):
-                bare_name = bare_name[len('module.'):]
-            
-            if any(bare_name.startswith(prefix) for prefix in freeze_prefixes):
-                p.requires_grad = False
-            else:
-                p.requires_grad = True
+        set_trainable_prefixes(model, risk_stage_trainable)
 
         optimizer = build_optimizer(model, args)
 

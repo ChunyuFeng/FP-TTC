@@ -22,6 +22,16 @@ from utils.dist import DistributedEvalSampler, is_main_process
 
 from PIL import Image
 from .draw import visual_scale_map_range_image, visual_risk_score_map_range_image
+from .metrics import (
+    add_metric_sums,
+    compute_orientation_metric_sums,
+    compute_scale_metric_sums,
+    finalize_orientation_metrics,
+    finalize_scale_metrics,
+    init_orientation_metric_sums,
+    init_scale_metric_sums,
+    reduce_metric_sums,
+)
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
 
 
@@ -174,7 +184,7 @@ class TTCTrainer(object):
         self.prop_radius_list=args.prop_radius_list
         self.num_reg_refine=args.num_reg_refine
 
-        self.grad_clip = 1.0
+        self.grad_clip = getattr(args, 'grad_clip', 1.0)
         self.checkpoint_interval = 20 # 保存模型的间隔
 
         self.loss_per_epoch = 0
@@ -190,6 +200,84 @@ class TTCTrainer(object):
         self.debug_visualize_projection = bool(getattr(args, 'debug_visualize_projection', False))
         self.debug_visualize_dir = getattr(args, 'debug_visualize_dir', None)
         self._projection_debug_saved = False
+        self.metric_delta_t = getattr(args, 'metric_delta_t', 0.1)
+        self.metric_tau_theta = getattr(args, 'metric_tau_theta', math.pi / 12.0)
+        self.metric_tau_t = getattr(args, 'metric_tau_t', 2.0)
+        self.metric_fbeta_beta = getattr(args, 'metric_fbeta_beta', 2.0)
+        self.metric_mid_scale = getattr(args, 'metric_mid_scale', 1e4)
+
+    def _move_sensor_metas_to_device(self, sensor_metas):
+        for frame_key in sensor_metas:
+            for channel in sensor_metas[frame_key]:
+                for key in sensor_metas[frame_key][channel]:
+                    sensor_metas[frame_key][channel][key] = sensor_metas[frame_key][channel][key].to(self.device)
+        return sensor_metas
+
+    def _init_epoch_metric_sums(self):
+        if self.scale_only:
+            return init_scale_metric_sums()
+        return init_orientation_metric_sums()
+
+    def _compute_batch_metric_sums(
+        self,
+        scale_pred,
+        risk_pred,
+        gt_scale_map_with_mask,
+        gt_risk_score_map_with_mask,
+    ):
+        if self.scale_only:
+            return compute_scale_metric_sums(
+                scale_pred,
+                gt_scale_map_with_mask,
+                delta_t=self.metric_delta_t,
+                mid_scale=self.metric_mid_scale,
+            )
+
+        return compute_orientation_metric_sums(
+            scale_pred,
+            risk_pred,
+            gt_scale_map_with_mask,
+            gt_risk_score_map_with_mask,
+            delta_t=self.metric_delta_t,
+            tau_theta=self.metric_tau_theta,
+            tau_t=self.metric_tau_t,
+        )
+
+    def _finalize_epoch_metrics(self, metric_sums):
+        reduced_sums = reduce_metric_sums(metric_sums, self.device)
+        if self.scale_only:
+            return finalize_scale_metrics(reduced_sums)
+        return finalize_orientation_metrics(
+            reduced_sums,
+            beta=self.metric_fbeta_beta,
+        )
+
+    def _format_metric_summary(self, split_name, metrics):
+        if self.scale_only:
+            return (
+                f"{split_name} scale metrics: "
+                f"MiD Err={metrics['mid_err']:.4f}  "
+                f"Err-1={metrics['err_1'] * 100:.2f}%  "
+                f"Err-2={metrics['err_2'] * 100:.2f}%  "
+                f"Err-5={metrics['err_5'] * 100:.2f}%"
+            )
+
+        return (
+            f"{split_name} orientation metrics: "
+            f"MAE_theta={metrics['mae_theta']:.6f}  "
+            f"Acc@tau_theta={metrics['acc_tau_theta']:.4f}  "
+            f"HR-Precision={metrics['hr_precision']:.4f}  "
+            f"HR-Recall={metrics['hr_recall']:.4f}  "
+            f"HR-F2={metrics['hr_f2']:.4f}"
+        )
+
+    def _log_epoch_metrics(self, split_name, metrics, epoch):
+        if self.neptune_run is None or not is_main_process():
+            return
+
+        stage_tag = 'scale' if self.scale_only else 'orientation'
+        for metric_name, metric_value in metrics.items():
+            self.neptune_run[f"{split_name}/{stage_tag}_{metric_name}"].append(metric_value, step=epoch)
 
 
     def train(self):
@@ -205,10 +293,10 @@ class TTCTrainer(object):
             self.loss_per_epoch = 0
             self.loss_sum_per_epoch = 0
             self.iters = 0
-            train_loss = self.train_epoch(epoch)
-            val_loss = None
+            train_result = self.train_epoch(epoch)
+            val_result = None
             if self.val_loader is not None and epoch % self.val_freq == 0:
-                val_loss = self.validate_epoch(epoch)
+                val_result = self.validate_epoch(epoch)
 
             if is_main_process():
                 if (epoch < self.epoch and epoch % self.checkpoint_interval == 0):
@@ -218,15 +306,17 @@ class TTCTrainer(object):
                         temp_pth = os.path.join(self.out_dir, f'{epoch}.pth.tar')
                     self._save_checkpoint(temp_pth, epoch)
 
-                if self.save_best and val_loss is not None and val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
+                if self.save_best and val_result is not None and val_result['loss'] < self.best_val_loss:
+                    self.best_val_loss = val_result['loss']
                     best_path = os.path.join(self.out_dir, self.best_ckpt_name)
                     self._save_checkpoint(best_path, epoch)
-                    print(f"Best checkpoint updated: {best_path} (val_loss={val_loss:.6f})")
+                    print(f"Best checkpoint updated: {best_path} (val_loss={val_result['loss']:.6f})")
 
-                print("Train loss in epoch", epoch, ":", train_loss)
-                if val_loss is not None:
-                    print("Val loss in epoch", epoch, ":", val_loss)
+                print("Train loss in epoch", epoch, ":", train_result['loss'])
+                print(self._format_metric_summary('Train', train_result['metrics']))
+                if val_result is not None:
+                    print("Val loss in epoch", epoch, ":", val_result['loss'])
+                    print(self._format_metric_summary('Val', val_result['metrics']))
                     print("Best val loss so far:", self.best_val_loss)
                 for i, pg in enumerate(self.optimizer.param_groups):
                     print(f"  param group {i} lr = {pg['lr']:.3e}")
@@ -240,6 +330,7 @@ class TTCTrainer(object):
         
         epoch_loss = 0
         steps = 0
+        metric_sums = self._init_epoch_metric_sums()
 
         save_index = 1000
         for i, data in enumerate(self.train_loader):
@@ -251,7 +342,8 @@ class TTCTrainer(object):
              proj_pix_prev_tensor,
              proj_pix_curr_tensor,
              gt_scale_map_with_mask,
-             gt_risk_score_map_with_mask) = data
+             gt_risk_score_map_with_mask,
+             sensor_metas) = data
             
             prev_surr_view_imgs_tensor   = prev_surr_view_imgs_tensor.to(self.device)
             curr_surr_view_imgs_tensor   = curr_surr_view_imgs_tensor.to(self.device)
@@ -261,7 +353,7 @@ class TTCTrainer(object):
             proj_pix_curr_tensor         = proj_pix_curr_tensor.to(self.device)
             gt_scale_map_with_mask       = gt_scale_map_with_mask.to(self.device)
             gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
-            # affine_matrix                = affine_matrix.to(self.device)
+            sensor_metas                 = self._move_sensor_metas_to_device(sensor_metas)
 
             capture_projection_debug = (
                 self.debug_visualize_projection
@@ -284,6 +376,7 @@ class TTCTrainer(object):
                     proj_pix_curr                 = proj_pix_curr_tensor,
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
                     gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
+                    sensor_metas                  = sensor_metas,
                     attn_type                     = self.attn_type,
                     attn_splits_list              = self.attn_splits_list,
                     corr_radius_list              = self.corr_radius_list,
@@ -303,6 +396,7 @@ class TTCTrainer(object):
                     proj_pix_curr                 = proj_pix_curr_tensor,
                     gt_scale_map_with_mask        = gt_scale_map_with_mask,
                     gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
+                    sensor_metas                  = sensor_metas,
                     attn_type                     = self.attn_type,
                     attn_splits_list              = self.attn_splits_list,
                     corr_radius_list              = self.corr_radius_list,
@@ -320,6 +414,17 @@ class TTCTrainer(object):
                 scale, risk_score, loss_s, loss_r = model_outputs
             
             loss = loss_s if self.scale_only else loss_r
+
+            with torch.no_grad():
+                metric_sums = add_metric_sums(
+                    metric_sums,
+                    self._compute_batch_metric_sums(
+                        scale,
+                        risk_score,
+                        gt_scale_map_with_mask,
+                        gt_risk_score_map_with_mask,
+                    ),
+                )
 
             # 支持 gradient accumulation
             if self.grad_accum_steps > 1:
@@ -415,14 +520,19 @@ class TTCTrainer(object):
                     self.neptune_run[tag].append(pg["lr"], step=global_step)
         
         avg_loss = epoch_loss / steps
+        epoch_metrics = self._finalize_epoch_metrics(metric_sums)
 
         if self.neptune_run is not None and is_main_process():
             self.neptune_run["train/epoch_loss"].append(avg_loss, step=epoch)
             for group_idx, pg in enumerate(self.optimizer.param_groups):
                 tag = f"train/epoch_learning_rate_group_{group_idx}"
                 self.neptune_run[tag].append(pg["lr"], step=epoch)
+        self._log_epoch_metrics('train', epoch_metrics, epoch)
 
-        return avg_loss
+        return {
+            'loss': avg_loss,
+            'metrics': epoch_metrics,
+        }
 
     def _save_projection_debug(self, prev_imgs, curr_imgs, debug_dict, batch_index):
         output_dir = self.debug_visualize_dir
@@ -466,6 +576,16 @@ class TTCTrainer(object):
                     os.path.join(output_dir, f'{frame_name}_scale{scale_idx}_range_norm.png')
                 )
 
+                init_key = f'{range_key}_init'
+                if init_key in debug_dict:
+                    init_range_feature = debug_dict[init_key][scale_idx][0]
+                    Image.fromarray(_feature_pca_rgb(init_range_feature)).save(
+                        os.path.join(output_dir, f'{frame_name}_scale{scale_idx}_range_init_pca.png')
+                    )
+                    Image.fromarray(_feature_norm_rgb(init_range_feature)).save(
+                        os.path.join(output_dir, f'{frame_name}_scale{scale_idx}_range_init_norm.png')
+                    )
+
     @torch.no_grad()
     def validate_epoch(self, epoch):
         if self.val_loader is None:
@@ -477,6 +597,7 @@ class TTCTrainer(object):
         self.model.eval()
         total_loss = 0.0
         total_samples = 0
+        metric_sums = self._init_epoch_metric_sums()
 
         for data in self.val_loader:
             (prev_surr_view_imgs_tensor,
@@ -486,7 +607,8 @@ class TTCTrainer(object):
              proj_pix_prev_tensor,
              proj_pix_curr_tensor,
              gt_scale_map_with_mask,
-             gt_risk_score_map_with_mask) = data
+             gt_risk_score_map_with_mask,
+             sensor_metas) = data
 
             prev_surr_view_imgs_tensor   = prev_surr_view_imgs_tensor.to(self.device)
             curr_surr_view_imgs_tensor   = curr_surr_view_imgs_tensor.to(self.device)
@@ -496,9 +618,10 @@ class TTCTrainer(object):
             proj_pix_curr_tensor         = proj_pix_curr_tensor.to(self.device)
             gt_scale_map_with_mask       = gt_scale_map_with_mask.to(self.device)
             gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
+            sensor_metas                 = self._move_sensor_metas_to_device(sensor_metas)
 
             model_ref = self.model.module if hasattr(self.model, "module") else self.model
-            _, _, loss_s, loss_r = model_ref.forward_with_loss(
+            scale, risk_score, loss_s, loss_r = model_ref.forward_with_loss(
                 img_prev                    = prev_surr_view_imgs_tensor,
                 img_curr                    = curr_surr_view_imgs_tensor,
                 depth_prev                  = prev_surr_view_depths_tensor,
@@ -507,6 +630,7 @@ class TTCTrainer(object):
                 proj_pix_curr               = proj_pix_curr_tensor,
                 gt_scale_map_with_mask      = gt_scale_map_with_mask,
                 gt_risk_score_map_with_mask = gt_risk_score_map_with_mask,
+                sensor_metas                = sensor_metas,
                 attn_type                   = self.attn_type,
                 attn_splits_list            = self.attn_splits_list,
                 corr_radius_list            = self.corr_radius_list,
@@ -516,6 +640,15 @@ class TTCTrainer(object):
             )
 
             loss = loss_s if self.scale_only else loss_r
+            metric_sums = add_metric_sums(
+                metric_sums,
+                self._compute_batch_metric_sums(
+                    scale,
+                    risk_score,
+                    gt_scale_map_with_mask,
+                    gt_risk_score_map_with_mask,
+                ),
+            )
             batch_samples = prev_surr_view_imgs_tensor.shape[0]
             total_loss += loss.item() * batch_samples
             total_samples += batch_samples
@@ -527,13 +660,18 @@ class TTCTrainer(object):
             total_samples = int(stats[1].item())
 
         avg_loss = total_loss / max(1, total_samples)
+        epoch_metrics = self._finalize_epoch_metrics(metric_sums)
         self.model.train()
 
         if self.neptune_run is not None and is_main_process():
             tag = "val/epoch_loss_scale" if self.scale_only else "val/epoch_loss_risk"
             self.neptune_run[tag].append(avg_loss, step=epoch)
+        self._log_epoch_metrics('val', epoch_metrics, epoch)
 
-        return avg_loss
+        return {
+            'loss': avg_loss,
+            'metrics': epoch_metrics,
+        }
 
     def _save_checkpoint(self, path, epoch):
         checkpoint = {

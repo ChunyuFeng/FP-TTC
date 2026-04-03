@@ -96,6 +96,55 @@ def _validate_proj_cache_meta(cache_root: Path, crop_size):
     if meta.get('augmentor', {}).get('do_flip') is not False or meta.get('augmentor', {}).get('rotate') is not False:
         raise ValueError('Projection cache was generated with incompatible augmentation settings.')
 
+
+def build_frame_sensor_metas(data, dataset_key, frame_key, affine_matrix, idx=None):
+    """Build per-camera geometry metadata for one frame without changing proj mapping APIs."""
+    sample_info = data if idx is None else data[idx]
+    sensor_metas_channel = {}
+
+    for channel in CAMERA_CHANNELS:
+        if dataset_key == 'sjtu':
+            channel_meta = sample_info[f'sensor_metas_{frame_key}'][channel]
+            K_key = 'K_undist' if 'K_undist' in channel_meta else 'K'
+            sensor_metas_channel[channel] = {
+                'K': np.asarray(channel_meta[K_key], dtype=np.float32),
+                'R_l2c': np.asarray(channel_meta['R_l2c'], dtype=np.float32),
+                't_l2c': np.asarray(channel_meta['t_l2c'], dtype=np.float32).reshape(3),
+                'affine': np.asarray(affine_matrix, dtype=np.float32),
+            }
+            continue
+
+        if dataset_key == 'nusc':
+            sensor_metas = sample_info[f'sensor_metas_{frame_key}']
+            _, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
+                sensor_metas,
+                sensor_metas['camera']['calibrated_sensor'][channel],
+                sensor_metas['camera']['ego_pose'][channel]
+            )
+            sensor_metas_channel[channel] = {
+                'K': np.asarray(K, dtype=np.float32),
+                'R_l2c': np.asarray(R_l2c, dtype=np.float32),
+                't_l2c': np.asarray(t_l2c, dtype=np.float32).reshape(3),
+                'affine': np.asarray(affine_matrix, dtype=np.float32),
+            }
+            continue
+
+        raise ValueError(f"Unsupported dataset key: {dataset_key}")
+
+    return sensor_metas_channel
+
+
+def tensorize_sensor_metas(sensor_metas):
+    tensorized = {}
+    for frame_key, frame_sensor_metas in sensor_metas.items():
+        tensorized[frame_key] = {}
+        for channel, channel_metas in frame_sensor_metas.items():
+            tensorized[frame_key][channel] = {
+                key: torch.from_numpy(np.asarray(value)).float()
+                for key, value in channel_metas.items()
+            }
+    return tensorized
+
 class nuScenes_range_image(data.Dataset):
     def __init__(self,
                  aug_params=None,
@@ -263,6 +312,12 @@ class nuScenes_range_image(data.Dataset):
                 idx=None, dataset_root=self.dataset_root, H_r=40, W_r=480
             )
 
+        sensor_metas = {
+            'prev': build_frame_sensor_metas(info, 'nusc', 'prev', affine_matrix),
+            'curr': build_frame_sensor_metas(info, 'nusc', 'curr', affine_matrix),
+        }
+        sensor_metas = tensorize_sensor_metas(sensor_metas)
+
         for channel in camera_channels:
             prev_surr_view_imgs[channel] = torch.from_numpy(prev_surr_view_imgs[channel]).permute(2, 0, 1).float()
             curr_surr_view_imgs[channel] = torch.from_numpy(curr_surr_view_imgs[channel]).permute(2, 0, 1).float()
@@ -293,7 +348,8 @@ class nuScenes_range_image(data.Dataset):
                 proj_pix_prev_tensor,
                 proj_pix_curr_tensor,
                 gt_scale_map_with_mask,
-                gt_risk_map_with_mask)
+                gt_risk_map_with_mask,
+                sensor_metas)
 
     def __rmul__(self, v):
         self.samples = v * self.samples
