@@ -263,6 +263,24 @@ class FpTTC(nn.Module):
             scales, risks, debug_dict = outputs
         else:
             scales, risks = outputs
+
+        # Waymo uses a 40x400 projection cache but supervises against a 160x1920
+        # formal range image. Align predictions to GT shape only when needed.
+        if scales is not None and scales.shape[-2:] != gt_scale_map_with_mask.shape[-2:]:
+            scales = F.interpolate(
+                scales,
+                size=gt_scale_map_with_mask.shape[-2:],
+                mode='bilinear',
+                align_corners=True,
+            )
+        if risks is not None and risks.shape[-2:] != gt_risk_score_map_with_mask.shape[-2:]:
+            risks = F.interpolate(
+                risks,
+                size=gt_risk_score_map_with_mask.shape[-2:],
+                mode='bilinear',
+                align_corners=True,
+            )
+
         if scale_only:
             # 仅计算尺度分支的损失
             loss_s = get_loss_scale_map(scales, gt_scale_map_with_mask, loss_weight_alpha=loss_weight_alpha)

@@ -1,5 +1,6 @@
 from PIL import Image
 import os
+import os.path as osp
 import time
 import numpy as np
 import torch
@@ -12,11 +13,21 @@ import dataloader.dataset as datasets
 from fpttc.fp_ttc import FpTTC
 from utils.trainer import TTCTrainer
 from utils.dist import is_main_process
+from utils.waymo_paths import default_waymo_proj_cache_root
 
 import neptune
 
 time_stamp = datetime.datetime.now().strftime("%y_%m_%d-%H_%M_%S")
 out_dir = "./log/%s_surround_ttc"%(time_stamp)
+
+WAYMO_TRAIN_INFO_FILE = (
+    "waymo_train_infos_scene_flow_key_frames_top_lidar_160_1920_"
+    "fov_2_17_nusc_layout_vehrot_occsup_fgfg_sector.pkl"
+)
+WAYMO_VAL_INFO_FILE = (
+    "waymo_val_infos_scene_flow_key_frames_top_lidar_160_1920_"
+    "fov_2_17_nusc_layout_vehrot_occsup_fgfg_sector.pkl"
+)
 
 parser = argparse.ArgumentParser()
 
@@ -53,6 +64,10 @@ parser.add_argument('--val_proj_cache_root',
                     default='./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_hardproj_v1',
                     type=str,
                     help='root directory of precomputed val proj_pix cache')
+parser.add_argument('--waymo_dataset_root',
+                    default='/mnt/data2/waymo_projection_fix_v2_scene150',
+                    type=str,
+                    help='root directory of the formal Waymo scene150 dataset')
 
 # evaluation
 parser.add_argument('--eval', action='store_true',
@@ -195,7 +210,34 @@ parser.add_argument('--loss_weight_alpha', type=float, default=0.0,
 parser.add_argument('--neptune', action='store_true',
                     help='use neptune for logging')
 
+
+def _apply_stage_defaults(parsed_args):
+    if parsed_args.stage != 'waymo_range_image':
+        return parsed_args
+
+    waymo_root = parsed_args.waymo_dataset_root
+    default_train_info_path = osp.join(waymo_root, '2_trainval_test_infos', 'train')
+    default_val_info_path = osp.join(waymo_root, '2_trainval_test_infos', 'val')
+    default_proj_cache_root = str(default_waymo_proj_cache_root(waymo_root))
+
+    if parsed_args.train_info_path == parser.get_default('train_info_path'):
+        parsed_args.train_info_path = default_train_info_path
+    if parsed_args.train_info_file == parser.get_default('train_info_file'):
+        parsed_args.train_info_file = WAYMO_TRAIN_INFO_FILE
+    if parsed_args.val_info_path == parser.get_default('val_info_path'):
+        parsed_args.val_info_path = default_val_info_path
+    if parsed_args.val_info_file == parser.get_default('val_info_file'):
+        parsed_args.val_info_file = WAYMO_VAL_INFO_FILE
+    if parsed_args.proj_cache_root == parser.get_default('proj_cache_root'):
+        parsed_args.proj_cache_root = default_proj_cache_root
+    if parsed_args.val_proj_cache_root == parser.get_default('val_proj_cache_root'):
+        parsed_args.val_proj_cache_root = default_proj_cache_root
+
+    return parsed_args
+
+
 args = parser.parse_args()
+args = _apply_stage_defaults(args)
 
 if args.parallel:
     dist.init_process_group(backend="nccl")

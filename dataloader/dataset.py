@@ -12,6 +12,7 @@ from typing import Union
 from tqdm import tqdm
 
 from .utils.augmentor import NuscRangeImageAugmentor
+from .waymo_dataset import Waymo_range_image
 from dataloader.utils.geometry import get_geometry, range_projection_with_mapping
 import matplotlib.pyplot as plt
 from scipy.ndimage import distance_transform_edt
@@ -696,6 +697,24 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
                                         split='training')
 
         train_dataset = 1*nuscenes
+
+    elif args.stage == 'waymo_range_image':
+        aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False,
+                      'rotate_prob': 0.1, 'rotate_angle': 90,
+                      'color_aug': True}
+
+        waymo = Waymo_range_image(
+            aug_params,
+            train_info_file=args.train_info_file,
+            train_info_path=args.train_info_path,
+            require_complete_depth=args.require_complete_depth,
+            proj_cache_root=args.proj_cache_root,
+            max_samples=args.max_train_samples,
+            dataset_root=args.waymo_dataset_root,
+            split='training',
+        )
+
+        train_dataset = 1 * waymo
     
     else:
         raise ValueError(f"Unknown args.stage: {args.stage}")
@@ -706,17 +725,32 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
 
 def fetch_val_dataloader(args):
     """Create the validation dataset for the current training stage."""
-    if args.stage != 'nuscenes_range_image':
+    if args.stage == 'nuscenes_range_image':
+        aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
+
+        return nuScenes_range_image(
+            aug_params,
+            train_info_file=args.val_info_file,
+            train_info_path=args.val_info_path,
+            require_complete_depth=args.require_complete_depth,
+            proj_cache_root=args.val_proj_cache_root,
+            max_samples=None,
+            split='validation',
+        )
+
+    if args.stage == 'waymo_range_image':
+        aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
+
+        return Waymo_range_image(
+            aug_params,
+            train_info_file=args.val_info_file,
+            train_info_path=args.val_info_path,
+            require_complete_depth=args.require_complete_depth,
+            proj_cache_root=args.val_proj_cache_root,
+            max_samples=None,
+            dataset_root=args.waymo_dataset_root,
+            split='validation',
+        )
+
+    else:
         raise ValueError(f"Unknown args.stage: {args.stage}")
-
-    aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
-
-    return nuScenes_range_image(
-        aug_params,
-        train_info_file=args.val_info_file,
-        train_info_path=args.val_info_path,
-        require_complete_depth=args.require_complete_depth,
-        proj_cache_root=args.val_proj_cache_root,
-        max_samples=None,
-        split='validation',
-    )
