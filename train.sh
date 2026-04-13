@@ -12,10 +12,10 @@ export QT_QPA_PLATFORM=offscreen
 # ──────────────────────────────────────────────────────────────
 #  GPU / Distributed
 # ──────────────────────────────────────────────────────────────
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MASTER_PORT="${MASTER_PORT:-29501}"
-nproc_per_node=6
+nproc_per_node=8
 
 # ──────────────────────────────────────────────────────────────
 #  Dataset paths
@@ -31,7 +31,7 @@ val_proj_cache_root=./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_
 # ──────────────────────────────────────────────────────────────
 #  Checkpoint
 # ──────────────────────────────────────────────────────────────
-resume_ckpt=./log/26_03_25-21_54_22_surround_ttc/best_scale.pth.tar
+resume_ckpt="${RESUME_CKPT:-./log/hardproj_depth_local_rvt_scale_1000epochs_kbins8_26_04_11-03_16_49_surround_ttc/best_scale_epoch_20.pth.tar}"
 
 # ──────────────────────────────────────────────────────────────
 #  Training hyper-parameters
@@ -41,8 +41,11 @@ pct_start=0.08
 new_module_lr_mult=5.0
 grad_accum_steps=1
 
-risk_epochs=300
-risk_batch_size=1
+train_stage="${TRAIN_STAGE:-risk}"
+risk_epochs="${RISK_EPOCHS:-300}"
+risk_batch_size="${RISK_BATCH_SIZE:-10}"
+scale_epochs="${SCALE_EPOCHS:-1001}"
+scale_batch_size="${SCALE_BATCH_SIZE:-10}"
 val_freq=5
 num_workers=2
 
@@ -79,11 +82,14 @@ torchrun \
   --new_module_lr_mult "${new_module_lr_mult}" \
   --grad_accum_steps "${grad_accum_steps}" \
   \
-  --train_stage risk \
+  --train_stage "${train_stage}" \
+  --scale_epochs "${scale_epochs}" \
+  --scale_batch_size "${scale_batch_size}" \
   --risk_epochs "${risk_epochs}" \
   --risk_batch_size "${risk_batch_size}" \
   --val_batch_size 1 \
   --val_freq "${val_freq}" \
   --num_workers "${num_workers}" \
   --save_best \
+  --rvt_depth_guided_sampling \
   --resume "${resume_ckpt}"

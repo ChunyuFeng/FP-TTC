@@ -212,6 +212,12 @@ class RangeViewTransformer(nn.Module):
         )
         self.level_embeds = nn.Parameter(torch.Tensor(num_level, input_dim))
         nn.init.xavier_uniform_(self.level_embeds)
+        self.register_buffer(
+            'local_depth_multipliers',
+            torch.exp(torch.linspace(-0.7, 0.7, steps=num_points)),
+        )
+        self.local_depth_min = 1e-3
+        self.local_depth_max = 48.0
 
     @staticmethod
     def _pack_levels(feats_by_cam):
@@ -250,13 +256,48 @@ class RangeViewTransformer(nn.Module):
         affine_M,
         feature_sizes,
         input_hw,
+        guide_range=None,
     ):
         input_h, input_w = input_hw
-        K_bins = depth_bins.numel()
         Q = Hr * Wr
         rays = make_range_rays(Hr, Wr, self.fov_up, self.fov_down, device=cam_K[0].device)
         rays = rays.view(1, Q, 3).repeat(B, 1, 1)
-        points = rays.unsqueeze(2) * depth_bins.view(1, 1, K_bins, 1).to(rays.device)
+
+        if depth_bins.numel() != self.num_points:
+            raise ValueError(
+                f'depth_bins length ({depth_bins.numel()}) must match num_points ({self.num_points}).'
+            )
+
+        depth_bins = depth_bins.to(device=rays.device, dtype=rays.dtype)
+        if guide_range is None:
+            depth_samples = depth_bins.view(1, 1, self.num_points).expand(B, Q, self.num_points)
+        else:
+            if guide_range.ndim == 4:
+                if guide_range.shape[1] != 1:
+                    raise ValueError('guide_range must have channel dimension 1 when provided as BCHW.')
+                guide_range = guide_range[:, 0]
+            if guide_range.shape != (B, Hr, Wr):
+                raise ValueError(
+                    f'guide_range must have shape {(B, Hr, Wr)}; got {tuple(guide_range.shape)}.'
+                )
+
+            guide_flat = guide_range.reshape(B, Q, 1).to(device=rays.device, dtype=rays.dtype)
+            local_depth_bins = guide_flat * self.local_depth_multipliers.to(
+                device=rays.device,
+                dtype=rays.dtype,
+            ).view(1, 1, self.num_points)
+            local_depth_bins = local_depth_bins.clamp(self.local_depth_min, self.local_depth_max)
+
+            valid_guide = torch.isfinite(guide_flat) & (guide_flat > 0)
+            fallback_depth_bins = depth_bins.view(1, 1, self.num_points).expand(B, Q, self.num_points)
+            depth_samples = torch.where(
+                valid_guide.expand_as(local_depth_bins),
+                local_depth_bins,
+                fallback_depth_bins,
+            )
+
+        K_bins = depth_samples.shape[-1]
+        points = rays.unsqueeze(2) * depth_samples.unsqueeze(-1)
 
         all_locations = []
         all_masks = []
@@ -305,6 +346,7 @@ class RangeViewTransformer(nn.Module):
         depth_bins,
         ini_query=None,
         input_hw=None,
+        guide_range=None,
     ):
         B, C_in, _, _ = feats_by_cam[0].shape
         if ini_query is None:
@@ -344,6 +386,7 @@ class RangeViewTransformer(nn.Module):
             affine_M,
             feature_sizes,
             input_hw,
+            guide_range=guide_range,
         )
 
         out = query

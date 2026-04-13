@@ -124,6 +124,8 @@ parser.add_argument('--num_reg_refine', default=1, type=int,
                     help='number of additional local regression refinement')
 parser.add_argument('--radial_sampling_num', default=8, type=int,
                     help='number of radial sampling points for spherical coordinates')
+parser.add_argument('--rvt_depth_guided_sampling', action='store_true',
+                    help='use projected image-depth guide ranges for local RVT sampling')
 
 # loss
 parser.add_argument('--gamma', default=0.9, type=float,
@@ -364,6 +366,7 @@ def main():
         ffn_dim_expansion      = args.ffn_dim_expansion,
         num_transformer_layers = args.num_transformer_layers,
         reg_refine             = args.reg_refine,
+        rvt_depth_guided_sampling = args.rvt_depth_guided_sampling,
     ).cuda()
 
     start_epoch = 0

@@ -196,7 +196,7 @@ class TTCTrainer(object):
         self.save_best = args.save_best
         self.best_val_loss = float('inf')
         self.out_dir = "./log/%s_surround_ttc"%(self.time_stamp)
-        self.best_ckpt_name = 'best_scale.pth.tar' if self.scale_only else 'best_risk.pth.tar'
+        self.best_ckpt_prefix = 'best_scale' if self.scale_only else 'best_risk'
         self.debug_visualize_projection = bool(getattr(args, 'debug_visualize_projection', False))
         self.debug_visualize_dir = getattr(args, 'debug_visualize_dir', None)
         self._projection_debug_saved = False
@@ -308,7 +308,8 @@ class TTCTrainer(object):
 
                 if self.save_best and val_result is not None and val_result['loss'] < self.best_val_loss:
                     self.best_val_loss = val_result['loss']
-                    best_path = os.path.join(self.out_dir, self.best_ckpt_name)
+                    best_path = self._best_checkpoint_path(epoch)
+                    self._remove_old_best_checkpoints()
                     self._save_checkpoint(best_path, epoch)
                     print(f"Best checkpoint updated: {best_path} (val_loss={val_result['loss']:.6f})")
 
@@ -680,6 +681,18 @@ class TTCTrainer(object):
             "epoch": epoch + 1
         }
         torch.save(checkpoint, path)
+
+    def _best_checkpoint_path(self, epoch):
+        return os.path.join(self.out_dir, f'{self.best_ckpt_prefix}_epoch_{epoch}.pth.tar')
+
+    def _remove_old_best_checkpoints(self):
+        if not os.path.isdir(self.out_dir):
+            return
+        prefix = f'{self.best_ckpt_prefix}_epoch_'
+        suffix = '.pth.tar'
+        for name in os.listdir(self.out_dir):
+            if name.startswith(prefix) and name.endswith(suffix):
+                os.remove(os.path.join(self.out_dir, name))
     
     def _weighted_loss(self, keys_s, keys_r, loss_s, loss_r, model_ref):
         """

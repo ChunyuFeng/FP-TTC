@@ -61,10 +61,12 @@ class FpTTC(nn.Module):
         ffn_dim_expansion=4,
         num_transformer_layers=6,
         reg_refine=False,
+        rvt_depth_guided_sampling=False,
     ):
         super().__init__()
         self.num_scales = num_scales
         self.feature_channels = feature_channels
+        self.rvt_depth_guided_sampling = rvt_depth_guided_sampling
 
         self.camera_channels = [
             'CAM_FRONT_LEFT',
@@ -151,6 +153,80 @@ class FpTTC(nn.Module):
 
     def _camera_meta_list(self, sensor_metas, frame_key, meta_key):
         return [sensor_metas[frame_key][camera][meta_key] for camera in self.camera_channels]
+
+    def _camera_meta_tensors(self, sensor_metas, frame_key):
+        cam_K = torch.stack(self._camera_meta_list(sensor_metas, frame_key, 'K'), dim=1)
+        cam_R_l2c = torch.stack(self._camera_meta_list(sensor_metas, frame_key, 'R_l2c'), dim=1)
+        cam_t_l2c = torch.stack(self._camera_meta_list(sensor_metas, frame_key, 't_l2c'), dim=1)
+        cam_affine = torch.stack(self._camera_meta_list(sensor_metas, frame_key, 'affine'), dim=1)
+
+        cam_K_inv = torch.linalg.inv(cam_K)
+        cam_affine_inv = torch.linalg.inv(cam_affine)
+        cam_R_c2l = cam_R_l2c.transpose(-1, -2)
+        cam_t_c2l = -(cam_R_c2l @ cam_t_l2c.unsqueeze(-1)).squeeze(-1)
+
+        return {
+            'K_inv': cam_K_inv,
+            'affine_inv': cam_affine_inv,
+            'R_c2l': cam_R_c2l,
+            't_c2l': cam_t_c2l,
+        }
+
+    def _build_depth_guided_range(self, depth_maps, proj_pix, camera_meta):
+        B, num_views, _, H_depth, W_depth = depth_maps.shape
+        _, H_r, W_r, _ = proj_pix.shape
+        Q = H_r * W_r
+        device = depth_maps.device
+        dtype = depth_maps.dtype
+
+        cam_idx = proj_pix[..., 0].long()
+        u_proc = proj_pix[..., 1].long()
+        v_proc = proj_pix[..., 2].long()
+        valid = (
+            (cam_idx >= 0)
+            & (cam_idx < num_views)
+            & (u_proc >= 0)
+            & (u_proc < W_depth)
+            & (v_proc >= 0)
+            & (v_proc < H_depth)
+        )
+
+        cam_idx_safe = cam_idx.clamp(0, num_views - 1)
+        u_safe = u_proc.clamp(0, W_depth - 1)
+        v_safe = v_proc.clamp(0, H_depth - 1)
+
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1)
+        sampled_depth = depth_maps[batch_idx, cam_idx_safe, 0, v_safe, u_safe]
+        valid = valid & torch.isfinite(sampled_depth) & (sampled_depth > 0)
+
+        batch_idx_flat = torch.arange(B, device=device).view(B, 1).expand(B, Q)
+        cam_idx_flat = cam_idx_safe.view(B, Q)
+
+        affine_inv = camera_meta['affine_inv'][batch_idx_flat, cam_idx_flat]
+        K_inv = camera_meta['K_inv'][batch_idx_flat, cam_idx_flat]
+        R_c2l = camera_meta['R_c2l'][batch_idx_flat, cam_idx_flat]
+        t_c2l = camera_meta['t_c2l'][batch_idx_flat, cam_idx_flat]
+
+        pix_proc = torch.stack(
+            [
+                u_safe.to(dtype),
+                v_safe.to(dtype),
+                torch.ones_like(sampled_depth, dtype=dtype),
+            ],
+            dim=-1,
+        ).view(B, Q, 3, 1)
+        pix_orig = (affine_inv @ pix_proc).squeeze(-1)
+        denom = pix_orig[..., 2:3]
+        pix_orig = pix_orig / torch.where(denom.abs() > 1e-6, denom, torch.ones_like(denom))
+
+        cam_points = (K_inv @ pix_orig.unsqueeze(-1)).squeeze(-1)
+        cam_points = cam_points * sampled_depth.view(B, Q, 1)
+
+        lidar_points = (R_c2l @ cam_points.unsqueeze(-1)).squeeze(-1) + t_c2l
+        guide_range = lidar_points.norm(dim=-1).view(B, 1, H_r, W_r)
+
+        valid = valid & torch.isfinite(guide_range[:, 0]) & (guide_range[:, 0] > 0)
+        return guide_range.masked_fill(~valid.unsqueeze(1), 0.0)
 
     def _extract_multi_view_features(
         self,
@@ -260,7 +336,14 @@ class FpTTC(nn.Module):
 
         return hardproj_corr_range_init, hardproj_ranges_prev_init, hardproj_ranges_curr_init
 
-    def _refine_corr_range(self, corr_list, hardproj_corr_range_init, sensor_metas, input_hw):
+    def _refine_corr_range(
+        self,
+        corr_list,
+        hardproj_corr_range_init,
+        sensor_metas,
+        input_hw,
+        guide_range=None,
+    ):
         Hr, Wr = hardproj_corr_range_init.shape[-2:]
         corr_delta = self.rvt_corr(
             feats_by_cam=corr_list,
@@ -273,6 +356,7 @@ class FpTTC(nn.Module):
             depth_bins=self.depth_bins,
             ini_query=hardproj_corr_range_init.detach(),
             input_hw=input_hw,
+            guide_range=guide_range,
         )
         corr_delta = self.corr_residual_decoder(corr_delta)
         return hardproj_corr_range_init + corr_delta
@@ -285,6 +369,8 @@ class FpTTC(nn.Module):
         hardproj_ranges_curr_init,
         sensor_metas,
         input_hw,
+        guide_ranges_prev=None,
+        guide_ranges_curr=None,
     ):
         rvt_ranges_prev = []
         rvt_ranges_curr = []
@@ -305,6 +391,7 @@ class FpTTC(nn.Module):
                 depth_bins=self.depth_bins,
                 ini_query=hardproj_ranges_prev_init[lvl].detach(),
                 input_hw=input_hw,
+                guide_range=None if guide_ranges_prev is None else guide_ranges_prev[lvl],
             )
             curr_delta = self.rvt_feat[lvl](
                 feats_by_cam=curr_feats_list,
@@ -317,6 +404,7 @@ class FpTTC(nn.Module):
                 depth_bins=self.depth_bins,
                 ini_query=hardproj_ranges_curr_init[lvl].detach(),
                 input_hw=input_hw,
+                guide_range=None if guide_ranges_curr is None else guide_ranges_curr[lvl],
             )
 
             rvt_ranges_prev.append(hardproj_ranges_prev_init[lvl] + prev_delta)
@@ -341,7 +429,6 @@ class FpTTC(nn.Module):
         scale_only,
         return_debug=False,
     ):
-        del depth_prev, depth_curr
         if sensor_metas is None:
             raise ValueError('sensor_metas must be provided when RVT refinement is enabled.')
 
@@ -367,12 +454,39 @@ class FpTTC(nn.Module):
             )
         )
 
+        corr_guide_range = None
+        guide_ranges_prev = None
+        guide_ranges_curr = None
+        if self.rvt_depth_guided_sampling:
+            camera_meta_prev = self._camera_meta_tensors(sensor_metas, 'prev')
+            camera_meta_curr = self._camera_meta_tensors(sensor_metas, 'curr')
+
+            corr_guide_range = self._build_depth_guided_range(depth_curr, proj_pix_curr, camera_meta_curr)
+            guide_ranges_prev = []
+            guide_ranges_curr = []
+            for lvl in range(self.num_scales):
+                scale = 2 ** (self.num_scales - 1 - lvl)
+                if scale > 1:
+                    proj_prev_lvl = proj_pix_prev[:, ::scale, ::scale, :]
+                    proj_curr_lvl = proj_pix_curr[:, ::scale, ::scale, :]
+                else:
+                    proj_prev_lvl = proj_pix_prev
+                    proj_curr_lvl = proj_pix_curr
+
+                guide_ranges_prev.append(
+                    self._build_depth_guided_range(depth_prev, proj_prev_lvl, camera_meta_prev)
+                )
+                guide_ranges_curr.append(
+                    self._build_depth_guided_range(depth_curr, proj_curr_lvl, camera_meta_curr)
+                )
+
         input_hw = (feature_outputs['H_img'], feature_outputs['W_img'])
         corr_range = self._refine_corr_range(
             corr_list=feature_outputs['corr_list'],
             hardproj_corr_range_init=hardproj_corr_range_init,
             sensor_metas=sensor_metas,
             input_hw=input_hw,
+            guide_range=corr_guide_range,
         )
         multi_level_ranges_prev, multi_level_ranges_curr = self._refine_feature_ranges(
             multi_level_feats_prev=feature_outputs['multi_level_feats_prev'],
@@ -381,6 +495,8 @@ class FpTTC(nn.Module):
             hardproj_ranges_curr_init=hardproj_ranges_curr_init,
             sensor_metas=sensor_metas,
             input_hw=input_hw,
+            guide_ranges_prev=guide_ranges_prev,
+            guide_ranges_curr=guide_ranges_curr,
         )
 
         debug_dict = None
@@ -395,6 +511,10 @@ class FpTTC(nn.Module):
                 'corr_range_init': hardproj_corr_range_init,
                 'corr_range': corr_range,
             }
+            if self.rvt_depth_guided_sampling:
+                debug_dict['corr_guide_range'] = corr_guide_range
+                debug_dict['guide_ranges_prev'] = guide_ranges_prev
+                debug_dict['guide_ranges_curr'] = guide_ranges_curr
 
         corr_encoded_scale = self.conv_corr(corr_range)
         initial_scale = F.softplus(corr_encoded_scale[:, :1]) + 1e-3
