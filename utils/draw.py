@@ -183,6 +183,51 @@ def flow_to_image(flow):
 
 import matplotlib.pyplot as plt
 
+
+def _centered_value_to_rgb(centered_value):
+    centered_value = np.clip(np.asarray(centered_value, dtype=np.float32), -1.0, 1.0)
+    centered_value_3d = centered_value[..., None]
+
+    neg_color = np.array([0.98, 0.12, 0.10], dtype=np.float32)
+    mid_color = np.array([1.00, 1.00, 1.00], dtype=np.float32)
+    pos_color = np.array([0.08, 0.28, 0.98], dtype=np.float32)
+
+    t_neg = np.clip(-centered_value_3d, 0.0, 1.0)
+    t_pos = np.clip(centered_value_3d, 0.0, 1.0)
+
+    rgb = np.where(
+        centered_value_3d < 0.0,
+        (1.0 - t_neg) * mid_color + t_neg * neg_color,
+        (1.0 - t_pos) * mid_color + t_pos * pos_color,
+    )
+    return rgb.astype(np.float32)
+
+
+def make_scale_analysis_rgb(scale_map, valid_mask=None):
+    scale_map = np.asarray(scale_map, dtype=np.float32)
+    safe_scale = np.clip(scale_map, 1e-6, None)
+    scale_limit = np.float32(np.log(1.5))
+    centered = np.log(safe_scale) / scale_limit
+    centered = np.clip(centered, -1.0, 1.0)
+
+    rgb = _centered_value_to_rgb(centered)
+    if valid_mask is not None:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        rgb[~valid_mask] = np.array([1.00, 1.00, 1.00], dtype=np.float32)
+    return rgb
+
+
+def make_risk_analysis_rgb(risk_map, valid_mask=None):
+    risk_map = np.asarray(risk_map, dtype=np.float32)
+    centered = (risk_map - np.float32(np.pi / 2.0)) / np.float32(np.pi / 2.0)
+    centered = np.clip(centered, -1.0, 1.0)
+
+    rgb = _centered_value_to_rgb(centered)
+    if valid_mask is not None:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        rgb[~valid_mask] = np.array([1.00, 1.00, 1.00], dtype=np.float32)
+    return rgb
+
 def gt_scale_2_rgb(scale, colormap_name='plasma'):
     """
     将尺度因子图转换为 RGB 图像，使用最小-最大归一化和指定的颜色映射表。

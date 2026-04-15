@@ -16,13 +16,15 @@ import time
 import pickle
 import argparse
 import datetime
+import shutil
+import subprocess
 from copy import deepcopy
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from pprint import pformat
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import albumentations as A
 import numpy as np
@@ -34,7 +36,6 @@ torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
 from fpttc.fp_ttc import FpTTC
-from fpttc.scale_net.utils.spherical import build_lidar_to_camera_projection
 from utils.draw import (
     make_risk_analysis_rgb,
     make_scale_analysis_rgb,
@@ -45,6 +46,12 @@ from dataloader.dataset import (
     build_frame_sensor_metas,
     finalize_frame_mapping_fast,
     tensorize_sensor_metas,
+)
+from utils.dtype_audit import (
+    dump_dtype_audit,
+    log_dtype_event,
+    reset_dtype_audit,
+    set_dtype_audit_enabled,
 )
 from utils.nusc_paths import resolve_nusc_path
 
@@ -65,18 +72,6 @@ except ModuleNotFoundError:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
-
-
-NUSC_CAMERA_CHANNELS = [
-    "CAM_FRONT_LEFT",
-    "CAM_FRONT",
-    "CAM_FRONT_RIGHT",
-    "CAM_BACK_RIGHT",
-    "CAM_BACK",
-    "CAM_BACK_LEFT",
-]
-NUSC_RAW_IMAGE_WIDTH = 1600
-NUSC_RAW_IMAGE_HEIGHT = 900
 
 
 def str2bool(value):
@@ -126,7 +121,6 @@ parser.add_argument("--prop_radius_list", default=[-1, 1], type=int, nargs="+")
 parser.add_argument("--num_reg_refine", default=1, type=int)
 parser.add_argument("--local_rank", default=0, type=int)
 parser.add_argument("--count_time", action="store_true")
-parser.add_argument("--timing_warmup_samples", default=0, type=int)
 parser.add_argument("--debug", action="store_true")
 parser.add_argument("--sjtu_test", action="store_true")
 
@@ -145,8 +139,6 @@ parser.add_argument("--compute_table3_metrics", dest="compute_scale_orientation_
 parser.add_argument("--compute_scene_mid_err", type=str2bool, nargs="?", const=True, default=False)
 parser.add_argument("--max_test_samples", default=-1, type=int)
 parser.add_argument("--output_dir", default=None, type=str)
-parser.add_argument("--eval_view", default="pano", choices=["pano", "front"])
-parser.add_argument("--eval_camera_channel", default="CAM_FRONT", choices=NUSC_CAMERA_CHANNELS)
 
 parser.add_argument("--save_pred_npy", action="store_true")
 parser.add_argument("--pred_npy_dir", default="./Datasets/nuscenes/3_visualization/collision_pred", type=str)
@@ -167,6 +159,16 @@ parser.add_argument("--enable_nusc_io_prefetch", type=str2bool, nargs="?", const
 parser.add_argument("--enable_fast_nusc_preprocess", type=str2bool, nargs="?", const=True, default=False)
 parser.add_argument("--depth_input_size", default=320, type=int)
 parser.add_argument("--num_depth_preprocess_workers", default=1, type=int)
+parser.add_argument("--depth_backend", default="pytorch", choices=["pytorch", "onnxruntime", "tensorrt"])
+parser.add_argument("--depth_trt_engine", default="", type=str)
+parser.add_argument("--depth_onnx_path", default="", type=str)
+parser.add_argument("--compile_depth", type=str2bool, nargs="?", const=True, default=False)
+parser.add_argument("--compile_model_submodules", type=str2bool, nargs="?", const=True, default=False)
+parser.add_argument("--compile_mode", default="reduce-overhead", choices=["reduce-overhead", "max-autotune"])
+parser.add_argument("--enable_cuda_graphs", type=str2bool, nargs="?", const=True, default=False)
+parser.add_argument("--cuda_graph_warmup_iters", default=3, type=int)
+parser.add_argument("--cache_geom_constants", type=str2bool, nargs="?", const=True, default=False)
+parser.add_argument("--dump_dtype_audit", type=str2bool, nargs="?", const=True, default=False)
 parser.add_argument("--range_size", default=["40", "480"], type=str, nargs="+")
 parser.add_argument("--mapping_pixel_stride", default=1, type=int)
 parser.add_argument("--mapping_range_backend", default="auto", choices=["auto", "gpu", "cpu"])
@@ -177,8 +179,6 @@ parser.add_argument("--model_amp_dtype", default="bf16", choices=["fp16", "bf16"
 parser.add_argument("--empty_cache_before_model", type=str2bool, nargs="?", const=True, default=False)
 
 args = parser.parse_args()
-if args.timing_warmup_samples < 0:
-    raise ValueError(f"timing_warmup_samples must be non-negative, got {args.timing_warmup_samples}")
 
 
 TEST_PROFILE_OVERRIDES = {
@@ -216,27 +216,6 @@ TIMING_KEYS = (
     "metrics_ms",
 )
 
-PAPER_INFERENCE_TIMING_KEYS = (
-    "augment_ms",
-    "depth_ms",
-    "mapping_ms",
-    "model_ms",
-)
-
-E2E_EVAL_TIMING_KEYS = (
-    "io_ms",
-    "augment_ms",
-    "depth_ms",
-    "mapping_ms",
-    "model_ms",
-)
-
-LATENCY_REPORTING_NOTE = (
-    "Our method uses six surround cameras at inference. Mono results are evaluated only on "
-    "CAM_FRONT-visible pixels, while latency is measured on the full six-view inference pipeline "
-    "because the released checkpoint and architecture are six-view by design."
-)
-
 MAPPING_DETAIL_KEYS = (
     "transform_setup_ms",
     "camera_backproject_ms",
@@ -254,6 +233,10 @@ class TestRuntime:
     range_w: int
     mapping_range_backend: str
     fixed_nusc_fast: Optional[Dict[str, object]] = None
+    fixed_depth_proc_hw: Optional[Tuple[int, int]] = None
+    depth_backend_summary: str = "pytorch"
+    xformers_available: bool = False
+    model_cuda_graph_runner: Any = None
 
 
 @dataclass
@@ -268,45 +251,538 @@ class NuscInputBundle:
     rgb_12: Optional[torch.Tensor] = None
 
 
-def infer_depth_pair(
-    depth_model: DepthAnythingV2,
-    inputs: NuscInputBundle,
-    camera_channels: List[str],
-    input_size: int,
-    num_preprocess_workers: int,
-):
-    if inputs.rgb_12 is not None:
-        if hasattr(depth_model, "infer_tensor_batch_rgb"):
-            with torch.inference_mode():
-                with autocast_context(args.enable_depth_amp, args.depth_amp_dtype):
-                    return depth_model.infer_tensor_batch_rgb(
-                        inputs.rgb_12,
-                        input_size=input_size,
-                        return_torch=False,
-                    )
+def torch_compile_available() -> bool:
+    return hasattr(torch, "compile")
 
-        processed_batch, orig_size, proc_size = depth_model.preprocess_tensor_batch_rgb(
+
+def xformers_available() -> bool:
+    try:
+        import xformers  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def maybe_compile_module(module: torch.nn.Module, enabled: bool, mode: str, label: str) -> torch.nn.Module:
+    if not enabled:
+        return module
+    if not torch_compile_available():
+        print(f"[Accel] torch.compile is unavailable in torch {torch.__version__}; skipping {label}.")
+        return module
+    try:
+        compiled = torch.compile(module, mode=mode)
+        print(f"[Accel] Enabled torch.compile for {label} with mode={mode}.")
+        return compiled
+    except Exception as exc:
+        print(f"[Accel] Failed to compile {label}: {type(exc).__name__}: {exc}")
+        return module
+
+
+def maybe_compile_model_submodules(model: torch.nn.Module, enabled: bool, mode: str):
+    if not enabled:
+        return
+    compile_targets = [
+        "cnet",
+        "conv_corr",
+        "conv_corr_risk",
+        "corr_residual_decoder",
+    ]
+    for attr_name in compile_targets:
+        module = getattr(model, attr_name, None)
+        if isinstance(module, torch.nn.Module):
+            setattr(model, attr_name, maybe_compile_module(module, True, mode, f"model.{attr_name}"))
+
+
+def tensor_tree_empty_like(obj):
+    if obj is None:
+        return None
+    if torch.is_tensor(obj):
+        return torch.empty_like(obj)
+    if isinstance(obj, dict):
+        return {key: tensor_tree_empty_like(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [tensor_tree_empty_like(value) for value in obj]
+    if isinstance(obj, tuple):
+        return tuple(tensor_tree_empty_like(value) for value in obj)
+    return obj
+
+
+def tensor_tree_copy_(dst, src):
+    if dst is None or src is None:
+        return
+    if torch.is_tensor(dst):
+        dst.copy_(src)
+        return
+    if isinstance(dst, dict):
+        for key in dst:
+            tensor_tree_copy_(dst[key], src[key])
+        return
+    if isinstance(dst, list):
+        for dst_item, src_item in zip(dst, src):
+            tensor_tree_copy_(dst_item, src_item)
+        return
+    if isinstance(dst, tuple):
+        for dst_item, src_item in zip(dst, src):
+            tensor_tree_copy_(dst_item, src_item)
+        return
+    return
+
+
+def infer_shape_signature(*items):
+    signature = []
+    for item in items:
+        signature.append(_shape_signature_for_item(item))
+    return tuple(signature)
+
+
+def _shape_signature_for_item(item):
+    if item is None:
+        return None
+    if torch.is_tensor(item):
+        return (tuple(item.shape), str(item.dtype), str(item.device))
+    if isinstance(item, dict):
+        return tuple((key, _shape_signature_for_item(value)) for key, value in sorted(item.items()))
+    if isinstance(item, list):
+        return tuple(_shape_signature_for_item(value) for value in item)
+    if isinstance(item, tuple):
+        return tuple(_shape_signature_for_item(value) for value in item)
+    return type(item).__name__
+
+
+class DepthCudaGraphRunner:
+    def __init__(self, model: DepthAnythingV2, amp_enabled: bool, amp_dtype_name: str, warmup_iters: int):
+        self.model = model
+        self.amp_enabled = amp_enabled
+        self.amp_dtype_name = amp_dtype_name
+        self.warmup_iters = max(1, int(warmup_iters))
+        self.graph = None
+        self.static_input = None
+        self.static_output = None
+        self.shape_signature = None
+        self.disabled = False
+
+    def run(self, processed_batch: torch.Tensor) -> torch.Tensor:
+        if self.disabled:
+            with torch.inference_mode():
+                with autocast_context(self.amp_enabled, self.amp_dtype_name):
+                    return self.model(processed_batch)
+        signature = infer_shape_signature(processed_batch)
+        if self.graph is None or self.shape_signature != signature:
+            self._capture(processed_batch)
+        self.static_input.copy_(processed_batch)
+        self.graph.replay()
+        return self.static_output
+
+    def _capture(self, processed_batch: torch.Tensor):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA graphs require CUDA.")
+        try:
+            self.shape_signature = infer_shape_signature(processed_batch)
+            self.static_input = torch.empty_like(processed_batch)
+            self.static_output = None
+
+            with torch.inference_mode():
+                for _ in range(self.warmup_iters):
+                    with autocast_context(self.amp_enabled, self.amp_dtype_name):
+                        _ = self.model(self.static_input.copy_(processed_batch))
+                sync_cuda_if_available()
+                self.graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self.graph):
+                    with autocast_context(self.amp_enabled, self.amp_dtype_name):
+                        self.static_output = self.model(self.static_input)
+        except Exception as exc:
+            self.disabled = True
+            self.graph = None
+            self.static_input = None
+            self.static_output = None
+            print(f"[Accel] Depth CUDA graph capture failed; falling back to eager: {type(exc).__name__}: {exc}")
+
+
+class ModelCudaGraphRunner:
+    def __init__(self, model: torch.nn.Module, amp_enabled: bool, amp_dtype_name: str, warmup_iters: int):
+        self.model = model
+        self.amp_enabled = amp_enabled
+        self.amp_dtype_name = amp_dtype_name
+        self.warmup_iters = max(1, int(warmup_iters))
+        self.graph = None
+        self.static_kwargs = None
+        self.static_outputs = None
+        self.shape_signature = None
+        self.disabled = False
+
+    def run(self, **kwargs):
+        if self.disabled:
+            with torch.inference_mode():
+                with autocast_context(self.amp_enabled, self.amp_dtype_name):
+                    return self.model.forward(**kwargs)
+        signature = infer_shape_signature(kwargs)
+        if self.graph is None or self.shape_signature != signature:
+            self._capture(kwargs)
+        if self.disabled:
+            with torch.inference_mode():
+                with autocast_context(self.amp_enabled, self.amp_dtype_name):
+                    return self.model.forward(**kwargs)
+        tensor_tree_copy_(self.static_kwargs, kwargs)
+        self.graph.replay()
+        return self.static_outputs
+
+    def _capture(self, kwargs: Dict[str, Any]):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA graphs require CUDA.")
+        try:
+            self.shape_signature = infer_shape_signature(kwargs)
+            self.static_kwargs = tensor_tree_empty_like(kwargs)
+            tensor_tree_copy_(self.static_kwargs, kwargs)
+
+            with torch.inference_mode():
+                for _ in range(self.warmup_iters):
+                    with autocast_context(self.amp_enabled, self.amp_dtype_name):
+                        _ = self.model.forward(**self.static_kwargs)
+                sync_cuda_if_available()
+                self.graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self.graph):
+                    with autocast_context(self.amp_enabled, self.amp_dtype_name):
+                        self.static_outputs = self.model.forward(**self.static_kwargs)
+        except Exception as exc:
+            self.disabled = True
+            self.graph = None
+            self.static_kwargs = None
+            self.static_outputs = None
+            print(f"[Accel] Model CUDA graph capture failed; falling back to eager: {type(exc).__name__}: {exc}")
+
+
+class DepthPyTorchBackend:
+    def __init__(
+        self,
+        model: DepthAnythingV2,
+        *,
+        input_size: int,
+        enable_amp: bool,
+        amp_dtype_name: str,
+        compile_depth: bool,
+        compile_mode: str,
+        enable_cuda_graphs: bool,
+        cuda_graph_warmup_iters: int,
+    ):
+        self.model = maybe_compile_module(model, compile_depth, compile_mode, "depth_model")
+        self.input_size = input_size
+        self.enable_amp = enable_amp
+        self.amp_dtype_name = amp_dtype_name
+        self.enable_cuda_graphs = enable_cuda_graphs
+        self.cuda_graph_warmup_iters = cuda_graph_warmup_iters
+        self.cuda_graph_runner = None
+        if self.enable_cuda_graphs and torch.cuda.is_available():
+            self.cuda_graph_runner = DepthCudaGraphRunner(
+                self.model,
+                amp_enabled=enable_amp,
+                amp_dtype_name=amp_dtype_name,
+                warmup_iters=cuda_graph_warmup_iters,
+            )
+
+    @property
+    def summary(self) -> str:
+        xformers_tag = "xformers" if xformers_available() else "no-xformers"
+        compile_tag = f"compile={args.compile_mode}" if args.compile_depth and torch_compile_available() else "compile=off"
+        graph_tag = "cudagraph=on" if self.cuda_graph_runner is not None else "cudagraph=off"
+        return f"pytorch/{xformers_tag}/{compile_tag}/{graph_tag}"
+
+    def infer_depth_pair(
+        self,
+        inputs: NuscInputBundle,
+        camera_channels: List[str],
+        num_preprocess_workers: int,
+    ):
+        if inputs.rgb_12 is not None:
+            log_dtype_event(
+                "depth_input.rgb_12",
+                src_dtype=inputs.rgb_12.dtype,
+                dst_dtype=inputs.rgb_12.dtype,
+                shape=inputs.rgb_12.shape,
+                device=inputs.rgb_12.device,
+                copied=False,
+            )
+            processed_batch, orig_size, proc_size = self.model.preprocess_tensor_batch_rgb(
+                inputs.rgb_12,
+                input_size=self.input_size,
+                raw_is_rgb=True,
+            )
+            log_dtype_event(
+                "depth_preprocess.tensor_batch",
+                src_dtype=inputs.rgb_12.dtype,
+                dst_dtype=processed_batch.dtype,
+                shape=processed_batch.shape,
+                device=processed_batch.device,
+                copied=True,
+                note=f"orig={orig_size} proc={proc_size}",
+            )
+            with torch.inference_mode():
+                if self.cuda_graph_runner is not None:
+                    depth_batch = self.cuda_graph_runner.run(processed_batch)
+                else:
+                    with autocast_context(self.enable_amp, self.amp_dtype_name):
+                        depth_batch = self.model(processed_batch)
+            depth_list_12 = self.model.postprocess_depth_batch(
+                depth_batch,
+                orig_size=orig_size,
+                proc_size=proc_size,
+                return_torch=False,
+            )
+            log_dtype_event(
+                "depth_output.tensor_batch",
+                src_dtype=depth_batch.dtype,
+                dst_dtype=depth_batch.dtype,
+                shape=depth_batch.shape,
+                device=depth_batch.device,
+                copied=False,
+            )
+            return depth_list_12
+
+        imgs_12 = [inputs.proc_prev[ch] for ch in camera_channels] + [inputs.proc_curr[ch] for ch in camera_channels]
+        infer_images_kwargs = {"input_size": self.input_size}
+        if "num_preprocess_workers" in inspect.signature(self.model.infer_images).parameters:
+            infer_images_kwargs["num_preprocess_workers"] = num_preprocess_workers
+        with torch.inference_mode():
+            with autocast_context(self.enable_amp, self.amp_dtype_name):
+                return self.model.infer_images(imgs_12, **infer_images_kwargs)
+
+
+def export_depthanything_onnx(depth_model: DepthAnythingV2, onnx_path: str, batch_size: int, input_hw: Tuple[int, int]):
+    onnx_path = Path(onnx_path)
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    dummy = torch.randn(batch_size, 3, input_hw[0], input_hw[1], device=device, dtype=torch.float32)
+    with torch.inference_mode():
+        torch.onnx.export(
+            depth_model,
+            dummy,
+            str(onnx_path),
+            input_names=["input"],
+            output_names=["depth"],
+            opset_version=17,
+            do_constant_folding=True,
+            dynamic_axes=None,
+        )
+    return onnx_path
+
+
+def build_trt_engine_from_onnx(onnx_path: str, engine_path: str, input_hw: Tuple[int, int], batch_size: int):
+    trtexec_path = shutil.which("trtexec")
+    if trtexec_path is None:
+        raise FileNotFoundError("trtexec was not found on PATH; cannot build a TensorRT engine automatically.")
+    command = [
+        trtexec_path,
+        f"--onnx={onnx_path}",
+        f"--saveEngine={engine_path}",
+        "--fp16",
+        "--skipInference",
+        f"--minShapes=input:{batch_size}x3x{input_hw[0]}x{input_hw[1]}",
+        f"--optShapes=input:{batch_size}x3x{input_hw[0]}x{input_hw[1]}",
+        f"--maxShapes=input:{batch_size}x3x{input_hw[0]}x{input_hw[1]}",
+    ]
+    subprocess.run(command, check=True)
+
+
+class DepthONNXRuntimeBackend:
+    def __init__(
+        self,
+        *,
+        depth_model: DepthAnythingV2,
+        onnx_path: str,
+        input_size: int,
+        fixed_batch_size: int,
+        fixed_input_hw: Tuple[int, int],
+    ):
+        try:
+            import onnxruntime as ort
+        except Exception as exc:
+            raise RuntimeError("Depth ONNX Runtime backend requires the onnxruntime package.") from exc
+
+        if not onnx_path:
+            raise ValueError("--depth_onnx_path must be provided or resolved before --depth_backend=onnxruntime.")
+
+        self.ort = ort
+        self.depth_model = depth_model
+        self.onnx_path = Path(onnx_path)
+        self.input_size = input_size
+        self.fixed_batch_size = fixed_batch_size
+        self.fixed_input_hw = fixed_input_hw
+
+        if not self.onnx_path.exists():
+            export_depthanything_onnx(
+                depth_model=self.depth_model,
+                onnx_path=str(self.onnx_path),
+                batch_size=self.fixed_batch_size,
+                input_hw=self.fixed_input_hw,
+            )
+
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self.session = ort.InferenceSession(str(self.onnx_path), sess_options=sess_options, providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+        self.providers = list(self.session.get_providers())
+        self.use_cuda_iobinding = torch.cuda.is_available() and "CUDAExecutionProvider" in self.providers
+
+    @property
+    def summary(self) -> str:
+        provider_tag = self.providers[0] if self.providers else "unknown"
+        return f"onnxruntime/{provider_tag}/model={self.onnx_path.name}"
+
+    def infer_depth_pair(
+        self,
+        inputs: NuscInputBundle,
+        camera_channels: List[str],
+        num_preprocess_workers: int,
+    ):
+        if inputs.rgb_12 is None:
+            raise RuntimeError("ONNX Runtime depth backend requires the fixed tensor RGB path; enable fast nuScenes preprocess.")
+
+        processed_batch, orig_size, proc_size = self.depth_model.preprocess_tensor_batch_rgb(
             inputs.rgb_12,
-            input_size=input_size,
+            input_size=self.input_size,
             raw_is_rgb=True,
         )
-        with torch.inference_mode():
-            with autocast_context(args.enable_depth_amp, args.depth_amp_dtype):
-                depth_batch = depth_model(processed_batch)
-        return depth_model.postprocess_depth_batch(
+        expected_shape = (self.fixed_batch_size, 3, self.fixed_input_hw[0], self.fixed_input_hw[1])
+        if tuple(processed_batch.shape) != expected_shape:
+            raise ValueError(
+                "ONNX Runtime depth backend only supports the fixed benchmark shape "
+                f"{expected_shape}; got {tuple(processed_batch.shape)}."
+            )
+
+        if processed_batch.dtype != torch.float32:
+            processed_batch = processed_batch.float()
+        processed_batch = processed_batch.contiguous()
+
+        if self.use_cuda_iobinding:
+            depth_batch = torch.empty(
+                (self.fixed_batch_size, self.fixed_input_hw[0], self.fixed_input_hw[1]),
+                device=processed_batch.device,
+                dtype=torch.float32,
+            )
+            io_binding = self.session.io_binding()
+            io_binding.bind_input(
+                name=self.input_name,
+                device_type="cuda",
+                device_id=processed_batch.device.index or 0,
+                element_type=np.float32,
+                shape=tuple(processed_batch.shape),
+                buffer_ptr=int(processed_batch.data_ptr()),
+            )
+            io_binding.bind_output(
+                name=self.output_name,
+                device_type="cuda",
+                device_id=processed_batch.device.index or 0,
+                element_type=np.float32,
+                shape=tuple(depth_batch.shape),
+                buffer_ptr=int(depth_batch.data_ptr()),
+            )
+            self.session.run_with_iobinding(io_binding)
+        else:
+            depth_np = self.session.run([self.output_name], {self.input_name: processed_batch.detach().cpu().numpy()})[0]
+            depth_batch = torch.from_numpy(depth_np).to(device, non_blocking=False)
+
+        return self.depth_model.postprocess_depth_batch(
             depth_batch,
             orig_size=orig_size,
             proc_size=proc_size,
             return_torch=False,
         )
 
-    imgs_12 = [inputs.proc_prev[ch] for ch in camera_channels] + [inputs.proc_curr[ch] for ch in camera_channels]
-    infer_images_kwargs = {"input_size": input_size}
-    if "num_preprocess_workers" in inspect.signature(depth_model.infer_images).parameters:
-        infer_images_kwargs["num_preprocess_workers"] = num_preprocess_workers
-    with torch.inference_mode():
-        with autocast_context(args.enable_depth_amp, args.depth_amp_dtype):
-            return depth_model.infer_images(imgs_12, **infer_images_kwargs)
+
+class DepthTensorRTBackend:
+    def __init__(
+        self,
+        *,
+        depth_model: DepthAnythingV2,
+        engine_path: str,
+        onnx_path: str,
+        input_size: int,
+        fixed_batch_size: int,
+        fixed_input_hw: Tuple[int, int],
+    ):
+        try:
+            import tensorrt as trt
+        except Exception as exc:
+            raise RuntimeError("Depth TensorRT backend requires the tensorrt Python package.") from exc
+
+        self.trt = trt
+        self.depth_model = depth_model
+        self.input_size = input_size
+        self.engine_path = Path(engine_path) if engine_path else None
+        self.onnx_path = Path(onnx_path) if onnx_path else None
+        self.fixed_batch_size = fixed_batch_size
+        self.fixed_input_hw = fixed_input_hw
+        self.logger = trt.Logger(trt.Logger.WARNING)
+
+        if self.engine_path is None:
+            raise ValueError("--depth_trt_engine must be provided when --depth_backend=tensorrt.")
+        if not self.engine_path.exists():
+            if self.onnx_path is None:
+                raise FileNotFoundError(
+                    f"TensorRT engine not found at {self.engine_path}. "
+                    "Pass --depth_onnx_path to allow ONNX export + engine build."
+                )
+            export_depthanything_onnx(
+                depth_model=self.depth_model,
+                onnx_path=str(self.onnx_path),
+                batch_size=self.fixed_batch_size,
+                input_hw=self.fixed_input_hw,
+            )
+            build_trt_engine_from_onnx(
+                onnx_path=str(self.onnx_path),
+                engine_path=str(self.engine_path),
+                input_hw=self.fixed_input_hw,
+                batch_size=self.fixed_batch_size,
+            )
+
+        with open(self.engine_path, "rb") as handle:
+            engine_bytes = handle.read()
+        self.runtime = trt.Runtime(self.logger)
+        self.engine = self.runtime.deserialize_cuda_engine(engine_bytes)
+        self.context = self.engine.create_execution_context()
+        self.input_name = self.engine.get_tensor_name(0)
+        self.output_name = self.engine.get_tensor_name(1)
+
+    @property
+    def summary(self) -> str:
+        return f"tensorrt/engine={self.engine_path.name}"
+
+    def infer_depth_pair(
+        self,
+        inputs: NuscInputBundle,
+        camera_channels: List[str],
+        num_preprocess_workers: int,
+    ):
+        if inputs.rgb_12 is None:
+            raise RuntimeError("TensorRT depth backend requires the fixed tensor RGB path; enable fast nuScenes preprocess.")
+        processed_batch, orig_size, proc_size = self.depth_model.preprocess_tensor_batch_rgb(
+            inputs.rgb_12,
+            input_size=self.input_size,
+            raw_is_rgb=True,
+        )
+        if tuple(processed_batch.shape) != (self.fixed_batch_size, 3, self.fixed_input_hw[0], self.fixed_input_hw[1]):
+            raise ValueError(
+                "TensorRT depth backend only supports the fixed benchmark shape "
+                f"{(self.fixed_batch_size, 3, self.fixed_input_hw[0], self.fixed_input_hw[1])}; "
+                f"got {tuple(processed_batch.shape)}."
+            )
+
+        if processed_batch.dtype != torch.float32:
+            processed_batch = processed_batch.float()
+        processed_batch = processed_batch.contiguous()
+
+        self.context.set_input_shape(self.input_name, tuple(processed_batch.shape))
+        output_shape = tuple(self.context.get_tensor_shape(self.output_name))
+        depth_batch = torch.empty(output_shape, device=processed_batch.device, dtype=torch.float32)
+        self.context.set_tensor_address(self.input_name, int(processed_batch.data_ptr()))
+        self.context.set_tensor_address(self.output_name, int(depth_batch.data_ptr()))
+        self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+        return self.depth_model.postprocess_depth_batch(
+            depth_batch,
+            orig_size=orig_size,
+            proc_size=proc_size,
+            return_torch=False,
+        )
 
 class ScaleMetricsAccumulator:
     def __init__(self):
@@ -562,6 +1038,33 @@ def format_effective_test_profile(args, applied_profile_overrides: Dict[str, obj
     return f"{header}\n{pformat(applied_profile_overrides, sort_dicts=False)}"
 
 
+def sanitize_accel_flags(args):
+    metrics_enabled = args.compute_scale_metrics if args.scale_only else (
+        args.compute_scale_orientation_metrics or args.compute_scene_mid_err
+    )
+    fixed_depth_backends = {"onnxruntime", "tensorrt"}
+    if args.enable_cuda_graphs and (
+        args.save_visualizations
+        or metrics_enabled
+    ):
+        print("[Accel] Disabling CUDA graphs because vis/metrics are enabled.")
+        args.enable_cuda_graphs = False
+
+    if args.compile_depth and args.depth_backend != "pytorch":
+        print(f"[Accel] Ignoring --compile_depth because depth backend is {args.depth_backend}.")
+        args.compile_depth = False
+
+    if args.enable_cuda_graphs and not args.enable_fast_nusc_preprocess and args.depth_backend in fixed_depth_backends:
+        print(f"[Accel] {args.depth_backend} depth backend requires fast nuScenes preprocess; disabling CUDA graphs.")
+        args.enable_cuda_graphs = False
+
+    if args.depth_backend in fixed_depth_backends and not args.enable_fast_nusc_preprocess:
+        raise ValueError(f"--depth_backend={args.depth_backend} currently requires --enable_fast_nusc_preprocess true.")
+
+    if args.depth_backend in fixed_depth_backends and args.sjtu_test:
+        raise ValueError(f"--depth_backend={args.depth_backend} is currently only wired for the fixed nuScenes test path.")
+
+
 if torch.cuda.is_available():
     torch.cuda.set_device(0)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -588,11 +1091,6 @@ def save_rgb_image(path: str, rgb_image: np.ndarray):
     Image.fromarray(rgb_u8).save(path)
 
 
-def save_mask_image(path: str, mask: np.ndarray):
-    mask_u8 = np.asarray(mask, dtype=np.uint8) * 255
-    Image.fromarray(mask_u8).save(path)
-
-
 def stack_imgs_to_tensor(
     imgs: Dict[str, np.ndarray],
     camera_channels: List[str],
@@ -601,7 +1099,16 @@ def stack_imgs_to_tensor(
     tensors = [torch.from_numpy(imgs[ch]).permute(2, 0, 1).float() for ch in camera_channels]
     batch = torch.stack(tensors, dim=0).unsqueeze(0)
     batch = maybe_pin_cpu_tensor(batch)
-    return batch.to(device, non_blocking=torch.cuda.is_available())
+    batch_gpu = batch.to(device, non_blocking=torch.cuda.is_available())
+    log_dtype_event(
+        "input_stack.rgb_batch",
+        src_dtype=batch.dtype,
+        dst_dtype=batch_gpu.dtype,
+        shape=batch_gpu.shape,
+        device=batch_gpu.device,
+        copied=True,
+    )
+    return batch_gpu
 
 
 def stack_rgb_pair_dicts_to_device_batches(
@@ -617,6 +1124,14 @@ def stack_rgb_pair_dicts_to_device_batches(
     tensor = torch.from_numpy(batch_np).permute(0, 3, 1, 2).contiguous()
     tensor = maybe_pin_cpu_tensor(tensor)
     tensor_gpu = tensor.to(device, non_blocking=torch.cuda.is_available()).float()
+    log_dtype_event(
+        "input_stack.rgb_pair_batch",
+        src_dtype=tensor.dtype,
+        dst_dtype=tensor_gpu.dtype,
+        shape=tensor_gpu.shape,
+        device=tensor_gpu.device,
+        copied=True,
+    )
     num_cams = len(camera_channels)
     return tensor_gpu[:num_cams].unsqueeze(0), tensor_gpu[num_cams:].unsqueeze(0), tensor_gpu
 
@@ -635,7 +1150,16 @@ def stack_depth_maps_to_device_batch(
     depth_np = np.stack([depth_maps[ch] for ch in camera_channels], axis=0).astype(np.float32, copy=False)
     tensor = torch.from_numpy(depth_np).unsqueeze(1).contiguous()
     tensor = maybe_pin_cpu_tensor(tensor)
-    return tensor.unsqueeze(0).to(device, non_blocking=torch.cuda.is_available())
+    tensor_gpu = tensor.unsqueeze(0).to(device, non_blocking=torch.cuda.is_available())
+    log_dtype_event(
+        "depth_stack.depth_batch",
+        src_dtype=tensor.dtype,
+        dst_dtype=tensor_gpu.dtype,
+        shape=tensor_gpu.shape,
+        device=tensor_gpu.device,
+        copied=True,
+    )
+    return tensor_gpu
 
 
 def fixed_resize_crop_rgb_image(
@@ -734,10 +1258,6 @@ def init_mapping_detail_records() -> Dict[str, List[float]]:
     return {key: [] for key in MAPPING_DETAIL_KEYS}
 
 
-def sum_timing_keys(sample_timing: Dict[str, float], timing_keys: Tuple[str, ...]) -> float:
-    return sum(float(sample_timing.get(key, 0.0)) for key in timing_keys)
-
-
 def accumulate_timing(totals: Dict[str, float], sample_timing: Dict[str, float]):
     for key in TIMING_KEYS:
         totals[key] += sample_timing.get(key, 0.0)
@@ -772,195 +1292,45 @@ def get_timing_status(stage_key: str) -> str:
     return "active"
 
 
-def should_record_timing_sample(sample_idx: int) -> bool:
-    return sample_idx >= args.timing_warmup_samples
-
-
-def build_stats_from_values(values: np.ndarray) -> Dict[str, float]:
-    values = np.asarray(values, dtype=np.float64)
-    if values.size == 0:
-        return {
-            "avg_ms": 0.0,
-            "p50_ms": 0.0,
-            "p95_ms": 0.0,
-        }
-    return {
-        "avg_ms": float(values.mean()),
-        "p50_ms": float(np.percentile(values, 50)),
-        "p95_ms": float(np.percentile(values, 95)),
-    }
-
-
-def combine_timing_record_values(
-    records: Dict[str, List[float]],
-    timing_keys: Tuple[str, ...],
-    divisor: float = 1.0,
-) -> np.ndarray:
-    if divisor <= 0:
-        raise ValueError(f"Expected divisor > 0, got {divisor}")
-    arrays = [np.asarray(records.get(key, []), dtype=np.float64) for key in timing_keys]
-    if not arrays or arrays[0].size == 0:
-        return np.asarray([], dtype=np.float64)
-    stacked = np.stack(arrays, axis=0)
-    return stacked.sum(axis=0) / float(divisor)
-
-
-def build_timing_summary_payload(
+def build_timing_summary_markdown(
     label: str,
     totals: Dict[str, float],
     records: Dict[str, List[float]],
-    total_sample_count: int,
-    timed_sample_count: int,
+    sample_count: int,
     mapping_detail_totals: Dict[str, float],
     mapping_detail_records: Dict[str, List[float]],
     mapping_range_backend: str,
-    num_camera_views: int,
-) -> Dict[str, object]:
-    if timed_sample_count <= 0:
-        return {}
-
-    paper_note = None
-    if args.eval_view == "front" and not args.sjtu_test:
-        paper_note = LATENCY_REPORTING_NOTE
-    total_ms = sum(totals[key] for key in TIMING_KEYS)
-    stage_payload = {}
-    for key in TIMING_KEYS:
-        values = np.asarray(records.get(key, []), dtype=np.float64)
-        stats = build_stats_from_values(values)
-        stats["share_percent"] = (totals[key] / total_ms * 100.0) if total_ms > 0 else 0.0
-        stats["status"] = get_timing_status(key)
-        stage_payload[key.replace("_ms", "")] = stats
-
-    total_values = np.asarray(records.get("total_ms", []), dtype=np.float64)
-    total_stats = build_stats_from_values(total_values)
-    total_stats["share_percent"] = 100.0
-    total_stats["status"] = "active"
-    stage_payload["total"] = total_stats
-
-    derived_payload = {
-        "inference_latency_ms": {
-            **build_stats_from_values(combine_timing_record_values(records, PAPER_INFERENCE_TIMING_KEYS)),
-            "formula": "augment + depth + mapping + model",
-            "included_stages": [key.replace("_ms", "") for key in PAPER_INFERENCE_TIMING_KEYS],
-        },
-        "e2e_eval_latency_ms": {
-            **build_stats_from_values(combine_timing_record_values(records, E2E_EVAL_TIMING_KEYS)),
-            "formula": "io + augment + depth + mapping + model",
-            "included_stages": [key.replace("_ms", "") for key in E2E_EVAL_TIMING_KEYS],
-        },
-        "per_camera_preprocess_ms": {
-            **build_stats_from_values(
-                combine_timing_record_values(
-                    records,
-                    ("augment_ms", "depth_ms"),
-                    divisor=max(1, num_camera_views),
-                )
-            ),
-            "formula": f"(augment + depth) / {max(1, num_camera_views)}",
-            "num_camera_views": int(max(1, num_camera_views)),
-        },
-        "shared_surround_ms": {
-            **build_stats_from_values(combine_timing_record_values(records, ("mapping_ms", "model_ms"))),
-            "formula": "mapping + model",
-            "included_stages": ["mapping", "model"],
-        },
-    }
-
-    mapping_payload = {}
-    mapping_total = sum(mapping_detail_totals[key] for key in MAPPING_DETAIL_KEYS)
-    for key in MAPPING_DETAIL_KEYS:
-        values = np.asarray(mapping_detail_records.get(key, []), dtype=np.float64)
-        stats = build_stats_from_values(values)
-        stats["share_percent_of_mapping"] = (
-            mapping_detail_totals[key] / mapping_total * 100.0
-        ) if mapping_total > 0 else 0.0
-        mapping_payload[key.replace("_ms", "")] = stats
-
-    return {
-        "label": label,
-        "total_sample_count": int(total_sample_count),
-        "timed_sample_count": int(timed_sample_count),
-        "timing_warmup_samples_excluded": int(args.timing_warmup_samples),
-        "test_profile": args.test_profile,
-        "eval_view": args.eval_view,
-        "eval_camera_channel": args.eval_camera_channel if args.eval_view == "front" else None,
-        "num_camera_views": int(num_camera_views),
-        "mapping_range_backend": mapping_range_backend,
-        "paper_latency_key": "inference_latency_ms",
-        "paper_latency_note": paper_note,
-        "stage_timing_ms": stage_payload,
-        "derived_latency_ms": derived_payload,
-        "mapping_breakdown_ms": mapping_payload,
-    }
-
-
-def build_timing_summary_markdown(payload: Dict[str, object]) -> str:
-    if not payload:
+) -> str:
+    if sample_count <= 0:
         return ""
 
-    stage_payload = payload["stage_timing_ms"]
-    derived_payload = payload["derived_latency_ms"]
-    mapping_payload = payload["mapping_breakdown_ms"]
+    total_ms = sum(totals[key] for key in TIMING_KEYS)
+    avg_total_ms = total_ms / sample_count
     lines = [
-        f"# Timing Summary ({payload['label']})",
+        f"# Timing Summary ({label})",
         "",
-        f"- Samples: {payload['total_sample_count']}",
-        f"- Timed samples: {payload['timed_sample_count']}",
-        f"- Avg total: {stage_payload['total']['avg_ms']:.2f} ms",
-        f"- Avg inference latency (paper): {derived_payload['inference_latency_ms']['avg_ms']:.2f} ms",
-        f"- Mapping range backend: {payload['mapping_range_backend']}",
-        f"- Test profile: {payload['test_profile']}",
-        f"- Eval view: {payload['eval_view']}"
-        + (
-            f" ({payload['eval_camera_channel']})"
-            if payload.get("eval_camera_channel")
-            else ""
-        ),
-        f"- Camera views at inference: {payload['num_camera_views']}",
-    ]
-    if payload["timing_warmup_samples_excluded"] > 0:
-        lines.append(f"- Timing warmup excluded: {payload['timing_warmup_samples_excluded']}")
-    lines.extend([
-        "",
-        "## Derived Latency Views",
-        "",
-        "| Metric | Avg ms | p50 ms | p95 ms | Formula |",
-        "| --- | ---: | ---: | ---: | --- |",
-    ])
-
-    derived_rows = (
-        ("inference_latency_ms", "inference_latency_ms"),
-        ("e2e_eval_latency_ms", "e2e_eval_latency_ms"),
-        ("per_camera_preprocess_ms", "per_camera_preprocess_ms"),
-        ("shared_surround_ms", "shared_surround_ms"),
-    )
-    for row_key, display_name in derived_rows:
-        stats = derived_payload[row_key]
-        lines.append(
-            f"| {display_name} | {stats['avg_ms']:.2f} | {stats['p50_ms']:.2f} | {stats['p95_ms']:.2f} | {stats['formula']} |"
-        )
-
-    if payload.get("paper_latency_note"):
-        lines.extend([
-            "",
-            "## Paper Note",
-            "",
-            payload["paper_latency_note"],
-        ])
-
-    lines.extend([
-        "",
-        "## Stage Breakdown",
+        f"- Samples: {sample_count}",
+        f"- Avg total: {avg_total_ms:.2f} ms",
+        f"- Mapping range backend: {mapping_range_backend}",
         "",
         "| Stage | Avg ms | Share % | p50 ms | p95 ms | Status |",
         "| --- | ---: | ---: | ---: | ---: | --- |",
-    ])
-    for stage_name in [key.replace("_ms", "") for key in TIMING_KEYS] + ["total"]:
-        stats = stage_payload[stage_name]
+    ]
+
+    for key in TIMING_KEYS:
+        avg_ms = totals[key] / sample_count
+        share = (totals[key] / total_ms * 100.0) if total_ms > 0 else 0.0
+        values = np.asarray(records.get(key, []), dtype=np.float64)
+        p50 = float(np.percentile(values, 50)) if values.size else 0.0
+        p95 = float(np.percentile(values, 95)) if values.size else 0.0
         lines.append(
-            f"| {stage_name} | {stats['avg_ms']:.2f} | {stats['share_percent']:.1f} | {stats['p50_ms']:.2f} | {stats['p95_ms']:.2f} | {stats['status']} |"
+            f"| {key.replace('_ms', '')} | {avg_ms:.2f} | {share:.1f} | {p50:.2f} | {p95:.2f} | {get_timing_status(key)} |"
         )
 
+    total_values = np.asarray(records.get("total_ms", []), dtype=np.float64)
+    total_p50 = float(np.percentile(total_values, 50)) if total_values.size else 0.0
+    total_p95 = float(np.percentile(total_values, 95)) if total_values.size else 0.0
+    lines.append(f"| total | {avg_total_ms:.2f} | 100.0 | {total_p50:.2f} | {total_p95:.2f} | active |")
     lines.extend([
         "",
         "## Mapping Breakdown",
@@ -968,10 +1338,16 @@ def build_timing_summary_markdown(payload: Dict[str, object]) -> str:
         "| Stage | Avg ms | Share % of mapping | p50 ms | p95 ms |",
         "| --- | ---: | ---: | ---: | ---: |",
     ])
-    for stage_name in [key.replace("_ms", "") for key in MAPPING_DETAIL_KEYS]:
-        stats = mapping_payload[stage_name]
+
+    mapping_total = sum(mapping_detail_totals[key] for key in MAPPING_DETAIL_KEYS)
+    for key in MAPPING_DETAIL_KEYS:
+        avg_ms = mapping_detail_totals[key] / sample_count
+        share = (mapping_detail_totals[key] / mapping_total * 100.0) if mapping_total > 0 else 0.0
+        values = np.asarray(mapping_detail_records.get(key, []), dtype=np.float64)
+        p50 = float(np.percentile(values, 50)) if values.size else 0.0
+        p95 = float(np.percentile(values, 95)) if values.size else 0.0
         lines.append(
-            f"| {stage_name} | {stats['avg_ms']:.2f} | {stats['share_percent_of_mapping']:.1f} | {stats['p50_ms']:.2f} | {stats['p95_ms']:.2f} |"
+            f"| {key.replace('_ms', '')} | {avg_ms:.2f} | {share:.1f} | {p50:.2f} | {p95:.2f} |"
         )
     return "\n".join(lines)
 
@@ -980,42 +1356,28 @@ def print_timing_summary(
     label: str,
     totals: Dict[str, float],
     records: Dict[str, List[float]],
-    total_sample_count: int,
-    timed_sample_count: int,
+    sample_count: int,
     output_dir: str,
     mapping_detail_totals: Dict[str, float],
     mapping_detail_records: Dict[str, List[float]],
     mapping_range_backend: str,
-    num_camera_views: int,
 ):
-    if timed_sample_count <= 0:
-        print(
-            f"[WARN] No timing samples were recorded for {label}. "
-            f"timing_warmup_samples={args.timing_warmup_samples} excluded all {total_sample_count} samples."
-        )
+    if sample_count <= 0:
         return
-
-    payload = build_timing_summary_payload(
+    markdown = build_timing_summary_markdown(
         label,
         totals,
         records,
-        total_sample_count,
-        timed_sample_count,
+        sample_count,
         mapping_detail_totals,
         mapping_detail_records,
         mapping_range_backend,
-        num_camera_views,
     )
-    markdown = build_timing_summary_markdown(payload)
     print(f"\n{markdown}")
-    timing_md_path = os.path.join(output_dir, "timing_breakdown.md")
-    with open(timing_md_path, "w", encoding="utf-8") as handle:
+    timing_path = os.path.join(output_dir, "timing_breakdown.md")
+    with open(timing_path, "w", encoding="utf-8") as handle:
         handle.write(markdown + "\n")
-    timing_json_path = os.path.join(output_dir, "timing_breakdown.json")
-    with open(timing_json_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-    print(f"[INFO] Saved timing breakdown to {timing_md_path}")
-    print(f"[INFO] Saved timing breakdown to {timing_json_path}")
+    print(f"[INFO] Saved timing breakdown to {timing_path}")
 
 
 def resize_map_to_shape(map_array: np.ndarray, target_shape: Tuple[int, int], interpolation) -> np.ndarray:
@@ -1047,15 +1409,6 @@ def compute_ttc_from_scale(scale_map: np.ndarray, delta_t: float) -> np.ndarray:
 def print_scale_metrics_summary(metrics_payload: Dict[str, object]):
     print()
     print("Scale metrics")
-    print(
-        "  Eval view: "
-        f"{metrics_payload.get('eval_view', 'pano')}"
-        + (
-            f" ({metrics_payload.get('eval_camera_channel')})"
-            if metrics_payload.get("eval_view") == "front"
-            else ""
-        )
-    )
     print(f"  MiD Err: {metrics_payload['mid_err']:.6f}")
     print(f"  Err-1:   {metrics_payload['err_1']:.6f}")
     print(f"  Err-2:   {metrics_payload['err_2']:.6f}")
@@ -1284,7 +1637,7 @@ def resolve_depthanything_ckpt_dir(requested_dir: str) -> Path:
     )
 
 
-def build_models_and_runtime(args, test_entries: list, split_name: str) -> Tuple[torch.nn.Module, DepthAnythingV2, TestRuntime]:
+def build_models_and_runtime(args, test_entries: list, split_name: str) -> Tuple[torch.nn.Module, Any, TestRuntime]:
     model_kwargs = dict(
         num_scales=args.num_scales,
         feature_channels=args.feature_channels,
@@ -1293,10 +1646,12 @@ def build_models_and_runtime(args, test_entries: list, split_name: str) -> Tuple
         ffn_dim_expansion=args.ffn_dim_expansion,
         num_transformer_layers=args.num_transformer_layers,
         reg_refine=args.reg_refine,
+        cache_geom_constants=args.cache_geom_constants,
     )
     if "rvt_depth_guided_sampling" in inspect.signature(FpTTC).parameters:
         model_kwargs["rvt_depth_guided_sampling"] = args.rvt_depth_guided_sampling
     model = FpTTC(**model_kwargs).to(device).eval()
+    maybe_compile_model_submodules(model, args.compile_model_submodules, args.compile_mode)
     if args.resume:
         _load_checkpoint_flexibly(model, args.resume, device)
 
@@ -1312,12 +1667,18 @@ def build_models_and_runtime(args, test_entries: list, split_name: str) -> Tuple
     )
     depth_model.to(device).eval()
 
-    camera_channels = list(NUSC_CAMERA_CHANNELS)
+    camera_channels = [
+        "CAM_FRONT_LEFT", "CAM_FRONT", "CAM_FRONT_RIGHT",
+        "CAM_BACK_RIGHT", "CAM_BACK", "CAM_BACK_LEFT",
+    ]
     fixed_nusc_fast = None
+    fixed_depth_proc_hw = None
     if args.enable_fast_nusc_preprocess and test_entries and not args.sjtu_test:
         sample_path = resolve_nusc_path(test_entries[0]["prev_camera_data"][camera_channels[0]]["filename"])
         with Image.open(sample_path) as sample_image:
             fixed_nusc_fast = build_fixed_nusc_fast_preprocess(augmentor, sample_image.size)
+        crop_h, crop_w = fixed_nusc_fast["crop_hw"]
+        fixed_depth_proc_hw = DepthAnythingV2.get_preprocess_size(crop_h, crop_w, input_size=args.depth_input_size)
 
     runtime = TestRuntime(
         output_dir=create_output_dir(args.output_dir),
@@ -1327,16 +1688,63 @@ def build_models_and_runtime(args, test_entries: list, split_name: str) -> Tuple
         range_w=args.range_size[1],
         mapping_range_backend=resolve_mapping_range_backend(args.mapping_range_backend),
         fixed_nusc_fast=fixed_nusc_fast,
+        fixed_depth_proc_hw=fixed_depth_proc_hw,
+        xformers_available=xformers_available(),
     )
-    return model, depth_model, runtime
+    fixed_batch_size = len(camera_channels) * 2
+    default_depth_onnx_path = None
+    if runtime.fixed_depth_proc_hw is not None:
+        default_depth_onnx_path = (
+            Path(runtime.output_dir)
+            / f"depthanything_vits_{fixed_batch_size}x3x{runtime.fixed_depth_proc_hw[0]}x{runtime.fixed_depth_proc_hw[1]}.onnx"
+        )
+
+    if args.depth_backend == "tensorrt":
+        if runtime.fixed_depth_proc_hw is None:
+            raise RuntimeError("Depth TensorRT backend requires fixed nuScenes fast preprocess with a known tensor shape.")
+        depth_backend = DepthTensorRTBackend(
+            depth_model=depth_model,
+            engine_path=args.depth_trt_engine,
+            onnx_path=args.depth_onnx_path or str(default_depth_onnx_path),
+            input_size=args.depth_input_size,
+            fixed_batch_size=fixed_batch_size,
+            fixed_input_hw=runtime.fixed_depth_proc_hw,
+        )
+    elif args.depth_backend == "onnxruntime":
+        if runtime.fixed_depth_proc_hw is None:
+            raise RuntimeError("Depth ONNX Runtime backend requires fixed nuScenes fast preprocess with a known tensor shape.")
+        depth_backend = DepthONNXRuntimeBackend(
+            depth_model=depth_model,
+            onnx_path=args.depth_onnx_path or str(default_depth_onnx_path),
+            input_size=args.depth_input_size,
+            fixed_batch_size=fixed_batch_size,
+            fixed_input_hw=runtime.fixed_depth_proc_hw,
+        )
+    else:
+        depth_backend = DepthPyTorchBackend(
+            depth_model,
+            input_size=args.depth_input_size,
+            enable_amp=args.enable_depth_amp,
+            amp_dtype_name=args.depth_amp_dtype,
+            compile_depth=args.compile_depth,
+            compile_mode=args.compile_mode,
+            enable_cuda_graphs=args.enable_cuda_graphs,
+            cuda_graph_warmup_iters=args.cuda_graph_warmup_iters,
+        )
+    runtime.depth_backend_summary = depth_backend.summary
+    if args.enable_cuda_graphs and torch.cuda.is_available():
+        runtime.model_cuda_graph_runner = ModelCudaGraphRunner(
+            model,
+            amp_enabled=args.enable_model_amp,
+            amp_dtype_name=args.model_amp_dtype,
+            warmup_iters=args.cuda_graph_warmup_iters,
+        )
+    return model, depth_backend, runtime
 
 
 def print_runtime_summary(args, runtime: TestRuntime, applied_profile_overrides: Dict[str, object]):
     print(format_effective_test_profile(args, applied_profile_overrides))
     dataset_name = "sjtu" if args.sjtu_test else "nuScenes"
-    eval_mode = f"eval_view={args.eval_view}"
-    if args.eval_view == "front":
-        eval_mode += f" eval_camera_channel={args.eval_camera_channel}"
     metrics_mode = (
         f"compute_scale_metrics={args.compute_scale_metrics}"
         if args.scale_only
@@ -1351,7 +1759,6 @@ def print_runtime_summary(args, runtime: TestRuntime, applied_profile_overrides:
         f"image_size={tuple(args.image_size)} "
         f"depth_input_size={args.depth_input_size} "
         f"range_size=({runtime.range_h}, {runtime.range_w}) "
-        f"{eval_mode} "
         f"save_visualizations={args.save_visualizations} "
         f"scale_only={args.scale_only} "
         f"{metrics_mode} "
@@ -1361,11 +1768,15 @@ def print_runtime_summary(args, runtime: TestRuntime, applied_profile_overrides:
         "[Accel] "
         f"nusc_io_prefetch={args.enable_nusc_io_prefetch} "
         f"fast_nusc_preprocess={args.enable_fast_nusc_preprocess} "
+        f"depth_backend={runtime.depth_backend_summary} "
         f"depth_amp={args.enable_depth_amp}({args.depth_amp_dtype}) "
         f"depth_pre_workers={args.num_depth_preprocess_workers} "
         f"mapping_backend={runtime.mapping_range_backend} "
         f"model_amp={args.enable_model_amp}({args.model_amp_dtype}) "
-        f"empty_cache_before_model={args.empty_cache_before_model}"
+        f"compile_model_submodules={args.compile_model_submodules} "
+        f"cuda_graphs={args.enable_cuda_graphs} "
+        f"cache_geom_constants={args.cache_geom_constants} "
+        f"xformers_available={runtime.xformers_available}"
     )
     if args.sjtu_test:
         print("[SJTU] Online undistortion enabled. Metrics are disabled because scene_18 has no GT.")
@@ -1579,53 +1990,6 @@ def prepare_sjtu_input_bundle(
     ), augment_ms
 
 
-def compute_nusc_camera_view_mask(
-    sensor_metas_curr: Dict[str, object],
-    xyz_map: np.ndarray,
-    valid_mask: np.ndarray,
-    camera_channel: str,
-) -> np.ndarray:
-    xyz_map = np.asarray(xyz_map, dtype=np.float32)
-    valid_mask = np.asarray(valid_mask, dtype=bool)
-
-    if xyz_map.ndim != 3 or xyz_map.shape[-1] != 3:
-        raise ValueError(f"Expected xyz_map to have shape (H, W, 3), got {tuple(xyz_map.shape)}")
-    if xyz_map.shape[:2] != valid_mask.shape:
-        raise ValueError(
-            f"xyz_map spatial shape {tuple(xyz_map.shape[:2])} does not match valid_mask {tuple(valid_mask.shape)}"
-        )
-
-    camera_meta = sensor_metas_curr.get("camera", {})
-    calibrated = camera_meta.get("calibrated_sensor", {})
-    ego_pose = camera_meta.get("ego_pose", {})
-    if camera_channel not in calibrated or camera_channel not in ego_pose:
-        raise KeyError(f"Missing sensor metadata for camera channel {camera_channel}")
-
-    camera_view_mask = np.zeros(valid_mask.shape, dtype=bool)
-    if not valid_mask.any():
-        return camera_view_mask
-
-    cam_cs = calibrated[camera_channel]
-    cam_pose = ego_pose[camera_channel]
-    _, K, R_l2c, t_l2c = build_lidar_to_camera_projection(sensor_metas_curr, cam_cs, cam_pose)
-
-    valid_xyz = xyz_map[valid_mask]
-    cam_points = (R_l2c @ valid_xyz.T).T + np.asarray(t_l2c, dtype=np.float32).reshape(1, 3)
-    z = cam_points[:, 2]
-    proj = (K @ cam_points.T).T
-    uv = proj[:, :2] / np.clip(z[:, None], 1e-6, None)
-
-    visible = (
-        (z > 1.0)
-        & (uv[:, 0] >= 0.0)
-        & (uv[:, 0] < float(NUSC_RAW_IMAGE_WIDTH))
-        & (uv[:, 1] >= 0.0)
-        & (uv[:, 1] < float(NUSC_RAW_IMAGE_HEIGHT))
-    )
-    camera_view_mask[valid_mask] = visible
-    return camera_view_mask
-
-
 def load_nusc_ground_truth(sample_info: Dict[str, object], need_gt: bool):
     if not need_gt or sample_info.get("gt_map_path") is None:
         return None
@@ -1634,33 +1998,10 @@ def load_nusc_ground_truth(sample_info: Dict[str, object], need_gt: bool):
     gt_item = np.load(gt_range_path, allow_pickle=True).item()
     gt_scale_map = np.asarray(gt_item["scale"], dtype=np.float32)
     gt_risk_map = np.asarray(gt_item["risk_score"], dtype=np.float32)
-    base_valid_mask = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
-    xyz_map = None
-    camera_view_mask = None
-    valid_mask = base_valid_mask
-
-    if args.eval_view == "front":
-        if "xyz" not in gt_item:
-            raise ValueError(
-                f"GT file {gt_range_path} does not contain xyz, which is required for eval_view=front."
-            )
-        xyz_map = np.asarray(gt_item["xyz"], dtype=np.float32)
-        camera_view_mask = compute_nusc_camera_view_mask(
-            sample_info["sensor_metas_curr"],
-            xyz_map,
-            base_valid_mask,
-            args.eval_camera_channel,
-        )
-        valid_mask = base_valid_mask & camera_view_mask
-    elif "xyz" in gt_item:
-        xyz_map = np.asarray(gt_item["xyz"], dtype=np.float32)
-
+    valid_mask = (gt_scale_map > 0.3) & (gt_scale_map < 3.0)
     return {
         "scale": gt_scale_map,
         "risk": gt_risk_map,
-        "xyz": xyz_map,
-        "base_valid_mask": base_valid_mask,
-        "camera_view_mask": camera_view_mask,
         "valid_mask": valid_mask,
     }
 
@@ -1685,18 +2026,16 @@ def run_online_depth_and_mapping(
     inputs: NuscInputBundle,
     camera_channels: List[str],
     pool: ThreadPoolExecutor,
-    depth_model: DepthAnythingV2,
+    depth_backend,
     runtime: TestRuntime,
     device: torch.device,
     dataset_key: str,
 ):
     sync_cuda_if_available()
     t0 = time.perf_counter()
-    depth_list_12 = infer_depth_pair(
-        depth_model,
+    depth_list_12 = depth_backend.infer_depth_pair(
         inputs,
         camera_channels,
-        input_size=args.depth_input_size,
         num_preprocess_workers=args.num_depth_preprocess_workers,
     )
     prev_depth_map = {ch: depth for ch, depth in zip(camera_channels, depth_list_12[:len(camera_channels)])}
@@ -1813,6 +2152,7 @@ def run_nusc_model_forward(
     prev_depth_batch: Optional[torch.Tensor],
     curr_depth_batch: Optional[torch.Tensor],
     sensor_metas,
+    runtime: TestRuntime,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], float]:
     if args.empty_cache_before_model and torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1834,8 +2174,11 @@ def run_nusc_model_forward(
         scale_only=args.scale_only,
     )
     with torch.inference_mode():
-        with autocast_context(args.enable_model_amp, args.model_amp_dtype):
-            scale_pred, risk_pred = model.forward(**model_kwargs)
+        if runtime.model_cuda_graph_runner is not None:
+            scale_pred, risk_pred = runtime.model_cuda_graph_runner.run(**model_kwargs)
+        else:
+            with autocast_context(args.enable_model_amp, args.model_amp_dtype):
+                scale_pred, risk_pred = model.forward(**model_kwargs)
     sync_cuda_if_available()
     return scale_pred, risk_pred, (time.perf_counter() - t0) * 1000.0
 
@@ -1933,11 +2276,6 @@ def save_nusc_outputs(
                     gt_risk_map=gt_bundle["risk"],
                     gt_valid_mask=gt_bundle["valid_mask"],
                 )
-            if args.eval_view == "front" and gt_bundle.get("camera_view_mask") is not None:
-                save_mask_image(
-                    os.path.join(runtime.output_dir, f"front_view_mask_{idx}.png"),
-                    gt_bundle["camera_view_mask"],
-                )
 
         concat_prev = np.concatenate([inputs.proc_prev[ch] for ch in runtime.camera_channels], axis=1)
         concat_prev = concat_prev.astype(np.uint8)
@@ -1992,7 +2330,7 @@ def save_sjtu_outputs(
 
 def run_nusc_test(
     model: torch.nn.Module,
-    depth_model: DepthAnythingV2,
+    depth_backend,
     test_entries: list,
     runtime: TestRuntime,
     scale_metrics_acc: Optional[ScaleMetricsAccumulator],
@@ -2003,7 +2341,6 @@ def run_nusc_test(
     timing_records = init_timing_records()
     mapping_detail_totals = init_mapping_detail_totals()
     mapping_detail_records = init_mapping_detail_records()
-    timed_sample_count = 0
     image_loader = load_nusc_image_np if args.enable_fast_nusc_preprocess else load_nusc_image
 
     with ThreadPoolExecutor(max_workers=max(1, args.num_io_workers)) as pool:
@@ -2062,7 +2399,7 @@ def run_nusc_test(
                     inputs,
                     runtime.camera_channels,
                     pool,
-                    depth_model,
+                    depth_backend,
                     runtime,
                     device,
                     dataset_key="nusc",
@@ -2075,6 +2412,7 @@ def run_nusc_test(
                     prev_depth_batch,
                     curr_depth_batch,
                     sensor_metas,
+                    runtime,
                 )
                 scale_prediction_array, risk_prediction_array = materialize_prediction_arrays(
                     scale_pred,
@@ -2106,32 +2444,24 @@ def run_nusc_test(
                     risk_prediction_array,
                 )
 
-                is_timed_sample = should_record_timing_sample(idx)
-                if is_timed_sample:
-                    timed_sample_count += 1
-                    accumulate_timing(timing_totals, sample_timing)
-                    record_timing_sample(timing_records, sample_timing)
-                    accumulate_mapping_detail(mapping_detail_totals, sample_mapping_detail)
-                    record_mapping_detail_sample(mapping_detail_records, sample_mapping_detail)
+                accumulate_timing(timing_totals, sample_timing)
+                record_timing_sample(timing_records, sample_timing)
+                accumulate_mapping_detail(mapping_detail_totals, sample_mapping_detail)
+                record_mapping_detail_sample(mapping_detail_records, sample_mapping_detail)
                 if args.count_time:
-                    total_ms = sum_timing_keys(sample_timing, TIMING_KEYS)
-                    inference_ms = sum_timing_keys(sample_timing, PAPER_INFERENCE_TIMING_KEYS)
-                    e2e_eval_ms = sum_timing_keys(sample_timing, E2E_EVAL_TIMING_KEYS)
-                    timing_tag = "timed" if is_timed_sample else "warmup"
+                    total_ms = sum(sample_timing[key] for key in TIMING_KEYS)
                     print(
-                        f"[Timing][{idx}][{timing_tag}] io={sample_timing['io_ms']:.2f}ms "
+                        f"[Timing][{idx}] io={sample_timing['io_ms']:.2f}ms "
                         f"aug={sample_timing['augment_ms']:.2f}ms "
                         f"depth={sample_timing['depth_ms']:.2f}ms "
                         f"mapping={sample_timing['mapping_ms']:.2f}ms "
                         f"model={sample_timing['model_ms']:.2f}ms "
                         f"vis={sample_timing['vis_ms']:.2f}ms "
                         f"metrics={sample_timing['metrics_ms']:.2f}ms "
-                        f"inference={inference_ms:.2f}ms "
-                        f"e2e_eval={e2e_eval_ms:.2f}ms "
                         f"total={total_ms:.2f}ms"
                     )
                     print(
-                        f"[MappingDetail][{idx}][{timing_tag}] "
+                        f"[MappingDetail][{idx}] "
                         f"setup={sample_mapping_detail['transform_setup_ms']:.2f}ms "
                         f"backproject={sample_mapping_detail['camera_backproject_ms']:.2f}ms "
                         f"range={sample_mapping_detail['range_project_ms']:.2f}ms "
@@ -2151,18 +2481,16 @@ def run_nusc_test(
         timing_totals,
         timing_records,
         len(test_entries),
-        timed_sample_count,
         runtime.output_dir,
         mapping_detail_totals,
         mapping_detail_records,
         runtime.mapping_range_backend,
-        len(runtime.camera_channels),
     )
 
 
 def run_sjtu_test(
     model: torch.nn.Module,
-    depth_model: DepthAnythingV2,
+    depth_backend,
     test_entries: list,
     runtime: TestRuntime,
 ):
@@ -2170,7 +2498,6 @@ def run_sjtu_test(
     timing_records = init_timing_records()
     mapping_detail_totals = init_mapping_detail_totals()
     mapping_detail_records = init_mapping_detail_records()
-    timed_sample_count = 0
 
     with ThreadPoolExecutor(max_workers=max(1, args.num_io_workers)) as pool:
         for idx in tqdm(range(len(test_entries)), desc="Processing SJTU scene 18"):
@@ -2201,7 +2528,7 @@ def run_sjtu_test(
                 inputs,
                 runtime.camera_channels,
                 pool,
-                depth_model,
+                depth_backend,
                 runtime,
                 device,
                 dataset_key="sjtu",
@@ -2214,6 +2541,7 @@ def run_sjtu_test(
                 prev_depth_batch,
                 curr_depth_batch,
                 sensor_metas,
+                runtime,
             )
             scale_prediction_array, risk_prediction_array = materialize_prediction_arrays(
                 scale_pred,
@@ -2230,32 +2558,24 @@ def run_sjtu_test(
                 risk_prediction_array,
             )
 
-            is_timed_sample = should_record_timing_sample(idx)
-            if is_timed_sample:
-                timed_sample_count += 1
-                accumulate_timing(timing_totals, sample_timing)
-                record_timing_sample(timing_records, sample_timing)
-                accumulate_mapping_detail(mapping_detail_totals, sample_mapping_detail)
-                record_mapping_detail_sample(mapping_detail_records, sample_mapping_detail)
+            accumulate_timing(timing_totals, sample_timing)
+            record_timing_sample(timing_records, sample_timing)
+            accumulate_mapping_detail(mapping_detail_totals, sample_mapping_detail)
+            record_mapping_detail_sample(mapping_detail_records, sample_mapping_detail)
             if args.count_time:
-                total_ms = sum_timing_keys(sample_timing, TIMING_KEYS)
-                inference_ms = sum_timing_keys(sample_timing, PAPER_INFERENCE_TIMING_KEYS)
-                e2e_eval_ms = sum_timing_keys(sample_timing, E2E_EVAL_TIMING_KEYS)
-                timing_tag = "timed" if is_timed_sample else "warmup"
+                total_ms = sum(sample_timing[key] for key in TIMING_KEYS)
                 print(
-                    f"[Timing][SJTU][{idx}][{timing_tag}] io={sample_timing['io_ms']:.2f}ms "
+                    f"[Timing][SJTU][{idx}] io={sample_timing['io_ms']:.2f}ms "
                     f"aug={sample_timing['augment_ms']:.2f}ms "
                     f"depth={sample_timing['depth_ms']:.2f}ms "
                     f"mapping={sample_timing['mapping_ms']:.2f}ms "
                     f"model={sample_timing['model_ms']:.2f}ms "
                     f"vis={sample_timing['vis_ms']:.2f}ms "
                     f"metrics={sample_timing['metrics_ms']:.2f}ms "
-                    f"inference={inference_ms:.2f}ms "
-                    f"e2e_eval={e2e_eval_ms:.2f}ms "
                     f"total={total_ms:.2f}ms"
                 )
                 print(
-                    f"[MappingDetail][SJTU][{idx}][{timing_tag}] "
+                    f"[MappingDetail][SJTU][{idx}] "
                     f"setup={sample_mapping_detail['transform_setup_ms']:.2f}ms "
                     f"backproject={sample_mapping_detail['camera_backproject_ms']:.2f}ms "
                     f"range={sample_mapping_detail['range_project_ms']:.2f}ms "
@@ -2272,12 +2592,10 @@ def run_sjtu_test(
         timing_totals,
         timing_records,
         len(test_entries),
-        timed_sample_count,
         runtime.output_dir,
         mapping_detail_totals,
         mapping_detail_records,
         runtime.mapping_range_backend,
-        len(runtime.camera_channels),
     )
 
 
@@ -2288,13 +2606,6 @@ def finalize_metrics_and_reports(
     orientation_metrics_acc: Optional[Table3MetricsAccumulator],
     scene_mid_err_acc: Optional[SceneMidErrAccumulator],
 ):
-    def attach_eval_protocol_metadata(metrics_payload: Dict[str, object]) -> Dict[str, object]:
-        payload = dict(metrics_payload)
-        payload["eval_view"] = args.eval_view
-        payload["eval_camera_channel"] = args.eval_camera_channel if args.eval_view == "front" else None
-        payload["effective_valid_pixel_count"] = int(payload.get("valid_pixel_count", 0))
-        return payload
-
     if args.scale_only:
         if scale_metrics_acc is None:
             return
@@ -2302,9 +2613,7 @@ def finalize_metrics_and_reports(
             print("[INFO] No GT pixels available for scale metrics. Skipping metric summary and JSON export.")
             return
 
-        metrics_payload = attach_eval_protocol_metadata(
-            scale_metrics_acc.finalize(args.resume or "", runtime.split_name)
-        )
+        metrics_payload = scale_metrics_acc.finalize(args.resume or "", runtime.split_name)
         print_scale_metrics_summary(metrics_payload)
         metrics_path = os.path.join(runtime.output_dir, "scale_metrics.json")
         with open(metrics_path, "w", encoding="utf-8") as f:
@@ -2318,9 +2627,7 @@ def finalize_metrics_and_reports(
         print("[INFO] No GT pixels available for scale & orientation metrics. Skipping metric summary and JSON export.")
         return
 
-    metrics_payload = attach_eval_protocol_metadata(
-        orientation_metrics_acc.finalize(args.resume or "", runtime.split_name)
-    )
+    metrics_payload = orientation_metrics_acc.finalize(args.resume or "", runtime.split_name)
     print_scale_orientation_metrics_summary(metrics_payload)
     metrics_path = os.path.join(runtime.output_dir, "scale_orientation_metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
@@ -2344,6 +2651,9 @@ def finalize_metrics_and_reports(
 
 def main():
     applied_profile_overrides = resolve_test_profile(args)
+    sanitize_accel_flags(args)
+    reset_dtype_audit()
+    set_dtype_audit_enabled(args.dump_dtype_audit)
     raw_test_entries, split_name = load_test_entries(
         args.test_info_path,
         -1 if args.sjtu_test else args.max_test_samples,
@@ -2361,16 +2671,16 @@ def main():
     else:
         test_entries = raw_test_entries
 
-    model, depth_model, runtime = build_models_and_runtime(args, test_entries, split_name)
+    model, depth_backend, runtime = build_models_and_runtime(args, test_entries, split_name)
     scale_metrics_acc, orientation_metrics_acc, scene_mid_err_acc = create_metrics_accumulators(args, test_entries)
 
     print_runtime_summary(args, runtime, applied_profile_overrides)
     if args.sjtu_test:
-        run_sjtu_test(model, depth_model, test_entries, runtime)
+        run_sjtu_test(model, depth_backend, test_entries, runtime)
     else:
         run_nusc_test(
             model,
-            depth_model,
+            depth_backend,
             test_entries,
             runtime,
             scale_metrics_acc,
@@ -2384,6 +2694,11 @@ def main():
             orientation_metrics_acc,
             scene_mid_err_acc,
         )
+
+    if args.dump_dtype_audit:
+        dtype_audit_path = os.path.join(runtime.output_dir, "dtype_audit.json")
+        dtype_payload = dump_dtype_audit(dtype_audit_path)
+        print(f"[INFO] Saved dtype audit to {dtype_audit_path} ({dtype_payload['event_count']} events)")
 
 
 if __name__ == "__main__":
