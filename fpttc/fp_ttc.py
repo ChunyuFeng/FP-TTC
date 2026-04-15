@@ -11,11 +11,21 @@ from .scale_net.flow_net import FlowNet
 from .scale_net.scale_net import ScaleNet
 from .rvt.range_view_transformer import RangeViewTransformer
 from utils.loss import get_loss_risk_score_map, get_loss_scale_map
+from utils.dtype_audit import log_dtype_event
 
 
 def _safe_bilinear(x, *, size=None, scale_factor=None, align_corners=True):
     orig_dtype = x.dtype
     if orig_dtype == torch.bfloat16:
+        log_dtype_event(
+            "_safe_bilinear.upcast",
+            src_dtype=orig_dtype,
+            dst_dtype=torch.float32,
+            shape=x.shape,
+            device=x.device,
+            copied=True,
+            note="bilinear interpolate falls back to fp32 for bf16 inputs",
+        )
         x = x.float()
     y = F.interpolate(
         x,
@@ -24,6 +34,15 @@ def _safe_bilinear(x, *, size=None, scale_factor=None, align_corners=True):
         mode='bilinear',
         align_corners=align_corners,
     )
+    if y.dtype != orig_dtype:
+        log_dtype_event(
+            "_safe_bilinear.restore_dtype",
+            src_dtype=y.dtype,
+            dst_dtype=orig_dtype,
+            shape=y.shape,
+            device=y.device,
+            copied=True,
+        )
     return y.to(orig_dtype)
 
 
@@ -62,6 +81,7 @@ class FpTTC(nn.Module):
         num_transformer_layers=6,
         reg_refine=False,
         rvt_depth_guided_sampling=False,
+        cache_geom_constants=False,
     ):
         super().__init__()
         self.num_scales = num_scales
@@ -135,6 +155,7 @@ class FpTTC(nn.Module):
                     num_points=num_depth_bins,
                     fov_up=8.0,
                     fov_down=-15.0,
+                    cache_geom_constants=cache_geom_constants,
                 )
                 for _ in range(num_scales)
             ]
@@ -148,6 +169,7 @@ class FpTTC(nn.Module):
             num_points=num_depth_bins,
             fov_up=8.0,
             fov_down=-15.0,
+            cache_geom_constants=cache_geom_constants,
         )
         self.corr_residual_decoder = CorrResidualDecoder(feature_channels)
 

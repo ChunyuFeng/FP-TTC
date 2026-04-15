@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 import numpy as np
 import torch
 import torch.utils.data as data
@@ -500,6 +502,153 @@ def _precompute_pix_orig(H_img: int, W_img: int, affine_matrix: np.ndarray) -> n
     pix_orig /= pix_orig[2:3, :]                             # 归一化
     return pix_orig.astype(np.float32)
 
+
+_PIXEL_GRID_CACHE = {}
+_PIXEL_GRID_CACHE_LOCK = threading.Lock()
+_K_INV_CACHE = {}
+_K_INV_CACHE_LOCK = threading.Lock()
+_CAMERA_RAY_CACHE = {}
+_CAMERA_RAY_CACHE_LOCK = threading.Lock()
+
+
+def _affine_cache_key(H_img: int, W_img: int, pixel_stride: int, affine_matrix: np.ndarray):
+    affine = np.asarray(affine_matrix, dtype=np.float32)
+    return (int(H_img), int(W_img), int(pixel_stride), affine.shape, affine.tobytes())
+
+
+def _get_cached_inverse_affine_grid(H_img: int, W_img: int, pixel_stride: int, affine_matrix: np.ndarray):
+    cache_key = _affine_cache_key(H_img, W_img, pixel_stride, affine_matrix)
+    cached = _PIXEL_GRID_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    pix_orig_full = _precompute_pix_orig(H_img, W_img, affine_matrix)
+    if pixel_stride > 1:
+        us = np.arange(0, W_img, pixel_stride)
+        vs = np.arange(0, H_img, pixel_stride)
+        u_grid_s, v_grid_s = np.meshgrid(us, vs)
+        pick_lin = (v_grid_s * W_img + u_grid_s).reshape(-1)
+        cached_value = (
+            pix_orig_full[:, pick_lin],
+            u_grid_s.reshape(-1),
+            v_grid_s.reshape(-1),
+            pick_lin,
+        )
+    else:
+        uu_full, vv_full = np.meshgrid(np.arange(W_img), np.arange(H_img))
+        cached_value = (
+            pix_orig_full,
+            uu_full.reshape(-1),
+            vv_full.reshape(-1),
+            None,
+        )
+
+    with _PIXEL_GRID_CACHE_LOCK:
+        existing = _PIXEL_GRID_CACHE.get(cache_key)
+        if existing is not None:
+            return existing
+        _PIXEL_GRID_CACHE[cache_key] = cached_value
+    return cached_value
+
+
+def _get_cached_k_inv(K: np.ndarray) -> np.ndarray:
+    K = np.asarray(K, dtype=np.float32)
+    cache_key = (K.shape, K.tobytes())
+    cached = _K_INV_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    k_inv = np.linalg.inv(K).astype(np.float32)
+    with _K_INV_CACHE_LOCK:
+        existing = _K_INV_CACHE.get(cache_key)
+        if existing is not None:
+            return existing
+        _K_INV_CACHE[cache_key] = k_inv
+    return k_inv
+
+
+def _camera_signature_bytes(sample_info, dataset_key: str, frame_key: str, camera_channel: str) -> bytes:
+    if dataset_key == 'sjtu':
+        sensor_meta = sample_info[f'sensor_metas_{frame_key}'][camera_channel]
+        parts = [
+            np.asarray(sensor_meta['K'], dtype=np.float32).tobytes(),
+            np.asarray(sensor_meta['R_l2c'], dtype=np.float32).tobytes(),
+            np.asarray(sensor_meta['t_l2c'], dtype=np.float32).reshape(-1).tobytes(),
+        ]
+    else:
+        sensor_metas = sample_info[f'sensor_metas_{frame_key}']
+        cam_cs = sensor_metas['camera']['calibrated_sensor'][camera_channel]
+        cam_pose = sensor_metas['camera']['ego_pose'][camera_channel]
+        lidar_cs = sensor_metas['lidar']['calibrated_sensor']
+        lidar_pose = sensor_metas['lidar']['ego_pose']
+        parts = [
+            np.asarray(cam_cs['camera_intrinsic'], dtype=np.float32).tobytes(),
+            np.asarray(cam_cs['translation'], dtype=np.float32).tobytes(),
+            np.asarray(cam_cs['rotation'], dtype=np.float32).tobytes(),
+            np.asarray(cam_pose['translation'], dtype=np.float32).tobytes(),
+            np.asarray(cam_pose['rotation'], dtype=np.float32).tobytes(),
+            np.asarray(lidar_cs['translation'], dtype=np.float32).tobytes(),
+            np.asarray(lidar_cs['rotation'], dtype=np.float32).tobytes(),
+            np.asarray(lidar_pose['translation'], dtype=np.float32).tobytes(),
+            np.asarray(lidar_pose['rotation'], dtype=np.float32).tobytes(),
+        ]
+    return b''.join(parts)
+
+
+def _get_cached_camera_ray_base(
+    sample_info,
+    dataset_key: str,
+    frame_key: str,
+    camera_channel: str,
+    pix_orig: np.ndarray,
+    H_img: int,
+    W_img: int,
+    pixel_stride: int,
+    affine_matrix: np.ndarray,
+):
+    affine_key = _affine_cache_key(H_img, W_img, pixel_stride, affine_matrix)
+    camera_signature = _camera_signature_bytes(sample_info, dataset_key, frame_key, camera_channel)
+    cache_key = (dataset_key, camera_channel, affine_key, camera_signature)
+
+    cached = _CAMERA_RAY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if dataset_key == 'sjtu':
+        sensor_meta = sample_info[f'sensor_metas_{frame_key}'][camera_channel]
+        K = np.asarray(sensor_meta['K'], dtype=np.float32)
+        R_l2c = np.asarray(sensor_meta['R_l2c'], dtype=np.float32)
+        t_l2c = np.asarray(sensor_meta['t_l2c'], dtype=np.float32).reshape(3, 1)
+        K_inv = _get_cached_k_inv(K)
+        R_c2l = R_l2c.T.astype(np.float32)
+        t_c2l = (-R_c2l @ t_l2c).astype(np.float32)
+        ray_lidar_base = (R_c2l @ (K_inv @ pix_orig)).astype(np.float32)
+        ray_lidar_base[:2, :] *= -1.0
+        t_c2l[:2, :] *= -1.0
+    else:
+        sensor_metas = sample_info[f'sensor_metas_{frame_key}']
+        _, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
+            sensor_metas,
+            sensor_metas['camera']['calibrated_sensor'][camera_channel],
+            sensor_metas['camera']['ego_pose'][camera_channel]
+        )
+        K = np.asarray(K, dtype=np.float32)
+        R_l2c = np.asarray(R_l2c, dtype=np.float32)
+        t_l2c = np.asarray(t_l2c, dtype=np.float32).reshape(3, 1)
+        K_inv = _get_cached_k_inv(K)
+        R_c2l = R_l2c.T.astype(np.float32)
+        t_c2l = (-R_c2l @ t_l2c).astype(np.float32)
+        ray_lidar_base = (R_c2l @ (K_inv @ pix_orig)).astype(np.float32)
+
+    cached_value = (ray_lidar_base, t_c2l.astype(np.float32))
+    with _CAMERA_RAY_CACHE_LOCK:
+        existing = _CAMERA_RAY_CACHE.get(cache_key)
+        if existing is not None:
+            return existing
+        _CAMERA_RAY_CACHE[cache_key] = cached_value
+    return cached_value
+
+
 def _geometry_cam2lidar_from_depth(
     depth_map: np.ndarray,
     K_inv: np.ndarray,
@@ -593,6 +742,192 @@ def _range_projection_with_mapping_np_fast(
 
     return proj_range, proj_xyz, proj_idx, proj_mask, proj_pix
 
+def build_camera_mapping_fast(
+    sample_info,
+    dataset_key: str,
+    frame_key: str,
+    depth_map: np.ndarray,
+    affine_matrix: np.ndarray,
+    camera_channel: str,
+    camera_index: int,
+    pixel_stride: int = 1,
+    return_timing: bool = False,
+):
+    t0 = time.perf_counter()
+
+    depth_map = np.asarray(depth_map, dtype=np.float32)
+    H_img, W_img = depth_map.shape
+    pix_orig, uu_base, vv_base, pick_lin = _get_cached_inverse_affine_grid(
+        H_img, W_img, pixel_stride, affine_matrix
+    )
+    ray_lidar_base, t_c2l = _get_cached_camera_ray_base(
+        sample_info,
+        dataset_key,
+        frame_key,
+        camera_channel,
+        pix_orig,
+        H_img,
+        W_img,
+        pixel_stride,
+        affine_matrix,
+    )
+    t1 = time.perf_counter()
+
+    ds = depth_map.reshape(-1)[pick_lin] if pick_lin is not None else depth_map.reshape(-1)
+    valid = ds > 0
+    if not np.any(valid):
+        empty_points = np.empty((0, 3), dtype=np.float32)
+        empty_pix = np.empty((0, 3), dtype=np.int32)
+        if return_timing:
+            return empty_points, empty_pix, {
+                'transform_setup_ms': (t1 - t0) * 1000.0,
+                'camera_backproject_ms': 0.0,
+            }
+        return empty_points, empty_pix
+
+    ds_valid = ds[valid].astype(np.float32, copy=False)
+    points = (ray_lidar_base[:, valid] * ds_valid[np.newaxis, :]) + t_c2l
+    uu = uu_base[valid].astype(np.int32, copy=False)
+    vv = vv_base[valid].astype(np.int32, copy=False)
+    cam_col = np.full_like(uu, camera_index, dtype=np.int32)
+    pix = np.stack([cam_col, uu, vv], axis=1).astype(np.int32, copy=False)
+    t2 = time.perf_counter()
+
+    if return_timing:
+        return points.T.astype(np.float32, copy=False), pix, {
+            'transform_setup_ms': (t1 - t0) * 1000.0,
+            'camera_backproject_ms': (t2 - t1) * 1000.0,
+        }
+    return points.T.astype(np.float32, copy=False), pix
+
+
+def _resolve_mapping_range_backend(mapping_range_backend: str) -> str:
+    if mapping_range_backend == 'auto':
+        return 'gpu' if torch.cuda.is_available() else 'cpu'
+    if mapping_range_backend == 'gpu' and not torch.cuda.is_available():
+        return 'cpu'
+    return mapping_range_backend
+
+
+def _range_projection_with_mapping_torch_fast(
+    points: np.ndarray,
+    pix_coords: np.ndarray,
+    H: int = 160,
+    W: int = 1920,
+    fov_up: float = 8.0,
+    fov_down: float = -15.0,
+):
+    device = torch.device('cuda')
+    points_t = torch.from_numpy(np.asarray(points, dtype=np.float32)).to(device, non_blocking=False)
+    pix_t = torch.from_numpy(np.asarray(pix_coords, dtype=np.int32)).to(device, non_blocking=False)
+
+    depth = torch.linalg.norm(points_t, dim=1)
+    safe = torch.clamp_min(depth, 1e-9)
+    yaw = -torch.atan2(points_t[:, 1], points_t[:, 0])
+    pitch = torch.asin(torch.clamp(points_t[:, 2] / safe, -1.0, 1.0))
+
+    fov_up_rad = float(np.deg2rad(fov_up))
+    fov_down_rad = float(np.deg2rad(fov_down))
+    fov = abs(fov_down_rad) + abs(fov_up_rad)
+
+    proj_x = torch.floor(0.5 * (yaw / np.pi + 1.0) * W).to(torch.int64)
+    proj_y = torch.floor((1.0 - (pitch + abs(fov_down_rad)) / fov) * H).to(torch.int64)
+    proj_x.clamp_(0, W - 1)
+    proj_y.clamp_(0, H - 1)
+    lin = proj_y * W + proj_x
+
+    flat_size = H * W
+    min_depth = torch.full((flat_size,), float('inf'), device=device, dtype=torch.float32)
+    min_depth.scatter_reduce_(0, lin, depth, reduce='amin', include_self=True)
+
+    candidate = depth <= (min_depth[lin] + 1e-6)
+    point_idx = torch.arange(depth.shape[0], device=device, dtype=torch.int64)
+    invalid_idx = torch.full_like(point_idx, depth.shape[0])
+    candidate_idx = torch.where(candidate, point_idx, invalid_idx)
+    chosen_idx = torch.full((flat_size,), depth.shape[0], device=device, dtype=torch.int64)
+    chosen_idx.scatter_reduce_(0, lin, candidate_idx, reduce='amin', include_self=True)
+
+    valid_flat = chosen_idx < depth.shape[0]
+    flat_idx = torch.nonzero(valid_flat, as_tuple=False).squeeze(1)
+    selected_idx = chosen_idx[flat_idx]
+
+    proj_range = torch.full((flat_size,), -1.0, device=device, dtype=torch.float32)
+    proj_mask = torch.zeros((flat_size,), device=device, dtype=torch.int32)
+    proj_pix = torch.full((flat_size, 3), -1, device=device, dtype=torch.int32)
+
+    proj_range[flat_idx] = depth[selected_idx]
+    proj_mask[flat_idx] = 1
+    proj_pix[flat_idx] = pix_t[selected_idx]
+
+    torch.cuda.synchronize()
+
+    return (
+        proj_range.view(H, W).cpu().numpy(),
+        proj_mask.view(H, W).cpu().numpy(),
+        proj_pix.view(H, W, 3).cpu().numpy(),
+    )
+
+
+def finalize_frame_mapping_fast(
+    camera_results,
+    H_r: int = 40,
+    W_r: int = 480,
+    return_timing: bool = False,
+    mapping_range_backend: str = 'auto',
+):
+    t0 = time.perf_counter()
+    resolved_backend = _resolve_mapping_range_backend(mapping_range_backend)
+
+    valid_results = [(points, pix) for points, pix in camera_results if points.size > 0]
+    if not valid_results:
+        proj_range = np.full((H_r, W_r), -1, np.float32)
+        proj_pix = np.full((H_r, W_r, 3), -1, np.int32)
+        if return_timing:
+            return proj_range, proj_pix, {
+                'range_project_ms': 0.0,
+                'hole_fill_ms': 0.0,
+                'range_backend': resolved_backend,
+            }
+        return proj_range, proj_pix
+
+    points = np.concatenate([points for points, _ in valid_results], axis=0)
+    pix = np.concatenate([pix for _, pix in valid_results], axis=0)
+
+    if resolved_backend == 'gpu':
+        proj_range, proj_mask, proj_pix = _range_projection_with_mapping_torch_fast(
+            points, pix, H=H_r, W=W_r, fov_up=8.0, fov_down=-15.0
+        )
+    else:
+        proj_range, proj_xyz, proj_idx, proj_mask, proj_pix = _range_projection_with_mapping_np_fast(
+            points, pix, H=H_r, W=W_r, fov_up=8.0, fov_down=-15.0
+        )
+    t1 = time.perf_counter()
+
+    valid_im = proj_mask.astype(bool)
+    hole_fill_ms = 0.0
+    if not valid_im.all():
+        hole_mask = ~valid_im
+        invalid_count = int(hole_mask.sum())
+        t_fill_0 = time.perf_counter()
+        _, inds = distance_transform_edt(hole_mask, return_distances=True, return_indices=True)
+        i_near, j_near = inds
+        if invalid_count > 0:
+            hole_i, hole_j = np.nonzero(hole_mask)
+            proj_pix[hole_i, hole_j] = proj_pix[i_near[hole_i, hole_j], j_near[hole_i, hole_j]]
+            proj_range[hole_i, hole_j] = proj_range[i_near[hole_i, hole_j], j_near[hole_i, hole_j]]
+            proj_mask[hole_i, hole_j] = 1
+        t_fill_1 = time.perf_counter()
+        hole_fill_ms = (t_fill_1 - t_fill_0) * 1000.0
+
+    if return_timing:
+        return proj_range, proj_pix, {
+            'range_project_ms': (t1 - t0) * 1000.0,
+            'hole_fill_ms': hole_fill_ms,
+            'range_backend': resolved_backend,
+        }
+    return proj_range, proj_pix
+
+
 def build_frame_mapping_fast(
     data,
     dataset_key: str,
@@ -602,7 +937,9 @@ def build_frame_mapping_fast(
     idx: int,
     H_r: int = 40, W_r: int = 480,
     visualize: bool = False,
-    pixel_stride: int = 1
+    pixel_stride: int = 1,
+    mapping_range_backend: str = 'auto',
+    return_timing: bool = False,
 ):
     """
     读取该帧 6 个相机的深度与标定，反投影到 LiDAR，再做 range 投影，返回：
@@ -613,122 +950,63 @@ def build_frame_mapping_fast(
     - pixel_stride >= 1（>1 会对像素网格均匀下采样）
     """
     assert dataset_key in ('sjtu', 'nusc')
-    camera_channels = CAMERA_CHANNELS
 
-    # 1) 帧级像素网格逆仿射（一次计算，所有相机复用）
-    any_ch = camera_channels[0]
-    H_img, W_img = depth_map_dict[any_ch].shape
-    pix_orig_full = _precompute_pix_orig(H_img, W_img, affine_matrix)          # (3, N)
+    sample_info = data[idx]
+    camera_results = []
+    timing = {
+        'transform_setup_ms': 0.0,
+        'camera_backproject_ms': 0.0,
+        'range_project_ms': 0.0,
+        'hole_fill_ms': 0.0,
+        'range_backend': _resolve_mapping_range_backend(mapping_range_backend),
+    }
 
-    if pixel_stride > 1:
-        us = np.arange(0, W_img, pixel_stride)
-        vs = np.arange(0, H_img, pixel_stride)
-        u_grid_s, v_grid_s = np.meshgrid(us, vs)
-        pick_lin = (v_grid_s * W_img + u_grid_s).reshape(-1)                   # (N')
-        pix_orig = pix_orig_full[:, pick_lin]                                   # (3, N')
-        # 下采样后的 (u,v) 基网格（后续各相机按有效掩膜过滤）
-        uu_sub = u_grid_s.reshape(-1)
-        vv_sub = v_grid_s.reshape(-1)
-    else:
-        pick_lin = None
-        pix_orig = pix_orig_full                                               # (3, N)
-        # 全量 (u,v)
-        uu_full, vv_full = np.meshgrid(np.arange(W_img), np.arange(H_img))
-        uu_full = uu_full.reshape(-1)
-        vv_full = vv_full.reshape(-1)
-
-    # 2) 相机级缓存（K_inv/R_c2l/t_c2l/flip_xy）
-    cam_cache = {}
-    if dataset_key == 'sjtu':
-        for ch in camera_channels:
-            K     = np.asarray(data[idx][f'sensor_metas_{frame_key}'][ch]['K'], dtype=np.float32)
-            R_l2c = np.asarray(data[idx][f'sensor_metas_{frame_key}'][ch]['R_l2c'], dtype=np.float32)
-            t_l2c = np.asarray(data[idx][f'sensor_metas_{frame_key}'][ch]['t_l2c'], dtype=np.float32).reshape(3, 1)
-
-            K_inv = np.linalg.inv(K).astype(np.float32)
-            R_c2l = R_l2c.T.astype(np.float32)
-            t_c2l = (-R_c2l @ t_l2c).astype(np.float32)
-            cam_cache[ch] = (K_inv, R_c2l, t_c2l, True)  # SJTU: flip_xy=True
-
-    else:  # 'nusc'
-        # 采用 build_lidar_to_camera_projection 来得到 K, R_l2c, t_l2c
-        
-
-        sensor_metas = data[idx][f'sensor_metas_{frame_key}']
-        for ch in camera_channels:
-            proj_matrix, K, R_l2c, t_l2c = build_lidar_to_camera_projection(
-                sensor_metas,
-                sensor_metas['camera']['calibrated_sensor'][ch],
-                sensor_metas['camera']['ego_pose'][ch]
+    transform_setup_samples = []
+    camera_backproject_samples = []
+    for cam_idx, ch in enumerate(CAMERA_CHANNELS):
+        if return_timing:
+            points, pix, camera_timing = build_camera_mapping_fast(
+                sample_info,
+                dataset_key,
+                frame_key,
+                depth_map_dict[ch],
+                affine_matrix,
+                ch,
+                cam_idx,
+                pixel_stride,
+                True,
             )
-            K     = np.asarray(K, dtype=np.float32)
-            R_l2c = np.asarray(R_l2c, dtype=np.float32)
-            t_l2c = np.asarray(t_l2c, dtype=np.float32).reshape(3, 1)
-
-            K_inv = np.linalg.inv(K).astype(np.float32)
-            R_c2l = R_l2c.T.astype(np.float32)
-            t_c2l = (-R_c2l @ t_l2c).astype(np.float32)
-            cam_cache[ch] = (K_inv, R_c2l, t_c2l, False)  # NuScenes: flip_xy=False
-
-    # 3) 各相机反投影 + 像素坐标收集
-    all_points = []
-    all_pix    = []
-
-    for cam_idx, ch in enumerate(camera_channels):
-        depth_map = np.asarray(depth_map_dict[ch], dtype=np.float32)
-
-        # 与 pix_orig 对齐的深度向量 ds
-        if pixel_stride > 1:
-            ds = depth_map.reshape(-1)[pick_lin]            # (N',)
-            uu_base, vv_base = uu_sub, vv_sub              # 下采样 (u,v) 基
+            transform_setup_samples.append(camera_timing['transform_setup_ms'])
+            camera_backproject_samples.append(camera_timing['camera_backproject_ms'])
         else:
-            ds = depth_map.reshape(-1)                      # (N,)
-            uu_base, vv_base = uu_full, vv_full            # 全量 (u,v)
+            points, pix = build_camera_mapping_fast(
+                sample_info,
+                dataset_key,
+                frame_key,
+                depth_map_dict[ch],
+                affine_matrix,
+                ch,
+                cam_idx,
+                pixel_stride,
+                False,
+            )
+        camera_results.append((points, pix))
 
-        valid = ds > 0
-        if not np.any(valid):
-            continue
-
-        # 对应地裁切 pix_orig 与 ds
-        pix_orig_use = pix_orig[:, valid]                  # (3, N_valid)
-        ds_use = ds[valid]                                 # (N_valid,)
-
-        K_inv, R_c2l, t_c2l, flip_xy = cam_cache[ch]
-        pts = _geometry_cam2lidar_from_depth(
-            depth_map, K_inv, R_c2l, t_c2l, pix_orig_use,
-            flip_xy=flip_xy, ds=ds_use
-        ).astype(np.float32)                               # (N_valid, 3)
-
-        uu = uu_base[valid].astype(np.int32)
-        vv = vv_base[valid].astype(np.int32)
-        cam_col = np.full_like(uu, cam_idx, dtype=np.int32)
-        pix = np.stack([cam_col, uu, vv], axis=1).astype(np.int32)  # (N_valid, 3)
-
-        all_points.append(pts)
-        all_pix.append(pix)
-
-    # 若所有相机都无有效点，返回空图
-    if not all_points:
-        proj_range = np.full((H_r, W_r), -1, np.float32)
-        proj_pix   = np.full((H_r, W_r, 3), -1, np.int32)
-        return proj_range, proj_pix
-
-    points = np.concatenate(all_points, axis=0)
-    pix    = np.concatenate(all_pix,    axis=0)
-
-    # 4) 矢量化 range 投影 + 最近点选择
-    proj_range, proj_xyz, proj_idx, proj_mask, proj_pix = _range_projection_with_mapping_np_fast(
-        points, pix, H=H_r, W=W_r, fov_up=8.0, fov_down=-15.0
+    proj_range, proj_pix, finalize_timing = finalize_frame_mapping_fast(
+        camera_results,
+        H_r=H_r,
+        W_r=W_r,
+        return_timing=True,
+        mapping_range_backend=mapping_range_backend,
     )
 
-    # 5) 小图补洞（40×480 开销很低）
-    valid_im = proj_mask.astype(bool)
-    if not valid_im.all():
-        _, inds = distance_transform_edt(~valid_im, return_distances=True, return_indices=True)
-        i_near, j_near = inds
-        proj_pix   = proj_pix[i_near, j_near]
-        proj_range = proj_range[i_near, j_near]
-        proj_mask[:] = 1
+    if return_timing:
+        timing['transform_setup_ms'] = max(transform_setup_samples) if transform_setup_samples else 0.0
+        timing['camera_backproject_ms'] = max(camera_backproject_samples) if camera_backproject_samples else 0.0
+        timing['range_project_ms'] = finalize_timing['range_project_ms']
+        timing['hole_fill_ms'] = finalize_timing['hole_fill_ms']
+        timing['range_backend'] = finalize_timing['range_backend']
+        return proj_range, proj_pix, timing
 
     return proj_range, proj_pix
 

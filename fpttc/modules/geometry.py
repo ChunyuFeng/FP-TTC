@@ -1,6 +1,19 @@
 import torch
 import torch.nn.functional as F
 
+_COORD_CENTER_CACHE = {}
+
+
+def _get_coord_center(h, w, device, dtype):
+    key = (int(h), int(w), str(device), str(dtype))
+    if key not in _COORD_CENTER_CACHE:
+        _COORD_CENTER_CACHE[key] = torch.tensor(
+            [(w - 1) / 2.0, (h - 1) / 2.0],
+            dtype=dtype,
+            device=device,
+        )
+    return _COORD_CENTER_CACHE[key]
+
 
 def coords_grid(b, h, w, homogeneous=False, device=None):
     y, x = torch.meshgrid(torch.arange(h), torch.arange(w))  # [H, W]
@@ -34,7 +47,7 @@ def generate_window_grid(h_min, h_max, w_min, w_max, len_h, len_w, device=None):
 
 def normalize_coords(coords, h, w):
     # coords: [B, H, W, 2]
-    c = torch.Tensor([(w - 1) / 2., (h - 1) / 2.]).float().to(coords.device)
+    c = _get_coord_center(h, w, coords.device, coords.dtype)
     return (coords - c) / c  # [-1, 1]
 
 

@@ -166,8 +166,7 @@ def local_correlation_softmax(feature0, feature1, local_radius,
 
     # mask invalid locations
     # corr[~valid] = -1e9
-    neg = torch.tensor(float('-inf'), dtype=corr.dtype, device=corr.device)
-    corr = corr.masked_fill(~valid, neg)
+    corr = corr.masked_fill(~valid, float("-inf"))
 
     prob = F.softmax(corr, -1)  # [B, H*W, (2R+1)^2]
 

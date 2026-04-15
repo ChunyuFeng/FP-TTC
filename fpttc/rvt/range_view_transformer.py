@@ -182,6 +182,7 @@ class RangeViewTransformer(nn.Module):
         num_points=8,
         fov_up=8.0,
         fov_down=-15.0,
+        cache_geom_constants=False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -190,6 +191,10 @@ class RangeViewTransformer(nn.Module):
         self.num_points = num_points
         self.fov_up = fov_up
         self.fov_down = fov_down
+        self.cache_geom_constants = cache_geom_constants
+        self._cached_range_rays = {}
+        self._cached_scale_matrices = {}
+        self._cached_query_location = {}
 
         self.query_encoder = nn.Sequential(
             conv(input_dim, d_model * 2),
@@ -218,6 +223,64 @@ class RangeViewTransformer(nn.Module):
         )
         self.local_depth_min = 1e-3
         self.local_depth_max = 48.0
+
+    def _cache_key(self, *values):
+        normalized = []
+        for value in values:
+            if isinstance(value, torch.device):
+                normalized.append(str(value))
+            elif isinstance(value, torch.dtype):
+                normalized.append(str(value))
+            elif isinstance(value, list):
+                normalized.append(tuple(value))
+            else:
+                normalized.append(value)
+        return tuple(normalized)
+
+    def _get_range_rays(self, Hr, Wr, device, dtype):
+        key = self._cache_key(Hr, Wr, device, dtype)
+        if self.cache_geom_constants and key in self._cached_range_rays:
+            return self._cached_range_rays[key]
+        rays = make_range_rays(Hr, Wr, self.fov_up, self.fov_down, device=device).to(dtype=dtype)
+        if self.cache_geom_constants:
+            self._cached_range_rays[key] = rays
+        return rays
+
+    def _get_scale_matrices(self, feature_sizes, input_hw, device, dtype):
+        key = self._cache_key(tuple(feature_sizes), tuple(input_hw), device, dtype)
+        if self.cache_geom_constants and key in self._cached_scale_matrices:
+            return self._cached_scale_matrices[key]
+
+        input_h, input_w = input_hw
+        scale_mats = []
+        for feat_h, feat_w in feature_sizes:
+            scale_x = feat_w / float(input_w)
+            scale_y = feat_h / float(input_h)
+            scale_m = torch.tensor(
+                [[scale_x, 0.0, 0.0], [0.0, scale_y, 0.0], [0.0, 0.0, 1.0]],
+                device=device,
+                dtype=dtype,
+            ).unsqueeze(0)
+            scale_mats.append(scale_m)
+        if self.cache_geom_constants:
+            self._cached_scale_matrices[key] = tuple(scale_mats)
+        return scale_mats
+
+    def _get_query_location(self, B, Hr, Wr, device, dtype):
+        key = self._cache_key(B, Hr, Wr, self.num_level, device, dtype)
+        if self.cache_geom_constants and key in self._cached_query_location:
+            return self._cached_query_location[key]
+        query_location = torch.zeros(
+            B,
+            Hr * Wr,
+            self.num_level,
+            2,
+            device=device,
+            dtype=dtype,
+        )
+        if self.cache_geom_constants:
+            self._cached_query_location[key] = query_location
+        return query_location
 
     @staticmethod
     def _pack_levels(feats_by_cam):
@@ -260,7 +323,7 @@ class RangeViewTransformer(nn.Module):
     ):
         input_h, input_w = input_hw
         Q = Hr * Wr
-        rays = make_range_rays(Hr, Wr, self.fov_up, self.fov_down, device=cam_K[0].device)
+        rays = self._get_range_rays(Hr, Wr, cam_K[0].device, cam_K[0].dtype)
         rays = rays.view(1, Q, 3).repeat(B, 1, 1)
 
         if depth_bins.numel() != self.num_points:
@@ -301,14 +364,9 @@ class RangeViewTransformer(nn.Module):
 
         all_locations = []
         all_masks = []
+        scale_mats = self._get_scale_matrices(feature_sizes, input_hw, affine_M[0].device, affine_M[0].dtype)
         for level_idx, (feat_h, feat_w) in enumerate(feature_sizes):
-            scale_x = feat_w / float(input_w)
-            scale_y = feat_h / float(input_h)
-            scale_m = torch.tensor(
-                [[scale_x, 0.0, 0.0], [0.0, scale_y, 0.0], [0.0, 0.0, 1.0]],
-                device=affine_M[level_idx].device,
-                dtype=affine_M[level_idx].dtype,
-            ).unsqueeze(0)
+            scale_m = scale_mats[level_idx].to(device=affine_M[level_idx].device, dtype=affine_M[level_idx].dtype)
             affine_feat = scale_m @ affine_M[level_idx]
 
             uv, z_mask = project_points_to_image(
@@ -367,14 +425,7 @@ class RangeViewTransformer(nn.Module):
         value = self.value_proj(value.transpose(1, 2)).transpose(1, 2)
         value = value.unsqueeze(2).repeat(1, 1, self.nhead, 1)
 
-        query_location = torch.zeros(
-            B,
-            Hr * Wr,
-            self.num_level,
-            2,
-            device=value.device,
-            dtype=value.dtype,
-        )
+        query_location = self._get_query_location(B, Hr, Wr, value.device, value.dtype)
         geom_locations, visibility_mask = self._make_geom_sampling(
             B,
             Hr,

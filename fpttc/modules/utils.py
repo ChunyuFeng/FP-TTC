@@ -2,6 +2,29 @@ import torch
 import torch.nn.functional as F
 from .position import PositionEmbeddingSine
 
+_COORD_CENTER_CACHE = {}
+_IMAGENET_STATS_CACHE = {}
+
+
+def _get_coord_center(h, w, device, dtype):
+    key = (int(h), int(w), str(device), str(dtype))
+    if key not in _COORD_CENTER_CACHE:
+        _COORD_CENTER_CACHE[key] = torch.tensor(
+            [(w - 1) / 2.0, (h - 1) / 2.0],
+            dtype=dtype,
+            device=device,
+        )
+    return _COORD_CENTER_CACHE[key]
+
+
+def _get_imagenet_stats(device, dtype):
+    key = (str(device), str(dtype))
+    if key not in _IMAGENET_STATS_CACHE:
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=dtype, device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=dtype, device=device).view(1, 3, 1, 1)
+        _IMAGENET_STATS_CACHE[key] = (mean, std)
+    return _IMAGENET_STATS_CACHE[key]
+
 
 def generate_window_grid(h_min, h_max, w_min, w_max, len_h, len_w, device=None):
     assert device is not None
@@ -16,15 +39,14 @@ def generate_window_grid(h_min, h_max, w_min, w_max, len_h, len_w, device=None):
 
 def normalize_coords(coords, h, w):
     # coords: [B, H, W, 2]
-    c = torch.Tensor([(w - 1) / 2., (h - 1) / 2.]).float().to(coords.device)
+    c = _get_coord_center(h, w, coords.device, coords.dtype)
     return (coords - c) / c  # [-1, 1]
 
 
 def normalize_img(img0, img1):
     # loaded images are in [0, 255]
     # normalize by ImageNet mean and std
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(img1.device)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(img1.device)
+    mean, std = _get_imagenet_stats(img1.device, img1.dtype)
     img0 = (img0 / 255. - mean) / std
     img1 = (img1 / 255. - mean) / std
 
