@@ -82,13 +82,15 @@ class FpTTC(nn.Module):
         reg_refine=False,
         rvt_depth_guided_sampling=False,
         cache_geom_constants=False,
+        camera_channels=None,
+        range_fov_up=8.0,
+        range_fov_down=-15.0,
     ):
         super().__init__()
         self.num_scales = num_scales
         self.feature_channels = feature_channels
         self.rvt_depth_guided_sampling = rvt_depth_guided_sampling
-
-        self.camera_channels = [
+        self.camera_channels = list(camera_channels) if camera_channels is not None else [
             'CAM_FRONT_LEFT',
             'CAM_FRONT',
             'CAM_FRONT_RIGHT',
@@ -96,6 +98,8 @@ class FpTTC(nn.Module):
             'CAM_BACK',
             'CAM_BACK_LEFT',
         ]
+        self.range_fov_up = float(range_fov_up)
+        self.range_fov_down = float(range_fov_down)
 
         self.cnet = CNNEncoder(
             output_dim=feature_channels,
@@ -153,8 +157,8 @@ class FpTTC(nn.Module):
                     nhead=4,
                     num_level=num_views,
                     num_points=num_depth_bins,
-                    fov_up=8.0,
-                    fov_down=-15.0,
+                    fov_up=self.range_fov_up,
+                    fov_down=self.range_fov_down,
                     cache_geom_constants=cache_geom_constants,
                 )
                 for _ in range(num_scales)
@@ -167,8 +171,8 @@ class FpTTC(nn.Module):
             nhead=4,
             num_level=num_views,
             num_points=num_depth_bins,
-            fov_up=8.0,
-            fov_down=-15.0,
+            fov_up=self.range_fov_up,
+            fov_down=self.range_fov_down,
             cache_geom_constants=cache_geom_constants,
         )
         self.corr_residual_decoder = CorrResidualDecoder(feature_channels)
@@ -606,6 +610,21 @@ class FpTTC(nn.Module):
             scales, risks, debug_dict = outputs
         else:
             scales, risks = outputs
+
+        if scales is not None and scales.shape[-2:] != gt_scale_map_with_mask.shape[-2:]:
+            scales = F.interpolate(
+                scales,
+                size=gt_scale_map_with_mask.shape[-2:],
+                mode='bilinear',
+                align_corners=True,
+            )
+        if risks is not None and risks.shape[-2:] != gt_risk_score_map_with_mask.shape[-2:]:
+            risks = F.interpolate(
+                risks,
+                size=gt_risk_score_map_with_mask.shape[-2:],
+                mode='bilinear',
+                align_corners=True,
+            )
 
         if scale_only:
             loss_scale = get_loss_scale_map(
