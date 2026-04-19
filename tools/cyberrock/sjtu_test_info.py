@@ -1,278 +1,450 @@
 #!/usr/bin/env python3
-import os
-import sys
-import bisect
-import pickle
+from __future__ import annotations
+
 import argparse
-import yaml
-import numpy as np
+import csv
+import json
+import pickle
+import sys
+from copy import deepcopy
+from pathlib import Path
+from typing import Dict, List, Optional
+
 import cv2
-import shutil
-from scipy.spatial.transform import Rotation
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.cyberrock.sjtu_pipeline_utils import (
+    CAMERA_CHANNELS,
+    REF_CHANNEL,
+    build_sequence_dir_name,
+    compute_rectify_map_and_kud,
+    ensure_dir,
+    load_camera_projections,
+    strip_markdown_code,
+)
 
 
-def load_camera_projections(yaml_path):
-    """
-    读取包含多相机内外参以及畸变参数的 YAML 文件，返回每个相机的标定。
-    """
-    with open(yaml_path, 'r') as f:
-        config = yaml.safe_load(f)
+def undistort_image(image_bgr: np.ndarray, K: np.ndarray, dist: np.ndarray):
+    h, w = image_bgr.shape[:2]
+    K = np.asarray(K, dtype=np.float32)
+    dist = np.asarray(dist, dtype=np.float32).reshape(-1)
+    if dist.size == 0:
+        return image_bgr.copy(), K.copy(), (0, 0, w, h)
 
-    calib = {}
-    cameras = config.get('cameras', {})
+    K_undist, roi = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0, (w, h))
+    image_undist = cv2.undistort(image_bgr, K, dist, None, K_undist)
+    return image_undist, K_undist.astype(np.float32), roi
 
-    for cam_name, cam_cfg in cameras.items():
-        # 内参
-        intr = cam_cfg['intrinsics']
-        fx, fy = intr['fx'], intr['fy']
-        cx, cy = intr['cx'], intr['cy']
-        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=float)
 
-        # 畸变（按原逻辑：若无则空数组）
-        if 'distortion' in intr and intr['distortion']:
-            dist = np.array(intr['distortion'], dtype=float)
-            has_dist = True
-        else:
-            dist = np.array([], dtype=float)
-            has_dist = False
-            print(f"[Warning] Camera '{cam_name}' missing distortion params in YAML.", file=sys.stderr)
+def intersect_rois(roi_a, roi_b):
+    ax, ay, aw, ah = roi_a
+    bx, by, bw, bh = roi_b
+    left = max(ax, bx)
+    top = max(ay, by)
+    right = min(ax + aw, bx + bw)
+    bottom = min(ay + ah, by + bh)
+    if right <= left or bottom <= top:
+        return 0, 0, 0, 0
+    return left, top, right - left, bottom - top
 
-        # 外参（原定义）
-        ext = cam_cfg['extrinsics']
-        t = np.array(ext['translation'], dtype=float)
-        q = ext['rotation']  # 四元数 [x, y, z, w]
-        R = Rotation.from_quat(q).as_matrix()
 
-        calib[cam_name] = {
-            'K_src':           K,     # 保留原始K
-            'dist_src':        dist,  # 保留原始畸变
-            'has_distortion':  has_dist,
-            'R':               R,     # 原 R/t（假设与原推理相同语义）
-            't':               t,
+def parse_args():
+    parser = argparse.ArgumentParser(description="Create SJTU test PKLs from aligned manifests.")
+    parser.add_argument("--yaml_path", type=str, required=True, help="Camera calibration YAML path.")
+    parser.add_argument(
+        "--aligned_manifest",
+        type=str,
+        default=None,
+        help="Single aligned manifest CSV path for per-bag PKL generation.",
+    )
+    parser.add_argument(
+        "--rectified_root",
+        type=str,
+        default=None,
+        help="Optional rectified root used to derive paths when aligned manifest omits them.",
+    )
+    parser.add_argument(
+        "--pkl_save_path",
+        type=str,
+        default=None,
+        help="Single-mode output PKL path or directory.",
+    )
+    parser.add_argument(
+        "--manifest_csv",
+        type=str,
+        default=None,
+        help="Structured scene manifest CSV used for batch PKL generation.",
+    )
+    parser.add_argument(
+        "--processed_root",
+        type=str,
+        default=None,
+        help="Root created by rosbag_extract_images.py, containing sequences/<sequence_dir_name>/manifests/*.aligned.csv.",
+    )
+    parser.add_argument(
+        "--pkl_save_root",
+        type=str,
+        default=None,
+        help="Batch-mode PKL output root. Will contain per_bag/ and merged PKLs.",
+    )
+    parser.add_argument(
+        "--scene_idx",
+        type=int,
+        default=None,
+        help="Optional legacy scene index used only in single-mode naming.",
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("HEIGHT", "WIDTH"),
+        help="Optional legacy naming hint; no resize is applied.",
+    )
+    return parser.parse_args()
+
+
+def load_aligned_manifest(aligned_manifest: Path) -> List[dict]:
+    with open(aligned_manifest, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    rows.sort(key=lambda row: int(row["group_id"]))
+    return rows
+
+
+def resolve_rectified_path(row: Dict[str, str], channel: str, rectified_root: Optional[Path]) -> str:
+    direct = row.get(f"{channel}_rectified_path", "")
+    if direct:
+        return str(Path(direct).resolve())
+    if rectified_root is None:
+        raise ValueError(f"Missing rectified path for {channel} and no --rectified_root provided.")
+    raw_path = Path(row[f"{channel}_raw_path"])
+    return str((rectified_root / channel / raw_path.name).resolve())
+
+
+def build_channel_meta(calib: Dict[str, dict], sample_row: Dict[str, str], rectified_root: Optional[Path]):
+    per_channel_meta = {}
+    for channel in CAMERA_CHANNELS:
+        rectified_path = Path(resolve_rectified_path(sample_row, channel, rectified_root))
+        image = cv2.imread(str(rectified_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise FileNotFoundError(f"Failed to read rectified image: {rectified_path}")
+        height, width = image.shape[:2]
+        _, _, K_ud = compute_rectify_map_and_kud(
+            calib[channel]["K_src"],
+            calib[channel]["dist_src"],
+            width,
+            height,
+        )
+        R = calib[channel]["R"]
+        t = calib[channel]["t"]
+        R_l2c = R.T
+        t_l2c = -R_l2c @ t
+        per_channel_meta[channel] = {
+            "K_src": calib[channel]["K_src"],
+            "dist_src": calib[channel]["dist_src"],
+            "K": K_ud,
+            "dist": np.array([], dtype=np.float32),
+            "is_rectified": True,
+            "image_size_rectified": (height, width),
+            "R_l2c": R_l2c,
+            "t_l2c": t_l2c,
+            "R": R,
+            "t": t,
         }
+    return per_channel_meta
 
-    return calib
+
+def build_raw_entries_from_rows(
+    rows: List[Dict[str, str]],
+    per_channel_meta: Dict[str, dict],
+    rectified_root: Optional[Path],
+) -> List[dict]:
+    if len(rows) < 2:
+        return []
+
+    entries = []
+    bag_name = rows[0].get("bag_name", "")
+    scene_indice = bag_name or rows[0].get("scene", "")
+    for index in range(1, len(rows)):
+        prev_row = rows[index - 1]
+        curr_row = rows[index]
+        prev_data = {}
+        curr_data = {}
+        for channel in CAMERA_CHANNELS:
+            prev_data[channel] = {
+                "filename": resolve_rectified_path(prev_row, channel, rectified_root),
+                "timestamp": int(prev_row[f"{channel}_header_time_us"]),
+            }
+            curr_data[channel] = {
+                "filename": resolve_rectified_path(curr_row, channel, rectified_root),
+                "timestamp": int(curr_row[f"{channel}_header_time_us"]),
+            }
+
+        ros_msg_seq = int(curr_row.get(f"{REF_CHANNEL}_seq") or curr_row["group_id"])
+        time_diff_cam_us = (
+            int(curr_row["CAM_FRONT_header_time_us"]) - int(prev_row["CAM_FRONT_header_time_us"])
+        )
+        entries.append(
+            {
+                "sjtu_pair_mode": "raw_100ms",
+                "prev_camera_data": prev_data,
+                "curr_camera_data": curr_data,
+                "prev_lidar_data": None,
+                "curr_lidar_data": None,
+                "sensor_metas_prev": deepcopy(per_channel_meta),
+                "sensor_metas_curr": deepcopy(per_channel_meta),
+                "gt_map_path": None,
+                "scene_flow_path": None,
+                "scene_indice": scene_indice,
+                "ros_msg_seq": ros_msg_seq,
+                "time_diff_cam_us": time_diff_cam_us,
+            }
+        )
+    return entries
 
 
-def build_image_index(base_dir):
-    """
-    遍历 base_dir 下的每个子文件夹（channel），收集符合
-    {channel}__seq_{seq}__{ts_usec}.jpg 的图像，按 seq 升序。
-    """
-    if not os.path.isdir(base_dir):
-        print(f"ERROR: 目录不存在: {base_dir}", file=sys.stderr)
-        sys.exit(1)
+def build_overlap_500ms_entries(raw_entries: List[dict]) -> List[dict]:
+    if len(raw_entries) < 5:
+        return []
 
-    img_dict = {}
-    for channel in os.listdir(base_dir):
-        channel_dir = os.path.join(base_dir, channel)
-        if not os.path.isdir(channel_dir):
+    overlap_entries = []
+    segment_start = 0
+    while segment_start < len(raw_entries):
+        scene_indice = raw_entries[segment_start].get("scene_indice")
+        segment_end = segment_start + 1
+        while (
+            segment_end < len(raw_entries)
+            and raw_entries[segment_end].get("scene_indice") == scene_indice
+        ):
+            segment_end += 1
+
+        for start in range(segment_start, max(segment_start, segment_end - 4)):
+            end = start + 4
+            if end >= segment_end:
+                break
+            prev_entry = raw_entries[start]
+            curr_entry = raw_entries[end]
+            front_channel = "CAM_FRONT"
+            prev_ts = int(prev_entry["prev_camera_data"][front_channel]["timestamp"])
+            curr_ts = int(curr_entry["curr_camera_data"][front_channel]["timestamp"])
+            overlap_entries.append(
+                {
+                    "sjtu_pair_mode": "overlap_500ms",
+                    "prev_camera_data": deepcopy(prev_entry["prev_camera_data"]),
+                    "curr_camera_data": deepcopy(curr_entry["curr_camera_data"]),
+                    "prev_lidar_data": prev_entry.get("prev_lidar_data"),
+                    "curr_lidar_data": curr_entry.get("curr_lidar_data"),
+                    "sensor_metas_prev": deepcopy(prev_entry["sensor_metas_prev"]),
+                    "sensor_metas_curr": deepcopy(curr_entry["sensor_metas_curr"]),
+                    "gt_map_path": None,
+                    "scene_flow_path": None,
+                    "scene_indice": prev_entry.get("scene_indice"),
+                    "ros_msg_seq_prev": prev_entry.get("ros_msg_seq"),
+                    "ros_msg_seq_curr": curr_entry.get("ros_msg_seq"),
+                    "ros_msg_seq": curr_entry.get("ros_msg_seq"),
+                    "time_diff_cam_us": curr_ts - prev_ts,
+                }
+            )
+        segment_start = segment_end
+
+    return overlap_entries
+
+
+def save_pickle(entries: List[dict], pkl_path: Path):
+    ensure_dir(pkl_path.parent)
+    with open(pkl_path, "wb") as f:
+        pickle.dump(entries, f)
+
+
+def derive_single_output_path(args, aligned_manifest: Path) -> Path:
+    if args.pkl_save_path:
+        output = Path(args.pkl_save_path)
+        if output.suffix == ".pkl":
+            return output.resolve()
+        bag_stem = aligned_manifest.stem.replace(".aligned", "")
+        return (output / f"{bag_stem}_sjtu_test_infos_rectified.pkl").resolve()
+
+    bag_stem = aligned_manifest.stem.replace(".aligned", "")
+    if args.scene_idx is not None and args.image_size:
+        height, width = args.image_size
+        return (aligned_manifest.parent / f"scene_{args.scene_idx}_sjtu_test_infos_{height}_{width * len(CAMERA_CHANNELS)}_rectified.pkl").resolve()
+    return (aligned_manifest.parent / f"{bag_stem}_sjtu_test_infos_rectified.pkl").resolve()
+
+
+def build_per_bag_pkl(
+    aligned_manifest: Path,
+    calib: Dict[str, dict],
+    rectified_root: Optional[Path],
+    raw_output_pkl: Path,
+    overlap_output_pkl: Path,
+) -> Dict[str, List[dict]]:
+    rows = load_aligned_manifest(aligned_manifest)
+    if not rows:
+        print(f"[warn] empty aligned manifest: {aligned_manifest}", file=sys.stderr)
+        raw_entries = []
+        overlap_entries = []
+    else:
+        per_channel_meta = build_channel_meta(calib, rows[0], rectified_root)
+        raw_entries = build_raw_entries_from_rows(rows, per_channel_meta, rectified_root)
+        overlap_entries = build_overlap_500ms_entries(raw_entries)
+    save_pickle(raw_entries, raw_output_pkl)
+    save_pickle(overlap_entries, overlap_output_pkl)
+    print(f"[pkl] saved {len(raw_entries)} raw_100ms entries to {raw_output_pkl}")
+    print(f"[pkl] saved {len(overlap_entries)} overlap_500ms entries to {overlap_output_pkl}")
+    return {
+        "raw_100ms": raw_entries,
+        "overlap_500ms": overlap_entries,
+    }
+
+
+def load_scene_manifest(manifest_csv: Path) -> List[Dict[str, str]]:
+    with open(manifest_csv, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+
+def write_batch_report(pkl_save_root: Path, batch_summary: dict):
+    report_path = pkl_save_root / "pkl_generation_report.json"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(batch_summary, f, indent=2, ensure_ascii=False)
+
+
+def candidate_sequence_dirs(processed_root: Path, row: Dict[str, str]) -> List[Path]:
+    bag_name = strip_markdown_code(row.get("bag_name", ""))
+    bag_stem = Path(bag_name).stem
+    scene = strip_markdown_code(row.get("scene", ""))
+    tag = strip_markdown_code(row.get("tag", ""))
+    manifest_sequence_dir = strip_markdown_code(row.get("sequence_dir_name", ""))
+    derived_sequence_dir = build_sequence_dir_name(bag_name, scene, tag)
+
+    candidate_names = []
+    for name in [manifest_sequence_dir, derived_sequence_dir, bag_stem]:
+        if name and name not in candidate_names:
+            candidate_names.append(name)
+
+    candidates = []
+    for name in candidate_names:
+        candidates.append(processed_root / "sequences" / name)
+    for name in [bag_stem]:
+        candidates.append(processed_root / "bags" / name)
+        candidates.append(processed_root / name)
+    return candidates
+
+
+def resolve_aligned_manifest_path(processed_root: Path, row: Dict[str, str]) -> Path:
+    bag_name = strip_markdown_code(row.get("bag_name", ""))
+    bag_stem = Path(bag_name).stem
+    for sequence_dir in candidate_sequence_dirs(processed_root, row):
+        aligned_manifest = sequence_dir / "manifests" / f"{bag_stem}.aligned.csv"
+        if aligned_manifest.exists():
+            return aligned_manifest
+    manifest_sequence_dir = strip_markdown_code(row.get("sequence_dir_name", ""))
+    if manifest_sequence_dir:
+        return processed_root / "sequences" / manifest_sequence_dir / "manifests" / f"{bag_stem}.aligned.csv"
+    return processed_root / "sequences" / bag_stem / "manifests" / f"{bag_stem}.aligned.csv"
+
+
+def batch_mode(args, calib: Dict[str, dict]):
+    if args.manifest_csv is None or args.processed_root is None or args.pkl_save_root is None:
+        raise ValueError("Batch mode requires --manifest_csv, --processed_root, and --pkl_save_root.")
+
+    manifest_rows = load_scene_manifest(Path(args.manifest_csv).resolve())
+    processed_root = Path(args.processed_root).resolve()
+    pkl_save_root = Path(args.pkl_save_root).resolve()
+    per_bag_root = ensure_dir(pkl_save_root / "per_bag")
+
+    all_raw_entries = []
+    keep_raw_entries = []
+    all_overlap_entries = []
+    keep_overlap_entries = []
+    per_bag_summary = []
+
+    for row in manifest_rows:
+        bag_name = row["bag_name"]
+        bag_stem = Path(bag_name).stem
+        aligned_manifest = resolve_aligned_manifest_path(processed_root, row)
+        if not aligned_manifest.exists():
+            print(f"[warn] missing aligned manifest, skipped: {aligned_manifest}", file=sys.stderr)
             continue
+        keep_flag = row.get("keep_t2", "").strip().upper()
+        effective_keep_t2 = "Y" if keep_flag in {"", "?", "Y"} else keep_flag
+        raw_output_pkl = per_bag_root / f"{bag_stem}_sjtu_test_infos_raw_100ms.pkl"
+        overlap_output_pkl = per_bag_root / f"{bag_stem}_sjtu_test_infos_overlap_500ms.pkl"
+        entry_payload = build_per_bag_pkl(aligned_manifest, calib, None, raw_output_pkl, overlap_output_pkl)
+        raw_entries = entry_payload["raw_100ms"]
+        overlap_entries = entry_payload["overlap_500ms"]
+        all_raw_entries.extend(raw_entries)
+        all_overlap_entries.extend(overlap_entries)
+        if effective_keep_t2 == "Y":
+            keep_raw_entries.extend(raw_entries)
+            keep_overlap_entries.extend(overlap_entries)
+        per_bag_summary.append(
+            {
+                "bag_name": bag_name,
+                "aligned_manifest": str(aligned_manifest),
+                "per_bag_raw_100ms_pkl": str(raw_output_pkl),
+                "per_bag_overlap_500ms_pkl": str(overlap_output_pkl),
+                "raw_entry_count": len(raw_entries),
+                "overlap_500ms_entry_count": len(overlap_entries),
+                "keep_t2": effective_keep_t2,
+            }
+        )
 
-        items = []
-        for fn in os.listdir(channel_dir):
-            if not fn.lower().endswith('.jpg'):
-                continue
-            parts = fn.split('__')
-            if len(parts) < 3 or not parts[1].startswith('seq_'):
-                continue
-            try:
-                seq = int(parts[1].split('_', 1)[1])
-                ts  = int(parts[2].split('.')[0])
-            except ValueError:
-                continue
-            items.append((seq, ts, os.path.join(channel_dir, fn)))
-
-        if not items:
-            continue
-
-        items.sort(key=lambda x: x[0])
-
-        img_dict[channel] = {
-            'filename':  [path for seq, ts, path in items],
-            'timestamp': [ts   for seq, ts, path in items],
-            'sequence':  [seq  for seq, ts, path in items],
-        }
-
-    return img_dict
-
-
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-def compute_rectify_map_and_Kud(K_src, dist_src, w, h):
-    """
-    按原代码风格（pinhole）计算一次 map1/map2 与去畸变后的 K_ud。
-    若 dist 为空，则返回 (None, None, K_src)。
-    """
-    if dist_src is None or dist_src.size == 0:
-        return None, None, K_src
-
-    # 与原推理保持一致：alpha=0，不裁剪，输出分辨率与输入一致
-    K_ud, _ = cv2.getOptimalNewCameraMatrix(K_src, dist_src, (w, h), 0, (w, h))
-    map1, map2 = cv2.initUndistortRectifyMap(K_src, dist_src, None, K_ud, (w, h), cv2.CV_32FC1)
-    return map1, map2, K_ud
-
-
-def rectify_and_save_channel(channel, items, rectified_root, K_src, dist_src):
-    """
-    对单个通道批量去畸变并落盘到 rectified_root/channel 下，文件名不变。
-    返回：
-      - rectified_fns: 与 items 对齐的去畸变后文件路径列表
-      - K_ud: 去畸变后的内参（若无畸变则等于 K_src）
-      - size_hw: (h, w)
-    """
-    if len(items) == 0:
-        return [], K_src, None
-
-    # 用第一帧确定尺寸
-    h, w = cv2.imread(items[0], cv2.IMREAD_COLOR).shape[:2]
-    map1, map2, K_ud = compute_rectify_map_and_Kud(K_src, dist_src, w, h)
-
-    out_dir = os.path.join(rectified_root, channel)
-    ensure_dir(out_dir)
-
-    rectified_fns = []
-    for src_path in items:
-        fn = os.path.basename(src_path)
-        dst_path = os.path.join(out_dir, fn)
-        if map1 is None:
-            # 无畸变：直接拷贝即可（更快）
-            # 若你更希望完全一致的编码，也可以读/写一遍
-            shutil.copy2(src_path, dst_path)
-        else:
-            img = cv2.imread(src_path, cv2.IMREAD_COLOR)
-            img_ud = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
-            cv2.imwrite(dst_path, img_ud)
-        rectified_fns.append(dst_path)
-
-    return rectified_fns, K_ud, (h, w)
+    all_raw_pkl = pkl_save_root / "sjtu_test_infos_all_processed_raw_100ms.pkl"
+    keep_raw_pkl = pkl_save_root / "sjtu_test_infos_keep_t2_raw_100ms.pkl"
+    all_overlap_pkl = pkl_save_root / "sjtu_test_infos_all_processed_overlap_500ms.pkl"
+    keep_overlap_pkl = pkl_save_root / "sjtu_test_infos_keep_t2_overlap_500ms.pkl"
+    save_pickle(all_raw_entries, all_raw_pkl)
+    save_pickle(keep_raw_entries, keep_raw_pkl)
+    save_pickle(all_overlap_entries, all_overlap_pkl)
+    save_pickle(keep_overlap_entries, keep_overlap_pkl)
+    batch_summary = {
+        "per_bag": per_bag_summary,
+        "all_processed_raw_100ms_entries": len(all_raw_entries),
+        "keep_t2_raw_100ms_entries": len(keep_raw_entries),
+        "all_processed_overlap_500ms_entries": len(all_overlap_entries),
+        "keep_t2_overlap_500ms_entries": len(keep_overlap_entries),
+        "all_processed_raw_100ms_pkl": str(all_raw_pkl),
+        "keep_t2_raw_100ms_pkl": str(keep_raw_pkl),
+        "all_processed_overlap_500ms_pkl": str(all_overlap_pkl),
+        "keep_t2_overlap_500ms_pkl": str(keep_overlap_pkl),
+    }
+    write_batch_report(pkl_save_root, batch_summary)
+    print(f"[batch] saved {len(all_raw_entries)} raw_100ms entries to {all_raw_pkl}")
+    print(f"[batch] saved {len(keep_raw_entries)} keep_t2 raw_100ms entries to {keep_raw_pkl}")
+    print(f"[batch] saved {len(all_overlap_entries)} overlap_500ms entries to {all_overlap_pkl}")
+    print(f"[batch] saved {len(keep_overlap_entries)} keep_t2 overlap_500ms entries to {keep_overlap_pkl}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate SJTU test infos (pre-rectified images)')
-    parser.add_argument('--base_dir', type=str, required=True,
-                        help='原始根目录，包含各通道子文件夹')
-    parser.add_argument('--rectified_root', type=str, required=True,
-                        help='去畸变图像输出根目录（与 base_dir 平行）')
-    parser.add_argument('--pkl_save_path', type=str, required=True,
-                        help='保存输出 pkl 文件的目录')
-    parser.add_argument('--image_size', type=int, nargs=2, required=True,
-                        metavar=('HEIGHT','WIDTH'),
-                        help='单通道图像的目标高和宽（仅用于命名，不改变原图尺寸）')
-    parser.add_argument('--scene_idx', type=int, default=0,
-                        help='场景索引')
-    parser.add_argument('--yaml_path', type=str, required=True,
-                        help='包含相机内外参的 YAML 文件路径')
-    args = parser.parse_args()
+    args = parse_args()
+    calib = load_camera_projections(args.yaml_path)
 
-    # 1) 读取标定
-    calib_src = load_camera_projections(args.yaml_path)
-
-    # 2) 扫描原始目录
-    img_dict = build_image_index(args.base_dir)
-    channels = sorted(img_dict.keys())
-    if not channels:
-        print("ERROR: 未发现任何通道图像。", file=sys.stderr)
-        sys.exit(1)
-
-    # 3) 每通道批量去畸变 -> 写入 rectified_root，并记录去畸变后的 K、尺寸
-    ensure_dir(args.rectified_root)
-    rectified_img_dict = {}
-    per_channel_meta = {}
-
-    for ch in channels:
-        src_fns = img_dict[ch]['filename']
-        rect_fns, K_ud, size_hw = rectify_and_save_channel(
-            channel=ch,
-            items=src_fns,
-            rectified_root=args.rectified_root,
-            K_src=calib_src[ch]['K_src'],
-            dist_src=calib_src[ch]['dist_src']
+    if args.aligned_manifest:
+        aligned_manifest = Path(args.aligned_manifest).resolve()
+        raw_output_pkl = derive_single_output_path(args, aligned_manifest)
+        overlap_output_pkl = raw_output_pkl.with_name(
+            raw_output_pkl.name.replace("_rectified.pkl", "_overlap_500ms.pkl")
+            if raw_output_pkl.name.endswith("_rectified.pkl")
+            else raw_output_pkl.stem + "_overlap_500ms.pkl"
         )
-        rectified_img_dict[ch] = {
-            'filename':  rect_fns,
-            'timestamp': img_dict[ch]['timestamp'],
-            'sequence':  img_dict[ch]['sequence'],
-        }
+        if raw_output_pkl.name.endswith("_overlap_500ms.pkl"):
+            raw_output_pkl = raw_output_pkl.with_name(raw_output_pkl.name.replace("_overlap_500ms.pkl", "_raw_100ms.pkl"))
+        rectified_root = Path(args.rectified_root).resolve() if args.rectified_root else None
+        build_per_bag_pkl(aligned_manifest, calib, rectified_root, raw_output_pkl, overlap_output_pkl)
+        return
 
-        # 预写好后续要用到的 meta（去畸变后的内参与尺寸；以及 R_l2c/t_l2c）
-        R = calib_src[ch]['R']
-        t = calib_src[ch]['t']
-        R_l2c = R.T               # 与你原推理里的一致
-        t_l2c = -R_l2c @ t
+    if args.manifest_csv:
+        batch_mode(args, calib)
+        return
 
-        per_channel_meta[ch] = {
-            # 源（备查）
-            'K_src': calib_src[ch]['K_src'],
-            'dist_src': calib_src[ch]['dist_src'],
-            # 生效（去畸变后）
-            'K': K_ud,
-            'dist': np.array([], dtype=float),   # 表明图像已去畸变
-            'is_rectified': True,
-            'image_size_rectified': (size_hw[0], size_hw[1]) if size_hw else None,
-            # 外参（统一提供 lidar->camera）
-            'R_l2c': R_l2c,
-            't_l2c': t_l2c,
-            # 同时保留原始 R/t（与之前保持兼容）
-            'R': R,
-            't': t,
-        }
+    raise ValueError("Provide either --aligned_manifest for single mode or --manifest_csv for batch mode.")
 
-    # 4) 生成测试 info（文件路径改为去畸变后的路径）
-    sjtu_test_infos = []
-    frame_count = len(rectified_img_dict[channels[0]]['timestamp'])
-
-    for i in range(1, frame_count):
-        seq = rectified_img_dict[channels[0]]['sequence'][i]
-
-        if seq < 24399 or seq > 24707:
-            continue
-
-        prev_data, curr_data = {}, {}
-        for ch in channels:
-            prev_data[ch] = {
-                'filename':  rectified_img_dict[ch]['filename'][i-1],
-                'timestamp': rectified_img_dict[ch]['timestamp'][i-1]
-            }
-            curr_data[ch] = {
-                'filename':  rectified_img_dict[ch]['filename'][i],
-                'timestamp': rectified_img_dict[ch]['timestamp'][i]
-            }
-
-        # 同一份 meta（不随时间变化）可直接复用
-        sensor_metas_prev = {ch: per_channel_meta[ch] for ch in channels}
-        sensor_metas_curr = {ch: per_channel_meta[ch] for ch in channels}
-
-        info = {
-            'prev_camera_data':  prev_data,
-            'curr_camera_data':  curr_data,
-            'prev_lidar_data':   None,
-            'curr_lidar_data':   None,
-            'sensor_metas_prev': sensor_metas_prev,
-            'sensor_metas_curr': sensor_metas_curr,
-            'gt_map_path':       None,
-            'scene_flow_path':   None,
-            'scene_indice':      None,
-            'ros_msg_seq':       seq
-        }
-        sjtu_test_infos.append(info)
-
-    # 5) 存 pkl
-    os.makedirs(args.pkl_save_path, exist_ok=True)
-    H, W = args.image_size
-    pkl_name = f"scene_{args.scene_idx}_sjtu_test_infos_{H}_{W*len(channels)}_rectified.pkl"
-    pkl_path = os.path.join(args.pkl_save_path, pkl_name)
-    with open(pkl_path, 'wb') as f:
-        pickle.dump(sjtu_test_infos, f)
-
-    print(f"Saved {len(sjtu_test_infos)} info entries to {pkl_path}")
-    print(f"Rectified images written under: {args.rectified_root}")
-    for ch in channels:
-        print(f"  - {ch}: {len(rectified_img_dict[ch]['filename'])} frames")
-    print("Done.")
-    
 
 if __name__ == "__main__":
     main()
