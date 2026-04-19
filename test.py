@@ -588,6 +588,44 @@ def save_rgb_image(path: str, rgb_image: np.ndarray):
     Image.fromarray(rgb_u8).save(path)
 
 
+def make_depth_visualization_rgb(depth_map: np.ndarray) -> np.ndarray:
+    depth_map = np.asarray(depth_map, dtype=np.float32)
+    valid_mask = np.isfinite(depth_map) & (depth_map > 0.0)
+    if not np.any(valid_mask):
+        return np.ones((*depth_map.shape, 3), dtype=np.float32)
+
+    valid_values = depth_map[valid_mask]
+    d_min = float(np.percentile(valid_values, 2.0))
+    d_max = float(np.percentile(valid_values, 98.0))
+    if not np.isfinite(d_min) or not np.isfinite(d_max) or d_max <= d_min:
+        d_min = float(valid_values.min())
+        d_max = float(valid_values.max())
+    if d_max <= d_min:
+        normalized = np.zeros_like(depth_map, dtype=np.float32)
+    else:
+        normalized = (np.clip(depth_map, d_min, d_max) - d_min) / (d_max - d_min)
+
+    normalized = 1.0 - normalized
+    depth_u8 = np.clip(normalized * 255.0, 0.0, 255.0).astype(np.uint8)
+    depth_bgr = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
+    depth_rgb = cv2.cvtColor(depth_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    depth_rgb[~valid_mask] = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    return depth_rgb
+
+
+def save_stitched_depth_visualization(
+    output_dir: str,
+    idx: int,
+    curr_depth_map: Dict[str, np.ndarray],
+    camera_channels: List[str],
+) -> str:
+    depth_rgbs = [make_depth_visualization_rgb(curr_depth_map[ch]) for ch in camera_channels]
+    stitched_rgb = np.concatenate(depth_rgbs, axis=1)
+    path = os.path.abspath(os.path.join(output_dir, f"curr_depth_stitched_{idx}.png"))
+    save_rgb_image(path, stitched_rgb)
+    return path
+
+
 def save_mask_image(path: str, mask: np.ndarray):
     mask_u8 = np.asarray(mask, dtype=np.uint8) * 255
     Image.fromarray(mask_u8).save(path)
@@ -1149,6 +1187,44 @@ def load_test_entries(info_path: str, max_test_samples: int) -> Tuple[list, str]
     return test_entries, split_name
 
 
+def build_pred_npy_payload(
+    sample_info: Optional[Dict[str, object]],
+    inputs: Optional["NuscInputBundle"],
+    proj_pix_curr_batch: Optional[torch.Tensor],
+    proj_pix_curr_fullres: Optional[np.ndarray],
+    scale_prediction_array: Optional[np.ndarray],
+    risk_prediction_array: Optional[np.ndarray],
+) -> Dict[str, object]:
+    payload: Dict[str, object] = {
+        "scale_pred": scale_prediction_array,
+    }
+    if risk_prediction_array is not None:
+        payload["risk_pred"] = risk_prediction_array
+
+    if sample_info is not None:
+        for key in (
+            "scene_indice",
+            "ros_msg_seq_prev",
+            "ros_msg_seq_curr",
+            "ros_msg_seq",
+            "time_diff_cam_us",
+        ):
+            if key in sample_info:
+                payload[key] = sample_info.get(key)
+
+    if inputs is not None and getattr(inputs, "affine_matrix", None) is not None:
+        payload["affine_matrix"] = np.asarray(inputs.affine_matrix, dtype=np.float32)
+
+    if proj_pix_curr_batch is not None:
+        payload["proj_pix_curr"] = (
+            proj_pix_curr_batch[0].detach().cpu().numpy().astype(np.int32, copy=False)
+        )
+    if proj_pix_curr_fullres is not None:
+        payload["proj_pix_curr_fullres"] = np.asarray(proj_pix_curr_fullres, dtype=np.int32)
+
+    return payload
+
+
 def _batchify_sensor_metas(sensor_metas):
     return {
         frame_key: {
@@ -1192,33 +1268,43 @@ def undistort_sjtu_bgr_image(image_bgr: np.ndarray, K: np.ndarray, dist: np.ndar
 def compose_sjtu_500ms_entries(raw_entries: list, max_test_samples: int) -> list:
     composed = []
     front_channel = "CAM_FRONT"
+    segment_start = 0
+    while segment_start < len(raw_entries):
+        scene_indice = raw_entries[segment_start].get("scene_indice")
+        segment_end = segment_start + 1
+        while (
+            segment_end < len(raw_entries)
+            and raw_entries[segment_end].get("scene_indice") == scene_indice
+        ):
+            segment_end += 1
 
-    for start in range(0, max(0, len(raw_entries) - 4), 5):
-        end = start + 4
-        if end >= len(raw_entries):
-            break
+        for start in range(segment_start, max(segment_start, segment_end - 4), 5):
+            end = start + 4
+            if end >= segment_end:
+                break
 
-        prev_entry = raw_entries[start]
-        curr_entry = raw_entries[end]
-        prev_ts = int(prev_entry["prev_camera_data"][front_channel]["timestamp"])
-        curr_ts = int(curr_entry["curr_camera_data"][front_channel]["timestamp"])
-        composed.append(
-            {
-                "prev_camera_data": deepcopy(prev_entry["prev_camera_data"]),
-                "curr_camera_data": deepcopy(curr_entry["curr_camera_data"]),
-                "prev_lidar_data": prev_entry.get("prev_lidar_data"),
-                "curr_lidar_data": curr_entry.get("curr_lidar_data"),
-                "sensor_metas_prev": deepcopy(prev_entry["sensor_metas_prev"]),
-                "sensor_metas_curr": deepcopy(curr_entry["sensor_metas_curr"]),
-                "gt_map_path": None,
-                "scene_flow_path": None,
-                "scene_indice": prev_entry.get("scene_indice", "18"),
-                "ros_msg_seq_prev": prev_entry.get("ros_msg_seq"),
-                "ros_msg_seq_curr": curr_entry.get("ros_msg_seq"),
-                "ros_msg_seq": curr_entry.get("ros_msg_seq"),
-                "time_diff_cam_us": curr_ts - prev_ts,
-            }
-        )
+            prev_entry = raw_entries[start]
+            curr_entry = raw_entries[end]
+            prev_ts = int(prev_entry["prev_camera_data"][front_channel]["timestamp"])
+            curr_ts = int(curr_entry["curr_camera_data"][front_channel]["timestamp"])
+            composed.append(
+                {
+                    "prev_camera_data": deepcopy(prev_entry["prev_camera_data"]),
+                    "curr_camera_data": deepcopy(curr_entry["curr_camera_data"]),
+                    "prev_lidar_data": prev_entry.get("prev_lidar_data"),
+                    "curr_lidar_data": curr_entry.get("curr_lidar_data"),
+                    "sensor_metas_prev": deepcopy(prev_entry["sensor_metas_prev"]),
+                    "sensor_metas_curr": deepcopy(curr_entry["sensor_metas_curr"]),
+                    "gt_map_path": None,
+                    "scene_flow_path": None,
+                    "scene_indice": prev_entry.get("scene_indice", "18"),
+                    "ros_msg_seq_prev": prev_entry.get("ros_msg_seq"),
+                    "ros_msg_seq_curr": curr_entry.get("ros_msg_seq"),
+                    "ros_msg_seq": curr_entry.get("ros_msg_seq"),
+                    "time_diff_cam_us": curr_ts - prev_ts,
+                }
+            )
+        segment_start = segment_end
 
     print(
         f"[SJTU] raw_100ms_samples={len(raw_entries)} "
@@ -1235,6 +1321,14 @@ def compose_sjtu_500ms_entries(raw_entries: list, max_test_samples: int) -> list
     if max_test_samples > 0:
         composed = composed[:max_test_samples]
     return composed
+
+
+def is_sjtu_overlap_500ms_entries(entries: list, split_name: str) -> bool:
+    if "overlap_500ms" in split_name:
+        return True
+    if not entries:
+        return False
+    return entries[0].get("sjtu_pair_mode") == "overlap_500ms"
 
 
 def _load_checkpoint_flexibly(model, checkpoint_path, device):
@@ -1776,8 +1870,17 @@ def run_online_depth_and_mapping(
         True,
         runtime.mapping_range_backend,
     )
+    curr_fullres_finalize_future = pool.submit(
+        finalize_frame_mapping_fast,
+        curr_camera_results,
+        args.image_size[0],
+        args.image_size[1] * len(camera_channels),
+        True,
+        runtime.mapping_range_backend,
+    )
     _, proj_pix_prev, prev_finalize_timing = prev_finalize_future.result()
     _, proj_pix_curr, curr_finalize_timing = curr_finalize_future.result()
+    _, proj_pix_curr_fullres, _ = curr_fullres_finalize_future.result()
 
     mapping_detail["range_project_ms"] = max(
         prev_finalize_timing["range_project_ms"],
@@ -1796,8 +1899,11 @@ def run_online_depth_and_mapping(
     return (
         proj_pix_prev_batch,
         proj_pix_curr_batch,
+        proj_pix_curr_fullres,
         prev_depth_batch,
         curr_depth_batch,
+        prev_depth_map,
+        curr_depth_map,
         sensor_metas,
         mapping_detail,
         depth_ms,
@@ -1902,14 +2008,25 @@ def update_nusc_metrics(
 
 def save_nusc_outputs(
     idx: int,
-    scene_indice: str,
+    sample_info: Dict[str, object],
     runtime: TestRuntime,
     inputs: NuscInputBundle,
     gt_bundle,
     scale_prediction_array: Optional[np.ndarray],
     risk_prediction_array: Optional[np.ndarray],
+    proj_pix_curr_batch: torch.Tensor,
+    proj_pix_curr_fullres: Optional[np.ndarray],
+    curr_depth_map: Optional[Dict[str, np.ndarray]] = None,
 ):
     t0 = time.perf_counter()
+    depth_stitched_path = None
+    if curr_depth_map is not None and (args.save_visualizations or args.save_pred_npy):
+        depth_stitched_path = save_stitched_depth_visualization(
+            runtime.output_dir,
+            idx,
+            curr_depth_map,
+            runtime.camera_channels,
+        )
     if args.save_visualizations:
         if args.scale_only:
             pred_scale_rgb = make_scale_analysis_rgb(scale_prediction_array)
@@ -1947,22 +2064,44 @@ def save_nusc_outputs(
     if args.save_pred_npy:
         pred_npy_subdir = os.path.join(args.pred_npy_dir, f"pred_npy_{os.path.basename(runtime.output_dir)}")
         os.makedirs(pred_npy_subdir, exist_ok=True)
-        pred_data = {"scale_pred": scale_prediction_array}
-        if not args.scale_only:
-            pred_data["risk_pred"] = risk_prediction_array
-        np.save(os.path.join(pred_npy_subdir, f"scene_{scene_indice}_pred_{idx}.npy"), pred_data)
+        pred_data = build_pred_npy_payload(
+            sample_info=sample_info,
+            inputs=inputs,
+            proj_pix_curr_batch=proj_pix_curr_batch,
+            proj_pix_curr_fullres=proj_pix_curr_fullres,
+            scale_prediction_array=scale_prediction_array,
+            risk_prediction_array=risk_prediction_array,
+        )
+        if depth_stitched_path is not None:
+            pred_data["curr_depth_stitched_path"] = depth_stitched_path
+        np.save(
+            os.path.join(pred_npy_subdir, f"scene_{sample_info['scene_indice']}_pred_{idx}.npy"),
+            pred_data,
+        )
 
     return vis_ms
 
 
 def save_sjtu_outputs(
     idx: int,
+    sample_info: Dict[str, object],
     runtime: TestRuntime,
     inputs: NuscInputBundle,
     scale_prediction_array: Optional[np.ndarray],
     risk_prediction_array: Optional[np.ndarray],
+    proj_pix_curr_batch: torch.Tensor,
+    proj_pix_curr_fullres: Optional[np.ndarray],
+    curr_depth_map: Optional[Dict[str, np.ndarray]] = None,
 ):
     t0 = time.perf_counter()
+    depth_stitched_path = None
+    if curr_depth_map is not None and (args.save_visualizations or args.save_pred_npy):
+        depth_stitched_path = save_stitched_depth_visualization(
+            runtime.output_dir,
+            idx,
+            curr_depth_map,
+            runtime.camera_channels,
+        )
     if args.save_visualizations:
         if args.scale_only:
             pred_scale_rgb = make_scale_analysis_rgb(scale_prediction_array)
@@ -1982,9 +2121,16 @@ def save_sjtu_outputs(
     if args.save_pred_npy:
         pred_npy_subdir = os.path.join(args.pred_npy_dir, f"pred_npy_{os.path.basename(runtime.output_dir)}")
         os.makedirs(pred_npy_subdir, exist_ok=True)
-        pred_data = {"scale_pred": scale_prediction_array}
-        if not args.scale_only:
-            pred_data["risk_pred"] = risk_prediction_array
+        pred_data = build_pred_npy_payload(
+            sample_info=sample_info,
+            inputs=inputs,
+            proj_pix_curr_batch=proj_pix_curr_batch,
+            proj_pix_curr_fullres=proj_pix_curr_fullres,
+            scale_prediction_array=scale_prediction_array,
+            risk_prediction_array=risk_prediction_array,
+        )
+        if depth_stitched_path is not None:
+            pred_data["curr_depth_stitched_path"] = depth_stitched_path
         np.save(os.path.join(pred_npy_subdir, f"pred_{idx}.npy"), pred_data)
 
     return (time.perf_counter() - t0) * 1000.0
@@ -2051,8 +2197,11 @@ def run_nusc_test(
                 (
                     proj_pix_prev_batch,
                     proj_pix_curr_batch,
+                    proj_pix_curr_fullres,
                     prev_depth_batch,
                     curr_depth_batch,
+                    prev_depth_map,
+                    curr_depth_map,
                     sensor_metas,
                     sample_mapping_detail,
                     sample_timing["depth_ms"],
@@ -2098,12 +2247,15 @@ def run_nusc_test(
                 )
                 sample_timing["vis_ms"] = save_nusc_outputs(
                     idx,
-                    sample_info["scene_indice"],
+                    sample_info,
                     runtime,
                     inputs,
                     gt_bundle,
                     scale_prediction_array,
                     risk_prediction_array,
+                    proj_pix_curr_batch,
+                    proj_pix_curr_fullres,
+                    curr_depth_map,
                 )
 
                 is_timed_sample = should_record_timing_sample(idx)
@@ -2190,8 +2342,11 @@ def run_sjtu_test(
             (
                 proj_pix_prev_batch,
                 proj_pix_curr_batch,
+                proj_pix_curr_fullres,
                 prev_depth_batch,
                 curr_depth_batch,
+                prev_depth_map,
+                curr_depth_map,
                 sensor_metas,
                 sample_mapping_detail,
                 sample_timing["depth_ms"],
@@ -2224,10 +2379,14 @@ def run_sjtu_test(
             sample_timing["metrics_ms"] = 0.0
             sample_timing["vis_ms"] = save_sjtu_outputs(
                 idx,
+                sample_info,
                 runtime,
                 inputs,
                 scale_prediction_array,
                 risk_prediction_array,
+                proj_pix_curr_batch,
+                proj_pix_curr_fullres,
+                curr_depth_map,
             )
 
             is_timed_sample = should_record_timing_sample(idx)
@@ -2349,8 +2508,17 @@ def main():
         -1 if args.sjtu_test else args.max_test_samples,
     )
     if args.sjtu_test:
-        test_entries = compose_sjtu_500ms_entries(raw_test_entries, args.max_test_samples)
-        split_name = f"{split_name}_500ms"
+        if is_sjtu_overlap_500ms_entries(raw_test_entries, split_name):
+            test_entries = raw_test_entries
+            if args.max_test_samples > 0:
+                test_entries = test_entries[:args.max_test_samples]
+            split_name = split_name if split_name.endswith("_500ms") else f"{split_name}_500ms"
+            print(
+                f"[SJTU] detected overlap_500ms PKL, using {len(test_entries)} samples directly without regroup."
+            )
+        else:
+            test_entries = compose_sjtu_500ms_entries(raw_test_entries, args.max_test_samples)
+            split_name = f"{split_name}_500ms"
         if args.scale_only and args.compute_scale_metrics:
             print("[SJTU] compute_scale_metrics was requested but will be disabled because no GT is available.")
         if (not args.scale_only) and (args.compute_scale_orientation_metrics or args.compute_scene_mid_err):
