@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import argparse
 import datetime
 import json
+import random
 import socket
 import subprocess
 import torch.distributed as dist
@@ -24,8 +25,10 @@ out_dir = "./log/%s_surround_ttc"%(time_stamp)
 parser = argparse.ArgumentParser()
 
 # dataset
-parser.add_argument('--checkpoint_dir', default='tmp', type=str,
+parser.add_argument('--checkpoint_dir', default='./log', type=str,
                     help='where to save the training log and models')
+parser.add_argument('--run_name', default=None, type=str,
+                    help='optional run name prefix inside checkpoint_dir')
 parser.add_argument('--stage', default='chairs', type=str,
                     help='training stage on different datasets')
 parser.add_argument('--val_dataset', default=['chairs'], type=str, nargs='+',
@@ -40,10 +43,16 @@ parser.add_argument('--train_info_path', default='./Datasets/nuscenes/2_trainval
                     help='path to the train pkl directory')
 parser.add_argument('--train_info_file', default='nusc_train_infos_key_frames_160_1920_fov_8_15.pkl', type=str,
                     help='train pkl file name')
+parser.add_argument('--val_info_path', default='./Datasets/nuscenes/2_trainval_test_infos/val', type=str,
+                    help='path to the val pkl directory')
+parser.add_argument('--val_info_file', default='nusc_val_infos_key_frames_160_1920_fov_8_15.pkl', type=str,
+                    help='val pkl file name')
 parser.add_argument('--require_complete_depth', action='store_true',
                     help='only keep samples whose 12 depth maps all exist')
 parser.add_argument('--max_train_samples', default=None, type=int,
                     help='limit the number of train samples after filtering')
+parser.add_argument('--max_val_samples', default=None, type=int,
+                    help='limit the number of val samples after filtering')
 parser.add_argument('--proj_cache_root',
                     default='./Datasets/nuscenes/5_proj_cache/nusc_150_keyframes_160x320_fov8_15_v1',
                     type=str,
@@ -70,6 +79,9 @@ parser.add_argument('--num_steps', default=100000, type=int)
 parser.add_argument('--seed', default=326, type=int)
 parser.add_argument('--summary_freq', default=100, type=int)
 parser.add_argument('--val_freq', default=10000, type=int)
+parser.add_argument('--val_batch_size', default=1, type=int)
+parser.add_argument('--metric_delta_t', default=0.5, type=float,
+                    help='frame interval in seconds for TTC threshold metrics')
 parser.add_argument('--save_ckpt_freq', default=10000, type=int)
 parser.add_argument('--save_latest_ckpt_freq', default=1000, type=int)
 
@@ -90,6 +102,9 @@ parser.add_argument('--ffn_dim_expansion', default=4, type=int)
 parser.add_argument('--num_transformer_layers', default=6, type=int)
 parser.add_argument('--reg_refine', action='store_true',
                     help='optional task-specific local regression refinement')
+parser.add_argument('--rvt_query_init', default='gvb',
+                    choices=['gvb', 'concatfeat', 'zero'],
+                    help='RVT query initialization for query-init ablations')
 parser.add_argument('--parallel', action='store_true',
                     help='use distributed data parallel for training')
 parser.add_argument('--load_opt', action='store_true',
@@ -169,6 +184,8 @@ parser.add_argument('--lambda_corr_distill', type=float, default=0.5,
                     help='weight for correlation distillation loss')
 parser.add_argument('--distill_end_pct', type=float, default=0.7,
                     help='fraction of training at which distillation weight reaches 0')
+parser.add_argument('--distill_end_epoch', type=int, default=None,
+                    help='absolute epoch where distillation reaches 0; overrides distill_end_pct when set')
 parser.add_argument('--student_tail_epochs', type=int, default=0,
                     help='extra student-only fine-tuning epochs after distillation')
 parser.add_argument('--loss_weight_alpha', type=float, default=0.0,
@@ -190,6 +207,28 @@ parser.add_argument('--neptune', action='store_true',
                     help='use neptune for logging')
 
 args = parser.parse_args()
+
+
+def build_out_dir(args, time_stamp):
+    run_leaf = f"{time_stamp}_surround_ttc"
+    if args.run_name:
+        run_leaf = f"{args.run_name}_{run_leaf}"
+    return os.path.join(args.checkpoint_dir, run_leaf)
+
+
+out_dir = build_out_dir(args, time_stamp)
+args.out_dir = out_dir
+
+
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+
+
+set_random_seed(args.seed)
 
 if args.parallel:
     dist.init_process_group(backend="nccl")
@@ -385,6 +424,7 @@ def main():
         num_transformer_layers = args.num_transformer_layers,
         reg_refine             = args.reg_refine,
         no_depth               = args.no_depth,
+        rvt_query_init         = args.rvt_query_init,
     ).cuda()
 
     start_epoch = 0
@@ -393,6 +433,8 @@ def main():
     model_init_info = {
         'no_depth': args.no_depth,
         'use_teacher_distill': args.use_teacher_distill,
+        'rvt_query_init': args.rvt_query_init,
+        'distill_end_epoch': args.distill_end_epoch,
         'resume': None,
         'scale_pretrained_ckpt': None,
         'optimizer_groups': {},
@@ -482,6 +524,7 @@ def main():
         print('Start Loading ...')
 
     dataset = datasets.fetch_dataloader(args) 
+    val_dataset = datasets.fetch_val_dataloader(args) if args.val_freq > 0 else None
     
     # stage 1: train scale branch
     if args.train_stage in ('scale', 'both'):
@@ -595,6 +638,7 @@ def main():
                              student_tail_epochs = args.student_tail_epochs,
                              loss_weight_alpha   = args.loss_weight_alpha,
                              edge_loss_weight    = args.edge_loss_weight,
+                             val_dataset         = val_dataset,
                              )
         trainer.train()
 

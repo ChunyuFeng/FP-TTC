@@ -765,3 +765,22 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K/S'):
 
     # print('Training with %d image pairs' % len(train_dataset.image_list))
     return train_dataset
+
+
+def fetch_val_dataloader(args):
+    """Build the nuScenes range-image validation dataset with the training crop policy."""
+    if args.stage != 'nuscenes_range_image':
+        raise ValueError(f"Validation is only wired for nuscenes_range_image, got {args.stage}")
+
+    aug_params = {'crop_size': args.image_size, 'do_flip': False, 'rotate': False, 'rotate_prob': 0.1, 'rotate_angle': 90}
+    return nuScenes_range_image(
+        aug_params,
+        train_info_file=args.val_info_file,
+        train_info_path=args.val_info_path,
+        require_complete_depth=args.require_complete_depth,
+        proj_cache_root=args.proj_cache_root,
+        max_samples=args.max_val_samples,
+        split='validation',
+        no_depth=getattr(args, 'no_depth', False),
+        need_teacher_proj=False,
+    )

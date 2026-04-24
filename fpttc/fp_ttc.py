@@ -36,6 +36,9 @@ class CorrEncoder(nn.Module):
         x = F.relu(self.convc2(x))
         return x
 
+RVT_QUERY_INIT_MODES = ('gvb', 'concatfeat', 'zero')
+
+
 class FpTTC(nn.Module):
     def __init__(self,
                  num_scales             = 2,
@@ -46,10 +49,17 @@ class FpTTC(nn.Module):
                  num_transformer_layers = 6,
                  reg_refine             = False,
                  no_depth               = False,
+                 rvt_query_init         = 'gvb',
                  ):
         super(FpTTC, self).__init__()
         self.num_scales = num_scales
         self.no_depth = no_depth
+        if rvt_query_init not in RVT_QUERY_INIT_MODES:
+            raise ValueError(
+                f"Unsupported rvt_query_init={rvt_query_init!r}; "
+                f"expected one of {RVT_QUERY_INIT_MODES}"
+            )
+        self.rvt_query_init = rvt_query_init
 
         self.camera_channels = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
                                 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
@@ -131,6 +141,24 @@ class FpTTC(nn.Module):
             fov_down=-15.0
         )
         
+    def _concat_init_query(self, feats_by_cam, Hr, Wr):
+        query = torch.cat(feats_by_cam, dim=-1).contiguous()
+        if query.shape[-2:] != (Hr, Wr):
+            query = _safe_bilinear(query, size=(Hr, Wr), align_corners=True)
+        return query
+
+    def _rvt_query_kwargs(self, feats_by_cam, Hr, Wr):
+        if self.rvt_query_init == 'gvb':
+            return {'ini_query': None, 'use_geom_bootstrap': True}
+        if self.rvt_query_init == 'zero':
+            return {'ini_query': None, 'use_geom_bootstrap': False}
+        if self.rvt_query_init == 'concatfeat':
+            return {
+                'ini_query': self._concat_init_query(feats_by_cam, Hr, Wr),
+                'use_geom_bootstrap': False,
+            }
+        raise RuntimeError(f'Unhandled RVT query init mode: {self.rvt_query_init}')
+
 
     def forward(
         self,
@@ -245,6 +273,7 @@ class FpTTC(nn.Module):
         corr_encoded_list = [self.conv_corr_rvt_in(c) for c in corr_list]  # list[V] of [B, Ccorr, Hc, Wc]
         H_r = corr_encoded_list[0].shape[2]
         W_r = corr_encoded_list[0].shape[3] * V
+        corr_query_kwargs = self._rvt_query_kwargs(corr_encoded_list, H_r, W_r)
 
         corr_range = self.rvt_corr(
             feats_by_cam=corr_encoded_list,
@@ -254,8 +283,7 @@ class FpTTC(nn.Module):
             affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
             Hr=H_r, Wr=W_r,
             depth_bins=self.depth_bins,
-            ini_query=None,
-            use_geom_bootstrap=True,
+            **corr_query_kwargs,
         )
 
         # 多尺度特征 -> range（前/当前帧）
@@ -265,6 +293,8 @@ class FpTTC(nn.Module):
             curr_feats_list = [multi_level_feats_curr[lvl][:, v] for v in range(V)]
             H_r = prev_feats_list[0].shape[2]
             W_r = prev_feats_list[0].shape[3] * V
+            prev_query_kwargs = self._rvt_query_kwargs(prev_feats_list, H_r, W_r)
+            curr_query_kwargs = self._rvt_query_kwargs(curr_feats_list, H_r, W_r)
 
             range_prev = self.rvt_feat[lvl](
                 feats_by_cam=prev_feats_list,
@@ -274,8 +304,7 @@ class FpTTC(nn.Module):
                 affine_M=[sensor_metas['prev'][cam]['affine'] for cam in self.camera_channels],
                 Hr=H_r, Wr=W_r,
                 depth_bins=self.depth_bins,
-                ini_query=None,
-                use_geom_bootstrap=True,
+                **prev_query_kwargs,
             )
             range_curr = self.rvt_feat[lvl](
                 feats_by_cam=curr_feats_list,
@@ -285,8 +314,7 @@ class FpTTC(nn.Module):
                 affine_M=[sensor_metas['curr'][cam]['affine'] for cam in self.camera_channels],
                 Hr=H_r, Wr=W_r,
                 depth_bins=self.depth_bins,
-                ini_query=None,
-                use_geom_bootstrap=True,
+                **curr_query_kwargs,
             )
             multi_level_ranges_prev.append(range_prev)
             multi_level_ranges_curr.append(range_curr)

@@ -16,7 +16,7 @@ import torch.optim as optim
 import torch.nn as nn
 from random import sample, shuffle
 from torch.utils.data.dataset import Dataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 import torch.nn.functional as F 
 import torch.distributed as dist
@@ -24,6 +24,13 @@ from utils.dist import is_main_process
 
 from PIL import Image
 from .draw import visual_scale_map_range_image, visual_risk_score_map_range_image
+from .metrics import (
+    add_metric_sums,
+    compute_scale_metric_sums,
+    finalize_scale_metrics,
+    init_scale_metric_sums,
+    reduce_metric_sums,
+)
 from dataloader.load import load_calib_cam_to_cam, readFlowKITTI, disparity_loader, triangulation
 
 class TTCTrainer(object):
@@ -33,21 +40,29 @@ class TTCTrainer(object):
                 no_depth=False, use_teacher_distill=False,
                 lambda_feat_distill=1.0, lambda_corr_distill=0.5,
                 distill_end_pct=0.7, student_tail_epochs=0,
-                loss_weight_alpha=0.0, edge_loss_weight=0.0):
+                loss_weight_alpha=0.0, edge_loss_weight=0.0,
+                val_dataset=None):
         self.model = model
         self.parallel = parallel
         self.batch_size = args.batch_size
         self.train_sampler = None
+        self.val_dataset = val_dataset
+        self.val_loader = None
         self.scale_only = scale_only
         self.no_depth = no_depth
         self.use_teacher_distill = use_teacher_distill
         self.lambda_feat_distill = lambda_feat_distill
         self.lambda_corr_distill = lambda_corr_distill
         self.distill_end_pct = distill_end_pct
+        self.distill_end_epoch = getattr(args, 'distill_end_epoch', None)
         self.student_tail_epochs = max(0, int(student_tail_epochs))
         self.loss_weight_alpha = loss_weight_alpha
         self.edge_loss_weight = edge_loss_weight
         self.new_module_lr_mult = getattr(args, 'new_module_lr_mult', 1.0)
+        self.rvt_query_init = getattr(args, 'rvt_query_init', 'gvb')
+        self.val_freq = max(0, int(getattr(args, 'val_freq', 0)))
+        self.metric_delta_t = float(getattr(args, 'metric_delta_t', 0.5))
+        self.best_val_mid_err = float('inf')
         if not self.parallel:
             self.train_loader = DataLoader(dataset, 
                                            batch_size  = args.batch_size, 
@@ -64,11 +79,30 @@ class TTCTrainer(object):
                                            pin_memory  = True, 
                                            num_workers = args.num_workers)
 
+        if self.val_dataset is not None:
+            val_data = self.val_dataset
+            if self.parallel and dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+                world_size = dist.get_world_size()
+                val_indices = list(range(rank, len(self.val_dataset), world_size))
+                val_data = Subset(self.val_dataset, val_indices)
+            self.val_loader = DataLoader(
+                val_data,
+                batch_size=getattr(args, 'val_batch_size', 1),
+                shuffle=False,
+                num_workers=args.num_workers,
+                drop_last=False,
+                pin_memory=True,
+            )
+
         if self.scale_only:
             self.main_epochs = args.scale_epochs
         else:
             self.main_epochs = args.risk_epochs
-        self.stage_a_end = max(0, min(self.main_epochs, int(math.ceil(self.distill_end_pct * self.main_epochs))))
+        if self.distill_end_epoch is not None:
+            self.stage_a_end = max(0, min(self.main_epochs, int(self.distill_end_epoch)))
+        else:
+            self.stage_a_end = max(0, min(self.main_epochs, int(math.ceil(self.distill_end_pct * self.main_epochs))))
         self.total_epochs = self.main_epochs + self.student_tail_epochs
         self.epoch = self.total_epochs
         self.optimizer = optimizer
@@ -114,7 +148,7 @@ class TTCTrainer(object):
 
         self.neptune_run = neptune_run
         self.dataset = dataset
-        self.out_dir = "./log/%s_surround_ttc" % (self.time_stamp)
+        self.out_dir = getattr(args, 'out_dir', "./log/%s_surround_ttc" % (self.time_stamp))
         self.train_branch = 'scale' if self.scale_only else 'risk'
         self.batch_metrics_interval = 50
         self.num_probe_samples = 4
@@ -147,6 +181,37 @@ class TTCTrainer(object):
             if not file_exists:
                 writer.writeheader()
             writer.writerow(row)
+
+    def _write_epoch_metrics(self, epoch_metrics):
+        fieldnames = [
+            'train_branch',
+            'rvt_query_init',
+            'epoch',
+            'phase',
+            'lr',
+            'lr_old',
+            'lr_new',
+            'train_loss_total',
+            'train_loss_task',
+            'train_loss_scale',
+            'train_loss_risk',
+            'train_loss_feat_distill',
+            'train_loss_corr_distill',
+            'train_loss_edge',
+            'distill_scale',
+            'lambda_feat_distill',
+            'lambda_corr_distill',
+            'num_steps',
+            'val_loss_scale',
+            'val_mid_err',
+            'val_err_1',
+            'val_err_2',
+            'val_err_5',
+            'num_val_samples',
+            'num_val_valid_pixels',
+        ]
+        row = {key: epoch_metrics.get(key, '') for key in fieldnames}
+        self._append_csv_row(os.path.join(self.out_dir, 'epoch_metrics.csv'), fieldnames, row)
 
     def _model_ref(self):
         return self.model.module if hasattr(self.model, "module") else self.model
@@ -223,11 +288,16 @@ class TTCTrainer(object):
             'branches': {},
         })
         manifest['train_samples'] = len(self.dataset)
+        manifest['val_samples'] = len(self.val_dataset) if self.val_dataset is not None else 0
         manifest['checkpoint_interval'] = self.checkpoint_interval
         manifest['batch_metrics_interval'] = self.batch_metrics_interval
+        manifest['rvt_query_init'] = self.rvt_query_init
+        manifest['val_freq'] = self.val_freq
+        manifest['metric_delta_t'] = self.metric_delta_t
         manifest['branches'][self.train_branch] = {
             'main_epochs': self.main_epochs,
             'stage_a_end': self.stage_a_end,
+            'distill_end_epoch': self.distill_end_epoch,
             'total_epochs': self.total_epochs,
             'scale_only': bool(self.scale_only),
             'use_teacher_distill': bool(self.use_teacher_distill),
@@ -430,9 +500,37 @@ class TTCTrainer(object):
             self.loss_sum_per_epoch = 0
             self.iters = 0
             epoch_metrics = self.train_epoch(epoch)
+            if (
+                self.val_loader is not None
+                and self.scale_only
+                and self.val_freq > 0
+                and (epoch % self.val_freq == 0 or epoch == self.epoch - 1)
+            ):
+                epoch_metrics.update(self.validate_epoch(epoch))
 
             if is_main_process():
-                if (epoch < self.epoch and epoch % self.checkpoint_interval == 0):
+                self._write_epoch_metrics(epoch_metrics)
+
+                val_mid_err = epoch_metrics.get('val_mid_err')
+                if val_mid_err not in (None, '') and float(val_mid_err) < self.best_val_mid_err:
+                    self.best_val_mid_err = float(val_mid_err)
+                    best_pth = os.path.join(self.out_dir, f'best_scale_epoch_{epoch}.pth.tar')
+                    torch.save({
+                        "net": self.model.state_dict(),
+                        'optimizer': self.optimizer.state_dict(),
+                        "epoch": epoch + 1,
+                        "metrics": epoch_metrics,
+                    }, best_pth)
+                    self._append_json_array(os.path.join(self.out_dir, 'checkpoints.json'), {
+                        'kind': 'best_val_mid_err',
+                        'train_branch': self.train_branch,
+                        'epoch': int(epoch),
+                        'phase': stage_name,
+                        'path': os.path.relpath(best_pth, self.out_dir),
+                        'val_mid_err': float(val_mid_err),
+                    })
+
+                if (epoch % self.checkpoint_interval == 0 or epoch == self.epoch - 1):
                     checkpoint = {
                         "net": self.model.state_dict(),
                         'optimizer': self.optimizer.state_dict(),
@@ -446,6 +544,7 @@ class TTCTrainer(object):
                         temp_pth = os.path.join(self.out_dir, f'{epoch}.pth.tar')
                     torch.save(checkpoint, temp_pth)
                     self._append_json_array(os.path.join(self.out_dir, 'checkpoints.json'), {
+                        'kind': 'regular',
                         'train_branch': self.train_branch,
                         'epoch': int(epoch),
                         'phase': stage_name,
@@ -455,6 +554,8 @@ class TTCTrainer(object):
                         'lr_new': epoch_metrics['lr_new'],
                         'train_loss_total': epoch_metrics['train_loss_total'],
                         'train_loss_task': epoch_metrics['train_loss_task'],
+                        'val_mid_err': epoch_metrics.get('val_mid_err'),
+                        'val_loss_scale': epoch_metrics.get('val_loss_scale'),
                     })
                     self._save_probe_snapshots(
                         epoch=epoch,
@@ -676,6 +777,7 @@ class TTCTrainer(object):
         current_lrs = self._current_lrs()
         epoch_metrics = {
             'train_branch': self.train_branch,
+            'rvt_query_init': self.rvt_query_init,
             'epoch': int(epoch),
             'phase': phase,
             'lr': current_lrs['old'],
@@ -694,31 +796,6 @@ class TTCTrainer(object):
             'num_steps': int(steps),
         }
 
-        if is_main_process():
-            self._append_csv_row(
-                os.path.join(self.out_dir, 'epoch_metrics.csv'),
-                [
-                    'train_branch',
-                    'epoch',
-                    'phase',
-                    'lr',
-                    'lr_old',
-                    'lr_new',
-                    'train_loss_total',
-                    'train_loss_task',
-                    'train_loss_scale',
-                    'train_loss_risk',
-                    'train_loss_feat_distill',
-                    'train_loss_corr_distill',
-                    'train_loss_edge',
-                    'distill_scale',
-                    'lambda_feat_distill',
-                    'lambda_corr_distill',
-                    'num_steps',
-                ],
-                epoch_metrics,
-            )
-
         if self.neptune_run is not None and is_main_process():
             self.neptune_run["train/epoch_loss"].append(epoch_metrics['train_loss_total'], step=epoch)
             for group_idx, pg in enumerate(self.optimizer.param_groups):
@@ -726,6 +803,110 @@ class TTCTrainer(object):
                 self.neptune_run[tag].append(pg["lr"], step=epoch)
         
         return epoch_metrics
+
+    @torch.no_grad()
+    def validate_epoch(self, epoch):
+        if self.val_loader is None:
+            return {}
+
+        model_ref = self._model_ref()
+        was_training = self.model.training
+        self.model.eval()
+
+        val_loss_sum = 0.0
+        val_samples = 0.0
+        metric_sums = init_scale_metric_sums()
+
+        try:
+            for data in self.val_loader:
+                (prev_surr_view_imgs_tensor,
+                 curr_surr_view_imgs_tensor,
+                 prev_surr_view_depths_tensor,
+                 curr_surr_view_depths_tensor,
+                 proj_pix_prev_tensor,
+                 proj_pix_curr_tensor,
+                 gt_scale_map_with_mask,
+                 gt_risk_score_map_with_mask,
+                 sensor_metas) = data
+
+                prev_surr_view_imgs_tensor   = prev_surr_view_imgs_tensor.to(self.device)
+                curr_surr_view_imgs_tensor   = curr_surr_view_imgs_tensor.to(self.device)
+                prev_surr_view_depths_tensor = prev_surr_view_depths_tensor.to(self.device)
+                curr_surr_view_depths_tensor = curr_surr_view_depths_tensor.to(self.device)
+                proj_pix_prev_tensor         = proj_pix_prev_tensor.to(self.device)
+                proj_pix_curr_tensor         = proj_pix_curr_tensor.to(self.device)
+                gt_scale_map_with_mask       = gt_scale_map_with_mask.to(self.device)
+                gt_risk_score_map_with_mask  = gt_risk_score_map_with_mask.to(self.device)
+                sensor_metas = self._move_sensor_metas_to_device(sensor_metas)
+
+                scale, _, _, _, loss_dict = model_ref.forward_with_loss(
+                    img_prev                      = prev_surr_view_imgs_tensor,
+                    img_curr                      = curr_surr_view_imgs_tensor,
+                    depth_prev                    = prev_surr_view_depths_tensor,
+                    depth_curr                    = curr_surr_view_depths_tensor,
+                    proj_pix_prev                 = proj_pix_prev_tensor,
+                    proj_pix_curr                 = proj_pix_curr_tensor,
+                    gt_scale_map_with_mask        = gt_scale_map_with_mask,
+                    gt_risk_score_map_with_mask   = gt_risk_score_map_with_mask,
+                    sensor_metas                  = sensor_metas,
+                    attn_type                     = self.attn_type,
+                    attn_splits_list              = self.attn_splits_list,
+                    corr_radius_list              = self.corr_radius_list,
+                    prop_radius_list              = self.prop_radius_list,
+                    num_reg_refine                = self.num_reg_refine,
+                    scale_only                    = True,
+                    no_depth                      = self.no_depth,
+                    use_teacher_distill           = False,
+                    lambda_feat_distill           = 0.0,
+                    lambda_corr_distill           = 0.0,
+                    loss_weight_alpha             = self.loss_weight_alpha,
+                    edge_loss_weight              = 0.0,
+                )
+
+                batch_size = float(prev_surr_view_imgs_tensor.shape[0])
+                val_loss_sum += float(loss_dict['scale'].item()) * batch_size
+                val_samples += batch_size
+                batch_metric_sums = compute_scale_metric_sums(
+                    scale,
+                    gt_scale_map_with_mask,
+                    delta_t=self.metric_delta_t,
+                )
+                metric_sums = add_metric_sums(metric_sums, batch_metric_sums)
+        finally:
+            if was_training:
+                self.model.train()
+
+        loss_stats = torch.tensor([val_loss_sum, val_samples], dtype=torch.float64, device=self.device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
+        metric_sums = reduce_metric_sums(metric_sums, self.device)
+        scale_metrics = finalize_scale_metrics(metric_sums)
+
+        total_samples = max(1.0, float(loss_stats[1].item()))
+        val_metrics = {
+            'val_loss_scale': float(loss_stats[0].item()) / total_samples,
+            'val_mid_err': scale_metrics['mid_err'],
+            'val_err_1': scale_metrics['err_1'],
+            'val_err_2': scale_metrics['err_2'],
+            'val_err_5': scale_metrics['err_5'],
+            'num_val_samples': int(loss_stats[1].item()),
+            'num_val_valid_pixels': int(metric_sums.get('valid_count', 0.0)),
+        }
+
+        if is_main_process():
+            print(
+                f"Validation epoch {epoch}: "
+                f"loss={val_metrics['val_loss_scale']:.6f}, "
+                f"mid_err={val_metrics['val_mid_err']:.3f}, "
+                f"Err-1={val_metrics['val_err_1']:.4f}, "
+                f"Err-2={val_metrics['val_err_2']:.4f}, "
+                f"Err-5={val_metrics['val_err_5']:.4f}"
+            )
+            if self.neptune_run is not None:
+                self.neptune_run["val/loss_scale"].append(val_metrics['val_loss_scale'], step=epoch)
+                self.neptune_run["val/mid_err"].append(val_metrics['val_mid_err'], step=epoch)
+
+        return val_metrics
     
     def _weighted_loss(self, keys_s, keys_r, loss_s, loss_r, model_ref):
         """
